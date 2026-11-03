@@ -32,7 +32,8 @@ acm publisher off             # 끄고 각 세션이 자기 계정으로 발행�
 
 다른 세션은 `acm publisher check <HTML 파일> [추가 파일...]` 로 파일을 inbox 에 올리고, 출력에 나온 올린 경로를 발행 세션에 보낸다. 올릴 때 아래 파일은 거절한다.
 
-- 숨은 파일과, `~/.ssh` 나 `~/.claude`, `~/.acm` 처럼 홈 바로 아래 숨은 폴더에 든 파일
+- 숨은 파일과 숨은 폴더에 든 파일. 홈 바로 아래의 `~/.ssh` 나 `~/.claude`, `~/.acm` 뿐 아니라 프로젝트 안의 `.git` 이나 `.secrets` 도 거절한다
+- 하드 링크가 걸린 파일. 이름만 보고는 원본이 어디 있는지 알 수 없어서다
 - `~/Library` 아래 파일
 - 웹 파일이 아닌 확장자. html 과 md, css, js, json, 이미지, 글꼴, 동영상, pdf, txt, csv 만 받는다
 - 16MB 를 넘는 파일
@@ -45,6 +46,7 @@ acm publisher off             # 끄고 각 세션이 자기 계정으로 발행�
 - Read 와 Artifact 의 로컬 경로는 inbox 나 그 세션의 scratchpad 안이어야 한다. `..` 가 든 경로는 받지 않고, 상대 경로는 작업 폴더와 `root` 어느 쪽 기준으로 풀어도 범위 안이어야 한다.
 - Read 는 그 세션의 라이브 판 사본도 받는다. 사본 폴더는 훅 입력의 `transcript_path` 옆 `<세션 ID>/tool-results/` 로 정하고, 그 폴더 바로 아래에서 이름이 `artifact-` 로 시작하는 파일만 통과시킨다. 다른 세션의 사본과 하위 폴더, 밖을 가리키는 링크는 막는다. 사본을 발행 경로로 쓰는 것도 막는다.
 - Artifact 는 publish 와 read 만 쓴다. force 와 capabilities, read 의 out_dir 도 막는다.
+- Artifact 의 `files` 는 아는 모양만 받는다. 로컬 경로와 `{from}`, 서버에서 복사하는 `{artifact, path}`, 지우는 null 이 그 모양이다. 모르는 모양에는 로컬 경로가 들었을 수 있어서 막는다.
 - inbox 가 링크로 바뀌어 있으면 아무 파일도 통과시키지 않는다.
 
 훅이 2 가 아닌 종료 코드로 끝나면 Claude Code 는 도구를 그대로 실행한다. 그래서 훅은 입력을 읽다 실패해도 막고, 명령 끝에 `|| exit 2` 를 붙여 acm 이 import 단계에서 죽어도 막힌다. 다른 설정의 `disableAllHooks` 가 이 훅을 끄지 못하게 같은 `--settings` 에서 false 로 둔다. 시스템 프롬프트에도 같은 범위를 ROLE.md 뒤에 붙인다.

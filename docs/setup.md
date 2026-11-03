@@ -11,7 +11,7 @@
 ```
 
 - 첫째, `bin/acm` 과 `bin/acm-statusline` 을 `~/.local/bin` 에 복사한다. 심링크가 아니라 복사라서 저장소를 옮기거나 worktree 를 지워도 acm 은 계속 돈다. 소스를 고친 뒤에는 `install.sh` 를 다시 돌려야 반영된다. 어느 저장소의 어느 커밋을 깔았는지는 `~/.acm/install.json` 에 남긴다.
-- 둘째, `~/.claude/settings.json` 의 `statusLine` 을 `acm-statusline '<원래 명령>'` 으로 감싼다. 원래 명령은 래퍼의 인자로 남아 그대로 실행되므로 화면은 달라지지 않는다. 원래 명령을 acm 이 따로 두는 파일로 옮기지 않는 것은, 그런 파일은 Claude Code 가 보호하지 않아서다. 세션이 묻지 않고 그 파일을 고치면 모든 세션의 statusline 에서 코드가 돈다. 예전처럼 `~/.acm/statusline-inner` 에 옮겨 둔 설치는 `install.sh` 를 다시 돌리면 인자로 옮기고 그 파일을 지운다. 바꾸기 전 settings 는 `settings.json.acm-bak-<시각>` 으로 남긴다.
+- 둘째, `~/.claude/settings.json` 의 `statusLine` 을 `acm-statusline '<원래 명령>'` 으로 감싼다. 원래 명령은 래퍼의 인자로 남아 그대로 실행되므로 화면은 달라지지 않는다. 원래 명령을 acm 이 따로 두는 파일로 옮기지 않는 것은, 그런 파일은 Claude Code 가 보호하지 않아서다. 세션이 묻지 않고 그 파일을 고치면 모든 세션의 statusline 에서 코드가 돈다. `settings.json` 이 아직 없는 새 설치면 만든다. 바꾸기 전 settings 는 `settings.json.acm-bak-<시각>` 으로 남긴다.
 - 셋째, `app/` 의 메뉴바 앱을 빌드해 `/Applications/ACM.app` 에 넣고 띄운다.
 - 넷째, `acm setup` 을 불러 나머지 설정을 하나씩 묻고 맞춘다. 다음 절에 있다.
 

@@ -15,10 +15,11 @@ acm 은 Anthropic 이나 OpenAI 와 관계없는 비공식 도구다. 로그인 
 | 도구 | 필요한 때 |
 |---|---|
 | `python3`, `jq`, `claude` | 늘 |
-| `swiftc` | 메뉴바 앱을 빌드할 때. 앱 없이 깔려면 `./install.sh --no-app` 을 쓴다 |
+| `swiftc` | 메뉴바 앱을 빌드할 때. 앱은 Apple silicon 의 macOS 14 이상에서 돈다. 앱 없이 깔려면 `./install.sh --no-app` 을 쓴다 |
 | `codex` | Codex 계정을 쓸 때 |
+| `tmux` | 아티팩트 모으기를 켤 때. 없으면 `acm setup` 이 brew 로 설치할지 묻는다 |
 
-`codex` 를 뺀 도구가 하나라도 없으면 `install.sh` 가 설치 방법을 알리고 멈춘다.
+`python3` 와 `jq`, `claude` 가 없으면 `install.sh` 가 설치 방법을 알리고 멈춘다. 앱까지 깔 때는 `swiftc` 가 없어도 멈춘다.
 
 1. 저장소를 받는다.
 
