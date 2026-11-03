@@ -1,30 +1,30 @@
-# 메뉴바와 위젯
+# Menu bar and widget
 
-이 문서는 메뉴바 앱과 떠 있는 위젯이 무엇을 보이는지 적는다. 앱은 `install.sh` 가 빌드해 `/Applications/ACM.app` 에 넣는다.
+This doc covers what the menu bar app and the floating widget show. `install.sh` builds the app and puts it in `/Applications/ACM.app`.
 
-## 메뉴바에는 로고만 둔다
+## The menu bar shows only the logo
 
-메뉴바에는 acm 로고만 두고 사용량은 보이지 않는다. 사용량은 창을 열어 계정 카드와 함께 볼 때 뜻이 있어서다. 로고는 템플릿 이미지라 메뉴바가 밝든 어둡든 시스템이 색을 맞춘다. 노치가 있는 맥북에서 메뉴바 항목이 노치 뒤로 숨으면 Command 를 누른 채 끌어 옮긴다.
+The menu bar shows only the acm logo, not usage. Usage means something only when you open the window and see it with the account cards. The logo is a template image, so the system matches its color to a light or dark menu bar. On a MacBook with a notch, if the menu bar item hides behind the notch, hold Command and drag it.
 
-## 메뉴바 창은 도구마다 색이 다른 상자로 묶는다
+## The menu bar window groups accounts in a box with a different color per tool
 
-로고를 누르면 창이 열린다. 맨 위에 acm 로고와 이름 AI Account Manager 가 있고 그 아래에 계정 카드와 실행 중인 세션 목록이 나온다. 계정 카드는 도구마다 상자로 묶는다. Claude 상자는 주황, Codex 상자는 파랑 테두리다. 상자 머리에는 그 도구의 로고와 다음 배정을 둔다. 로고는 이 Mac 에 깔린 Claude 앱과 Codex 앱, ChatGPT 앱의 아이콘을 빌려 쓰고 앱이 없으면 기호로 대신한다.
+Click the logo to open the window. At the top are the acm logo and the name AI Account Manager. Below them are the account cards and the list of running sessions. Account cards are grouped in a box per tool. The Claude box has an orange border, and the Codex box a blue one. The box header shows the tool's logo and its next pick. The logos borrow the icons of the Claude, Codex, and ChatGPT apps installed on this Mac, and fall back to a symbol if the app is missing.
 
-- 계정 카드는 5h 와 Week 게이지, 사용률, `1일 5시간 후 리셋` 처럼 리셋까지 남은 시간을 보인다. 게이지 색은 70% 미만 초록, 90% 미만 주황, 그 이상 빨강이다.
-- 이메일 옆에는 `Ultra`, `free` 같은 요금제를 보인다. Claude 요금제는 Claude Code 가 로그인할 때 받아 둔 표시 이름이고 Codex 요금제는 app-server 가 알려 준 값이다.
-- 모델별 주간 한도가 있는 계정은 `Fable`, `Sonnet` 처럼 모델 이름으로 게이지를 하나 더 보인다. 어느 한도를 배정에 견주는지는 [계정 배정과 사용량](selection.md) 에 있다.
-- Codex 카드는 긴 창 게이지를 `30d` 처럼 창 길이로 부른다. Codex 가 지금은 쓸 수 없다고 알린 계정은 빨간 `쓸 수 없음` 을 단다.
-- 세션 목록의 주황 `claude` 나 `codex` 표시는 acm 을 거치지 않고 띄운 세션이다. 도구가 여럿이면 줄 앞에 도구 이름을 쓴다.
-- 아래쪽에서 분배 방식과 로그인 시 실행, 떠 있는 위젯을 켜고 끈다. Codex 계정이 있으면 "새 세션…" 이 도구를 고르는 메뉴가 된다.
+- An account card shows 5h and Week gauges, usage, and the time left until reset, such as `Resets in 1d 5h`. Gauges are green below 70%, orange below 90%, and red at 90% or more.
+- The plan, such as `Ultra` or `free`, appears next to the email. The Claude plan is the display name Claude Code received at sign-in. The Codex plan is the value app-server reported.
+- An account with a per-model weekly limit shows one more gauge named after the model, such as `Fable` or `Sonnet`. Which limit counts toward picks is in [Account selection and usage](selection.md).
+- Codex cards name the long window gauge by its length, such as `30d`. An account that Codex reported as unusable right now gets a red `Unavailable`.
+- An orange `claude` or `codex` mark in the session list means a session started without acm. With more than one tool, each line starts with the tool name.
+- At the bottom are switches for the selection mode, launch at login, and the floating widget. If you have a Codex account, "New Session…" becomes a menu for choosing the tool.
 
-5시간 한도가 없는 Ultra 인증 계정은 5h 자리를 비운다. 한도가 있는 계정과 섞여 있으면 위젯은 5h 칸에 `한도 없음` 을, `acm status` 는 `없음` 을 보인다. 로그인한 계정 모두에 5h 한도가 없으면 위젯과 계정 카드, `acm status` 에서 5h 열을 뺀다. 사용량을 아직 한 번도 읽지 못한 계정은 한도가 없다고 보지 않아서, 위젯과 `acm status` 는 그 칸에 `–` 를, 계정 카드는 `아직 읽지 못함` 을 둔다.
+A verified Ultra account with no 5-hour limit leaves its 5h spot empty. Mixed with accounts that have a limit, the widget shows `No limit` in the 5h cell, and `acm status` shows `none`. If no signed-in account has a 5h limit, the widget, the account cards, and `acm status` drop the 5h column. An account whose usage has never been read is not assumed to have no limit. The widget and `acm status` put `–` in that cell, and the account card shows `Not read yet`.
 
-## 위젯은 모든 Space 에서 위에 뜬다
+## The widget floats on top in every Space
 
-떠 있는 위젯은 모든 Space 에서 항상 위에 뜨는 작은 창이다. 위젯에 보일 도구는 메뉴바 창의 도구 상자마다 있는 "위젯에 표시" 로 고르고 위젯 오른쪽 클릭 메뉴에서도 켜고 끈다. 처음에는 Claude 만 보인다. 둘 다 켜면 도구마다 머리글을 따로 두고 이어서 보인다. 위젯이 비지 않게 마지막 하나는 끌 수 없어서, 위젯을 통째로 숨기려면 메뉴바 창 아래쪽의 "떠 있는 위젯" 을 끈다.
+The floating widget is a small window that stays on top in every Space. Choose the tools it shows with "Show in widget" in each tool box of the menu bar window. You can also turn them on and off from the widget's right-click menu. At first it shows only Claude. With both on, each tool gets its own header, one after the other. The last tool cannot be turned off, so the widget is never empty. To hide the whole widget, turn off "Floating widget" at the bottom of the menu bar window.
 
-머리글 한 줄에 `5h 리셋 Week 리셋` 열 이름을 두고, 계정마다 게이지와 사용률, 리셋까지 남은 시간을 한 줄씩 보인다. 도구가 여럿이면 머리글 왼쪽에 로고와 도구 이름을 쓴다. Codex 무료 요금제처럼 긴 창이 30일이면 Week 대신 `30d` 를 열 이름으로 쓴다. 모델별 주간 한도가 있는 계정이 하나라도 있으면 Week 뒤에 `Fable 리셋` 처럼 모델 이름 열을 더하고, 그 한도가 없는 계정은 칸에 `–` 를 둔다. 모델별 칸에 마우스를 올리면 그 한도를 이번 배정에 견주는지 보인다. `▸` 가 붙은 계정이 다음에 배정될 계정이다. 끌어서 옮기면 그 자리를 기억하고, 오른쪽 클릭으로 새로고침하거나 숨긴다.
+A one-line header holds the column names `5h Reset Week Reset`. Each account gets one line with gauges, usage, and the time left until reset. With more than one tool, the header shows the logo and tool name on the left. If the long window is 30 days, as on the Codex free plan, the column is named `30d` instead of Week. If any account has a per-model weekly limit, a model column such as `Fable Reset` is added after Week. Accounts without that limit get `–` in the cell. Hover over a per-model cell to see whether that limit counts toward the current pick. The account marked `▸` is the next pick. Drag the widget to move it, and it remembers the spot. Right-click to refresh or hide it.
 
-## 앱은 acm status 만 부른다
+## The app only calls acm status
 
-앱은 30초마다 `acm status --json` 을 부를 뿐이고 사용량을 직접 읽지 않는다. 조회할 때가 된 계정이 있으면 acm 이 `/usage` 나 `codex app-server` 조회를 뒤에서 띄우고, 앱은 다음 호출에서 새 값을 받는다. acm 이 60초 안에 끝나지 않으면 끊고, 마지막 값을 흐리게 둔 채 다음 호출을 기다린다. 메뉴바 앱은 셸의 PATH 를 물려받지 않아서 `~/.local/bin` 과 `/opt/homebrew/bin` 을 PATH 에 넣고 acm 을 부른다. 앱만 고쳤으면 `app/build.sh` 로 다시 빌드한다.
+The app only calls `acm status --json` every 30 seconds. It never reads usage itself. If an account is due for a poll, acm starts the `/usage` or `codex app-server` poll in the background, and the app gets the new values on the next call. If acm does not finish within 60 seconds, the app cuts it off, dims the last values, and waits for the next call. The menu bar app does not inherit the shell's PATH, so it adds `~/.local/bin` and `/opt/homebrew/bin` to PATH before calling acm. If you changed only the app, rebuild it with `app/build.sh`.
