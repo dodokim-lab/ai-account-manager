@@ -155,6 +155,13 @@ def info(msg):
     print(f"acm: {msg}", file=sys.stderr)
 
 
+def run_attached(cmd, **kw):
+    """Run a command that writes to the same output as acm. When stdout is a pipe, Python holds acm's lines in a buffer
+    while the child writes straight away, so flush first to keep the lines in order."""
+    sys.stdout.flush()
+    return subprocess.run(cmd, **kw)
+
+
 # ---------- account list ----------
 
 def load_accounts():
@@ -1160,6 +1167,18 @@ def score_account(u, model, now, five_cap, seven_cap):
     return five_left * factor, blocked
 
 
+def free_at(u, model):
+    """When an account with nothing left has some again: the latest reset among its windows at 100%.
+    An account the tool refuses with no window at 100% waits for every window it reported. Without a known reset, it never frees up."""
+    windows = ([(u["five"], u["five_reset"]), (u["seven"], u["seven_reset"])]
+               + [(s["pct"], s["resets_at"]) for s in u["scoped"] if scope_matches(s["name"], model)]
+               + [(e["pct"], e["resets_at"]) for e in u.get("extra") or []])
+    waits = [r for p, r in windows if p is not None and p >= 100]
+    if not waits and u.get("denied"):
+        waits = [r for p, r in windows if p is not None and r]
+    return max(waits) if waits and all(waits) else float("inf")
+
+
 def settings_model(path):
     conf = read_json(path)
     model = conf.get("model") if isinstance(conf, dict) else None
@@ -1337,8 +1356,17 @@ def pick(data, mode, model=None, exclude=(), strict=False, tool="claude"):
         rows.append({"name": n, "u": u, "active": active, "exhausted": exhausted, "score": score})
     if strict and all(r["exhausted"] for r in rows):
         return None, "All other accounts are near their limit. " + " / ".join(blocked_reason(data, r, reserved, model) for r in rows)
-    # Even when all are blocked, keep the primary account for last
-    pool = [r for r in rows if not r["exhausted"]] or [r for r in rows if r["name"] != reserved] or rows
+    pool = [r for r in rows if not r["exhausted"]]
+    if not pool:
+        # Past the caps every score is 0, so the pick would fall to rotation order. Compare what is really left up to 100% instead,
+        # so an account the tool says cannot be used now, or one at 100%, is not picked while another still has some left.
+        # Even when all are blocked, keep the primary account for last among the accounts that still have some left
+        for r in rows:
+            r["score"] = 0.0 if r["u"].get("denied") else score_account(r["u"], model, now, 100.0, 100.0)[0]
+        usable = [r for r in rows if r["score"] > 0]
+        # When none has anything left, use the one that frees up first. A session started there works once the window resets
+        pool = ([r for r in usable if r["name"] != reserved] or usable
+                or [min([r for r in rows if r["name"] != reserved] or rows, key=lambda r: free_at(r["u"], model))])
     # Use the account with the highest score first. Session counts only decide among accounts with close scores.
     # If still tied, the rotate_after order (the one after the last pick) wins
     top = max(r["score"] for r in pool)
@@ -2999,7 +3027,7 @@ def setup_tmux(run):
     if not run.ask("Install tmux with brew to run the publisher session in the background?"):
         run.left("brew install tmux")
         return
-    if subprocess.run(["brew", "install", "tmux"]).returncode == 0 and shutil.which("tmux"):
+    if run_attached(["brew", "install", "tmux"]).returncode == 0 and shutil.which("tmux"):
         run.done("Installed tmux")
     else:
         run.left("brew install tmux failed. Install it yourself")
@@ -3257,7 +3285,7 @@ def next_account_id(data, tool="claude"):
 
 def login_account(name):
     """Start claude auth login for that account. It ends only after a person finishes the browser sign-in."""
-    subprocess.run([sys.executable, os.path.abspath(__file__), "-a", name, "auth", "login"])
+    run_attached([sys.executable, os.path.abspath(__file__), "-a", name, "auth", "login"])
     return account_email(load_accounts()["accounts"][name])
 
 
@@ -3645,10 +3673,10 @@ def cmd_upgrade(data, args):
         if subprocess.run(["git", "-C", src, "rev-parse", "--git-dir"], capture_output=True).returncode != 0:
             die(f"{src} is not a git repository. Update the source yourself, then acm upgrade --no-pull")
         print(f"Pulling {src}")
-        if subprocess.run(["git", "-C", src, "pull", "--ff-only"]).returncode != 0:
+        if run_attached(["git", "-C", src, "pull", "--ff-only"]).returncode != 0:
             die("git pull --ff-only failed. Fix the repository yourself and run again")
     cmd = ["sh", os.path.join(src, "install.sh")] + (["--no-app"] if inst.get("no_app") else [])
-    sys.exit(subprocess.run(cmd, cwd=src).returncode)
+    sys.exit(run_attached(cmd, cwd=src).returncode)
 
 
 HELP = """acm: start independent sessions across several Claude and Codex accounts

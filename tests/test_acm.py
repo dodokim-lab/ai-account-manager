@@ -271,6 +271,12 @@ class Pick(AcmCase):
         name, why = self.acm.pick(data, "usage")
         self.assertEqual(name, "cl2")
         self.assertIn("near their limit", why)
+        # Once the other account has nothing left, the primary account still has some, so it is used
+        self.polled("cl2", seven_day={"used_percentage": 100, "resets_at": now + 3 * 86400})
+        self.assertEqual(self.acm.pick(data, "usage")[0], "cl1")
+        # When none has anything left, the primary account still comes last
+        self.polled("cl1", seven_day={"used_percentage": 100, "resets_at": now + 3 * 86400})
+        self.assertEqual(self.acm.pick(data, "usage")[0], "cl2")
 
 
 class SessionModel(AcmCase):
@@ -1108,6 +1114,26 @@ class AccountsFile(AcmCase):
         self.assertEqual((saved["mode"], saved["accounts"]["cl2"]["label"]), ("rr", "personal"))
 
 
+class Upgrade(AcmCase):
+    def test_output_stays_in_order_through_a_pipe(self):
+        # acm prints "Pulling" before git pull. Through a pipe, that line used to come out after install.sh's output
+        git = ["git", "-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "init.defaultBranch=main"]
+        origin, src = os.path.join(self.tmp, "origin"), os.path.join(self.tmp, "src")
+        subprocess.run(git + ["init", "-q", origin], check=True)
+        with open(os.path.join(origin, "install.sh"), "w") as f:
+            f.write("echo installed\n")
+        subprocess.run(git + ["-C", origin, "add", "."], check=True)
+        subprocess.run(git + ["-C", origin, "commit", "-qm", "c"], check=True)
+        subprocess.run(git + ["clone", "-q", origin, src], check=True)
+        self.acm.save_json(self.acm.INSTALL_FILE, {"source": src, "no_app": True})
+        out = subprocess.run([sys.executable, ACM, "upgrade"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             text=True, env=os.environ, cwd=self.home).stdout
+        lines = out.splitlines()
+        self.assertIn(f"Pulling {src}", lines, out)
+        self.assertIn("installed", lines, out)
+        self.assertLess(lines.index(f"Pulling {src}"), lines.index("installed"), out)
+
+
 class Resilience(AcmCase):
     """A defect in acm or odd input must never keep claude from starting."""
 
@@ -1281,6 +1307,28 @@ class Codex(AcmCase):
         self.acm.set_last_pick(data, "codex", "cx2")
         self.assertEqual(self.acm.pick(data, "rr", tool="codex")[0], "cx1")
         self.assertIsNone(self.acm.load_accounts()["last"])
+
+    def test_all_blocked_skips_account_codex_refuses(self):
+        # cx1 is refused by Codex until its 30-day reset. cx2 is past the 95% 5h cap but still has 3% left.
+        # Past the caps both scores used to be 0, so rotation order picked cx1, which cannot start a session
+        now = time.time()
+        data = self.codex_accounts()
+        self.codex_polled("cx1", [{"used_percentage": 100, "resets_at": now + 20 * 86400, "window_minutes": 43200}],
+                          allowed=False, plan="free")
+        self.codex_polled("cx2", [{"used_percentage": 97, "resets_at": now + 3600, "window_minutes": 300},
+                                  {"used_percentage": 15, "resets_at": now + 5 * 86400, "window_minutes": 10080}])
+        name, why = self.acm.pick(data, "usage", tool="codex")
+        self.assertEqual(name, "cx2")
+        self.assertIn("near their limit", why)
+        # Once cx2 has nothing left either, it still wins because its 5h window resets long before cx1's 30 days
+        self.codex_polled("cx2", [{"used_percentage": 100, "resets_at": now + 3600, "window_minutes": 300},
+                                  {"used_percentage": 16, "resets_at": now + 5 * 86400, "window_minutes": 10080}],
+                          allowed=False)
+        self.assertEqual(self.acm.pick(data, "usage", tool="codex")[0], "cx2")
+        # If cx1 frees up first, it is the one
+        self.codex_polled("cx1", [{"used_percentage": 100, "resets_at": now + 600, "window_minutes": 43200}],
+                          allowed=False, plan="free")
+        self.assertEqual(self.acm.pick(data, "usage", tool="codex")[0], "cx1")
 
     def test_pick_without_codex_accounts_stops(self):
         data = self.accounts(["cl1"])
