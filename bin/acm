@@ -2037,6 +2037,9 @@ def set_publisher(data, **kw):
 
 
 def publisher_running():
+    # Without tmux there is no publisher session. Calling it anyway would crash acm publisher status
+    if not shutil.which("tmux"):
+        return False
     return subprocess.run(["tmux", "has-session", "-t", "=" + PUBLISHER_SESSION],
                           capture_output=True).returncode == 0
 

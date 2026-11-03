@@ -34,6 +34,10 @@ fi
 need python3 "Run xcode-select --install"
 need jq "Run brew install jq"
 need claude "Install Claude Code first"
+# Check before installing anything, so a missing swiftc does not leave a half-finished install
+if [ "$MODE" != "--no-app" ]; then
+  need swiftc "Run xcode-select --install"
+fi
 
 mkdir -p "$BIN"
 for f in acm acm-statusline; do
@@ -63,7 +67,6 @@ esac
 "$BIN/acm" install-statusline
 
 if [ "$MODE" != "--no-app" ]; then
-  need swiftc "Run xcode-select --install"
   "$DIR/app/build.sh"
   open "$APP"
 fi
