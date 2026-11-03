@@ -569,6 +569,39 @@ class PublisherScope(AcmCase):
         self.assertIsNotNone(self.guard("Read", file_path=theirs))
         self.assertIsNone(self.guard("ListAgents"))
 
+    def test_guard_reads_own_live_copy_for_update(self):
+        # 갱신 전 Artifact read 는 라이브 판을 기록 파일 옆 <세션 ID>/tool-results/artifact-* 에 저장한다
+        projects = os.path.join(self.home, ".claude", "projects", "-proj")
+
+        def guard(tool, transcript=os.path.join(projects, "sess-1.jsonl"), **tool_input):
+            event = {"tool_name": tool, "tool_input": tool_input, "cwd": self.acm.PUBLISHER_DIR, "session_id": "sess-1"}
+            if transcript is not None:
+                event["transcript_path"] = transcript
+            return self.acm.publisher_guard_problem(event)
+
+        mine = self.write(".claude/projects/-proj/sess-1/tool-results/artifact-d01b-1793682370-8418.html")
+        results = os.path.dirname(mine)
+        self.assertIsNone(guard("Read", file_path=mine, offset=1, limit=1499))
+        self.assertIsNotNone(guard("Read", transcript=None, file_path=mine))
+        self.assertIsNotNone(guard("Read", transcript="-proj/sess-1.jsonl", file_path=mine))
+        self.assertIsNotNone(guard("Read", transcript=os.path.join(projects, "sess-1"), file_path=mine))
+        # 다른 세션의 사본, artifact- 가 아닌 결과 파일, 하위 폴더는 막는다
+        self.assertIsNotNone(guard("Read", file_path=self.write(".claude/projects/-proj/sess-2/tool-results/artifact-a.html")))
+        self.assertIsNotNone(guard("Read", file_path=self.write(".claude/projects/-proj/sess-1/tool-results/toolu_01.txt", "k")))
+        self.assertIsNotNone(guard("Read", file_path=self.write(".claude/projects/-proj/sess-1/tool-results/x/artifact-a.html")))
+        self.assertIsNotNone(guard("Read", file_path=os.path.join(projects, "sess-1.jsonl")))
+        # 자기 폴더로 돌아오는 경로라도 .. 는 받지 않는다
+        self.assertIsNotNone(guard("Read", file_path=os.path.join(results, "..", "tool-results", os.path.basename(mine))))
+        # 이름만 artifact- 인 링크가 밖을 가리키면 막는다
+        link = os.path.join(results, "artifact-link.html")
+        os.symlink(self.write(".ssh/key.html"), link)
+        self.assertIsNotNone(guard("Read", file_path=link))
+        # 사본은 읽기만 하고 발행 경로로는 받지 않는다
+        self.assertIsNotNone(guard("Artifact", file_path=mine, url="u"))
+        staged = self.acm.stage_files([self.write("work/page.html")])[0][0]
+        self.assertIsNotNone(guard("Artifact", file_path=staged, url="u", files={"live.html": mine}))
+        self.assertIsNone(guard("Artifact", file_path=staged, url="u"))
+
     def test_guard_artifact_paths_and_actions(self):
         staged = self.acm.stage_files([self.write("work/page.html"), self.write("work/a.js", "1")])
         page, js = staged[0][0], staged[1][0]
