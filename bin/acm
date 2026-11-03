@@ -1,0 +1,3964 @@
+#!/usr/bin/env python3
+"""acm: 여러 Claude 계정에 독립 세션을 나눠 띄우는 런처.
+
+공유 원본은 ~/.claude 이고, 추가 계정은 ~/.claude-<name> 에 로그인 정보와
+.claude.json 만 따로 두고 나머지는 ~/.claude 로 심링크한다.
+세션을 띄울 때 남은 여유가 가장 큰 계정을 고르고, 여유가 비슷하면 실행 중인 세션 수로 가른다.
+주간 창은 리셋이 가까울수록 남은 여유를 크게 친다. 리셋 전에 안 쓰면 사라지는 몫이라서다.
+사용량은 statusline 기록과 그 계정 Claude Code 의 `claude -p /usage` 중 더 최근 것을 쓴다.
+acm 은 로그인 토큰을 읽거나 옮기지 않는다.
+"""
+import fcntl
+import glob
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import threading
+import time
+from queue import Empty, Queue
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:  # pragma: no cover - Python 3.9 부터 있다
+    ZoneInfo = None
+
+VERSION = "0.3.0"
+# acm 이 기대는 Claude Code 내부 구조를 마지막으로 확인한 판. acm doctor 와 acm version 이 지금 판과 함께 보인다
+VERIFIED_CLAUDE = "2.1.316"
+
+HOME = os.path.expanduser("~")
+SHARED = os.path.join(HOME, ".claude")
+DEFAULT_CLAUDE_JSON = os.path.join(HOME, ".claude.json")
+STATE_DIR = os.environ.get("ACM_HOME", os.path.join(HOME, ".acm"))
+ACCOUNTS_FILE = os.path.join(STATE_DIR, "accounts.json")
+LOCK_FILE = os.path.join(STATE_DIR, ".lock")
+# accounts.json 을 고칠 때만 잡는 잠금. LOCK_FILE 을 쥔 채로도 잡을 수 있게 따로 둔다
+ACCOUNTS_LOCK = os.path.join(STATE_DIR, ".accounts.lock")
+USAGE_DIR = os.path.join(STATE_DIR, "usage")
+RUN_DIR = os.path.join(STATE_DIR, "run")
+
+# 계정마다 따로 둬야 하는 항목. 나머지는 전부 ~/.claude 로 링크한다.
+PER_ACCOUNT = {
+    ".claude.json",
+    ".credentials.json",
+    "backups",  # .claude.json 백업
+    "daemon",  # 백그라운드 에이전트 데몬 (인증 포함)
+    "daemon-auth-cooldown",
+    "daemon-auth-status.json",
+    "daemon.log",
+    "jobs",  # 데몬이 관리하는 백그라운드 세션 목록
+    "telemetry",
+    "statsig",
+}
+
+# acm 이 다루는 도구. 계정마다 tool 이 있고, 없으면 claude 다. 배정은 같은 도구의 계정끼리만 한다
+TOOLS = ("claude", "codex")
+TOOL_NAMES = {"claude": "Claude", "codex": "Codex"}
+# 계정 id 앞부분. 새 계정 id 를 지을 때 쓴다
+# 계정 id 앞머리. 도구 약자에 번호를 붙인다 (cl1, cx2)
+TOOL_ID_PREFIX = {"claude": "cl", "codex": "cx"}
+
+# Codex 의 root. 추가 계정은 CODEX_HOME 을 ~/.codex-<id> 로 두고, 계정마다 달라야 하는 것만 실제 파일로 둔다.
+# app-server-daemon 과 app-server-control 은 로그인한 계정으로 뜬 데몬의 소켓이라, 같이 쓰면 다른 계정 세션이
+# 그 데몬에 붙어 그 계정으로 돈다. 세션 기록과 상태 DB, 설정, 스킬, 훅은 링크로 같이 써서 어느 계정에서든 이어 간다.
+# SQLite 는 링크를 따라간 실제 파일 옆에 WAL 을 만들어서 DB 를 링크로 같이 써도 된다
+CODEX_ROOT = os.path.join(HOME, ".codex")
+CODEX_PER_ACCOUNT = {
+    "auth.json",
+    "app-server-daemon",
+    "app-server-control",
+    "models_cache.json",  # 요금제마다 쓸 수 있는 모델이 다르다
+    "installation_id",
+    "log",
+    "cache",
+    "tmp",
+    ".tmp",  # 플러그인 목록을 받아 오는 임시 폴더
+    ".acm-drift",
+}
+# SQLite 가 DB 옆에 잠깐 두는 파일. 링크를 따라간 실제 DB 옆에 생기니 계정 폴더에는 링크하지 않는다
+CODEX_TRANSIENT = ("-wal", "-shm", "-journal")
+# 세션이 아니라 뒤에서 도는 codex 프로세스의 하위 명령
+CODEX_BACKGROUND_ARGS = ("app-server", "exec-server", "mcp-server", "remote-control")
+# 계정을 고를 일이 없는 codex 하위 명령. 셸 함수는 그대로 codex 로 보내고, acm 은 root 계정으로 띄운다
+CODEX_PASSTHROUGH = ("agents", "login", "logout", "mcp", "plugin", "app-server", "remote-control", "app", "completion",
+                     "update", "doctor", "sandbox", "debug", "apply", "archive", "delete", "migrate-rollouts",
+                     "migrate-nfs-db", "unarchive", "exec-server", "features", "help", "-h", "--help", "-V", "--version")
+
+# 실체를 ~/.claude 밖(STORE_DIR)에 두고 ~/.claude 쪽은 링크로 두는 항목.
+# Claude Code 는 링크를 따라간 실제 경로가 세션 자기 설정 폴더가 아닌 .claude 폴더 안이면 민감 파일로 보고
+# auto 모드에서도 확인을 묻는다. 추가 계정 세션은 메모리(projects)와 스킬, 훅을 고칠 때마다 걸린다.
+# 실체가 밖에 있으면 어느 계정에서 써도 걸리지 않는다. 허용 규칙과 --add-dir 로는 풀리지 않는다.
+# 파일은 옮기지 않는다. Write·Edit 가 링크 파일에는 쓰지 않고 실제 경로로 다시 쓰게 해서 기본 계정까지 돌아가게 된다.
+STORE_DIR = os.path.join(STATE_DIR, "shared")
+RELOCATED = ("projects", "skills", "hooks")
+
+# 새 계정의 .claude.json 에 기본 계정에서 복사해 오는 키
+SEED_KEYS = [
+    "hasCompletedOnboarding",
+    "lastOnboardingVersion",
+    "theme",
+    "installMethod",
+    "autoUpdates",
+    "githubRepoPaths",
+    "hasIdeOnboardingBeenShown",
+]
+
+# 기본 계정을 그대로 따라가는 개인 설정. 맞출 때마다 기본 계정 값으로 덮고, 기본 계정에 없으면 지운다.
+PREF_KEYS = (
+    "theme",
+    "editorMode",
+    "verbose",
+    "autoUpdates",
+    "autoUpdatesProtectedForNative",
+    "autoCompactEnabled",
+    "showSpinnerTree",
+    "deepLinkTerminal",
+    "preferredNotifChannel",
+    "diffTool",
+)
+
+# .claude.json 의 projects 항목 중 복사할 키 (has* 신뢰 플래그와 함께)
+PROJECT_KEYS = (
+    "allowedTools",
+    "mcpServers",
+    "mcpContextUris",
+    "enabledMcpjsonServers",
+    "disabledMcpjsonServers",
+    "enabledMcpServers",
+    "disabledMcpServers",
+)
+
+FIVE_HOUR_CAP =float(os.environ.get("ACM_FIVE_HOUR_CAP", "95"))
+SEVEN_DAY_CAP = float(os.environ.get("ACM_SEVEN_DAY_CAP", "98"))
+# 사용률이 가장 낮은 계정과 이만큼(%p) 안쪽이면 비슷하다고 보고, 그 안에서는 실행 중 세션이 적은 계정을 고른다
+USAGE_BAND = float(os.environ.get("ACM_USAGE_BAND", "5"))
+# 대표 계정은 아티팩트 발행에 쓸 여유를 남긴다. 자동 배정은 이 기준에서 멈추고, 그 아래에서는 다른 계정과
+# 똑같이 견줘서 계정마다 고르게 나눈다. `acm -a` 로 직접 지정하면 기준과 상관없이 뜬다.
+RESERVE_FIVE_HOUR_CAP = float(os.environ.get("ACM_RESERVE_FIVE_HOUR_CAP", "70"))
+RESERVE_SEVEN_DAY_CAP = float(os.environ.get("ACM_RESERVE_SEVEN_DAY_CAP", "85"))
+
+
+def die(msg, code=1):
+    print(f"acm: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def info(msg):
+    print(f"acm: {msg}", file=sys.stderr)
+
+
+# ---------- 계정 목록 ----------
+
+def load_accounts():
+    if not os.path.exists(ACCOUNTS_FILE):
+        os.makedirs(STATE_DIR, exist_ok=True)
+        data = {"mode": "usage", "order": ["cl1"], "accounts": {"cl1": {"dir": None}}, "last": None}
+        save_json(ACCOUNTS_FILE, data)
+        return data
+    with open(ACCOUNTS_FILE) as f:
+        return json.load(f)
+
+
+def update_accounts(change):
+    """accounts.json 을 잠금 안에서 다시 읽어 change 를 적용하고 저장한 뒤, 고친 내용을 돌려준다.
+    여러 acm 이 동시에 고쳐도 서로의 last, mode, label, publisher, email 을 묵은 값으로 덮지 않는다."""
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(ACCOUNTS_LOCK, "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        fresh = load_accounts()
+        change(fresh)
+        save_json(ACCOUNTS_FILE, fresh)
+    return fresh
+
+
+def save_json(path, data):
+    tmp = f"{path}.tmp.{os.getpid()}"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+def read_json(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def tool_of(acc):
+    return acc.get("tool") or "claude"
+
+
+def tool_accounts(data, tool):
+    """그 도구의 계정 id. data["order"] 순서다."""
+    return [n for n in data["order"] if tool_of(data["accounts"][n]) == tool]
+
+
+def config_dir(acc):
+    """None 이면 그 도구의 root 계정이다. Claude 는 ~/.claude(CLAUDE_CONFIG_DIR 미설정), Codex 는 ~/.codex(CODEX_HOME 미설정)."""
+    return acc.get("dir")
+
+
+def codex_home(acc):
+    return config_dir(acc) or CODEX_ROOT
+
+
+def claude_json_path(acc):
+    d = config_dir(acc)
+    return DEFAULT_CLAUDE_JSON if d is None else os.path.join(d, ".claude.json")
+
+
+def logged_in(acc):
+    """로그인한 계정인지. Codex 는 auth.json 이 있는지만 본다. acm 은 그 안의 토큰을 읽지 않는다."""
+    if tool_of(acc) == "codex":
+        return os.path.exists(os.path.join(codex_home(acc), "auth.json"))
+    return bool(account_email(acc))
+
+
+def account_email(acc):
+    """로그인한 이메일. Codex 는 사용량을 읽을 때 app-server 의 account/read 로 받아 accounts.json 에 적어 둔 값이다."""
+    if tool_of(acc) == "codex":
+        return acc.get("email") if logged_in(acc) else None
+    data = read_json(claude_json_path(acc)) or {}
+    return (data.get("oauthAccount") or {}).get("emailAddress")
+
+
+def account_label(name, acc):
+    """화면에 보일 이름: 직접 붙인 label, 없으면 이메일 앞부분, 없으면 계정 id."""
+    email = acc.get("email")
+    return acc.get("label") or (email.split("@")[0] if email else name)
+
+
+def remember_emails(data):
+    """로그인 이메일과 요금제를 accounts.json 에 적어 둔다 (statusline 과 앱이 .claude.json 을 읽지 않게).
+    data 는 몇십 초 묵었을 수 있어서 통째로 저장하지 않고, 파일을 다시 읽어 바뀐 값만 고친다."""
+    idents = {}
+    for name, acc in data["accounts"].items():
+        if tool_of(acc) == "codex":
+            # Codex 이메일과 요금제는 사용량 조회가 적는다. 여기서는 로그아웃한 계정만 지운다.
+            # 다른 계정으로 다시 로그인할 수 있어 요금제와 계정 ID 도 함께 지운다
+            if not logged_in(acc) and any(acc.get(k) for k in ("email", "plan", "account_id")):
+                idents[name] = {"email": None, "plan": None, "account_id": None}
+            continue
+        o = oauth_account(acc)
+        email = o.get("emailAddress")
+        # 요금제 이름은 Claude Code 가 받아 둔 표시 이름이다 (Ultra, Max, Pro 같은 것)
+        idents[name] = {"email": email, "plan": o.get("planDisplayName") if email else None}
+    changed = {n: v for n, v in idents.items() if any(data["accounts"][n].get(k) != x for k, x in v.items())}
+    if not changed:
+        return
+
+    def apply(acc, ident):
+        for key, value in ident.items():
+            # email 은 로그아웃해도 null 로 남기고, 나머지는 지운다
+            if value is None and key != "email":
+                acc.pop(key, None)
+            else:
+                acc[key] = value
+
+    def change(fresh):
+        for name, ident in changed.items():
+            if name in fresh["accounts"]:
+                apply(fresh["accounts"][name], ident)
+    update_accounts(change)
+    for name, ident in changed.items():
+        apply(data["accounts"][name], ident)
+
+
+def resolve(data, key, tool=None):
+    """id, label, 이메일, 이메일 앞부분 중 하나로 계정을 찾는다. 도구를 주면 그 도구의 계정에서만 찾고,
+    주지 않으면 Claude 계정부터 본다. 같은 이메일로 Claude 와 Codex 에 모두 로그인했을 수 있어서다."""
+    if key in data["accounts"]:
+        return key
+    names = tool_accounts(data, tool) if tool else sorted(data["order"], key=lambda n: tool_of(data["accounts"][n]) != "claude")
+    for name in names:
+        acc = data["accounts"][name]
+        email = acc.get("email") or ""
+        if key in (acc.get("label"), email, email.split("@")[0]):
+            return name
+    choices = ", ".join(f"{n}({account_label(n, data['accounts'][n])})" for n in names)
+    die(f"없는 계정: {key} (있는 계정: {choices})")
+
+
+# ---------- 사용량 ----------
+# 사용량은 두 곳에서 온다. 세션이 떠 있는 계정은 acm-statusline 이 usage/<계정>.json 에 적고, 로그인한 계정은 모두
+# POLL_INTERVAL 마다 뒤에서 그 계정의 `claude -p /usage` 로 읽어 poll/<계정>.json 의 usage 에 적는다.
+# 5h 와 Week 는 창마다 더 최근에 받은 쪽을 쓴다. 모델별 주간 한도(Fable, Sonnet only 같은 것)는 /usage 에만 있다.
+# 창마다 at 에 받은 시각을 적는다. 기록 전체의 updated_at 은 다른 창 때문에 바뀔 수 있어서다.
+
+WEEK_SECS = 7 * 86400
+# 5h 창을 마지막으로 본 뒤 이만큼 지나도록 다시 보이지 않으면 5시간 한도가 없는 계정(Ultra 인증 계정)으로 본다.
+# 한도가 있는 계정도 창이 리셋되면 statusline 과 /usage 에서 5h 가 빠지니, 한 번 빠졌다고 한도 없음으로 보지 않는다
+FIVE_HOUR_MEMORY = 24 * 3600
+
+
+def number(v):
+    """숫자로 읽을 수 있으면 float, 아니면 None. 사용량 기록은 Claude Code 가 주는 값이라 모양이 바뀌어도 멈추지 않게 한다."""
+    if isinstance(v, bool):
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def window_pct(w, now):
+    """창의 사용률. 리셋 시각이 지났으면 0."""
+    if not isinstance(w, dict):
+        return 0.0
+    reset = number(w.get("resets_at"))
+    if reset and reset <= now:
+        return 0.0
+    return number(w.get("used_percentage")) or 0.0
+
+
+def window_reset(w, now):
+    """창의 다음 리셋 시각. 지났거나 모르면 None."""
+    reset = number(w.get("resets_at")) if isinstance(w, dict) else None
+    return reset if reset and reset > now else None
+
+
+def scope_short(name):
+    """화면에 쓸 짧은 이름. 'Sonnet only' 는 'Sonnet'."""
+    return re.sub(r"\s+only$", "", name.strip(), flags=re.I)
+
+
+def account_usage(name, now):
+    """그 계정의 사용량. five 가 None 이면 5시간 한도가 없는 계정이다."""
+    polled = (read_json(os.path.join(POLL_DIR, f"{name}.json")) or {}).get("usage") or {}
+    if polled.get("tool") == "codex":
+        return codex_usage(polled, now)
+    sl = read_json(os.path.join(USAGE_DIR, f"{name}.json")) or {}
+
+    def latest(key):
+        best = (0, None)
+        for rec in (sl, polled):
+            w = rec.get(key)
+            if isinstance(w, dict):
+                at = w.get("at") or rec.get("updated_at") or 0
+                if at > best[0]:
+                    best = (at, w)
+        return best
+
+    five_at, five_w = latest("five_hour")
+    _, seven_w = latest("seven_day")
+    limited = bool(five_at) and now - five_at < FIVE_HOUR_MEMORY
+    sl_at, poll_at = sl.get("updated_at") or 0, polled.get("updated_at") or 0
+    scoped = [{"name": s["name"], "short": scope_short(s["name"]), "pct": window_pct(s, now),
+               "resets_at": window_reset(s, now)}
+              for s in polled.get("scoped") or [] if isinstance(s, dict) and s.get("name")]
+    return {
+        "five": window_pct(five_w, now) if limited else None,
+        "five_reset": window_reset(five_w, now) if limited else None,
+        "seven": window_pct(seven_w, now),
+        "seven_reset": window_reset(seven_w, now),
+        "seven_window": WEEK_SECS,
+        "seven_name": "Week",
+        "extra": [],
+        "denied": False,
+        "plan": None,
+        "scoped": scoped,
+        "updated_at": max(sl_at, poll_at) or None,
+        "source": None if not (sl_at or poll_at) else "statusline" if sl_at >= poll_at else "/usage",
+        "model": sl.get("model"),
+    }
+
+
+def usage(name, now):
+    """(5시간 %, 7일 %, 데이터 시각). 5시간 한도가 없는 계정은 5시간 자리가 None 이다."""
+    u = account_usage(name, now)
+    return u["five"], u["seven"], u["updated_at"]
+
+
+def near_limit(five, seven, five_cap, seven_cap):
+    """5시간 한도가 없는 계정은 Week 만 본다."""
+    return (five is not None and five >= five_cap) or seven >= seven_cap
+
+
+def fmt_usage(five, seven, name="Week"):
+    """"5h 30% · Week 16%". 5시간 한도가 없는 계정은 Week 만 쓴다. Codex 무료 요금제처럼 긴 창이 30일이면 name 이 30d 다."""
+    return (f"5h {five:.0f}% · " if five is not None else "") + f"{name} {seven:.0f}%"
+
+
+def fmt_u(u):
+    """account_usage 결과를 한 줄로. Codex 의 다른 긴 창도 붙인다."""
+    return fmt_usage(u["five"], u["seven"], u.get("seven_name") or "Week") + "".join(
+        f" · {e['name']} {e['pct']:.0f}%" for e in u.get("extra") or [])
+
+
+# ---------- /usage 조회 ----------
+# acm 은 토큰을 꺼내 API 를 부르지 않는다. 그 계정의 Claude Code 에 `claude -p /usage` 를 시켜 읽는다.
+# 이 명령은 모델을 부르지 않아 토큰이 들지 않는다(2.1.316 에서 입력·출력 0 토큰, 비용 $0, 3.8초).
+# 출력은 사람이 읽는 문장이라 형식이 바뀌면 파싱이 깨진다. acm doctor 가 실제로 돌려 보고 점검한다.
+
+POLL_DIR = os.path.join(STATE_DIR, "poll")
+POLL_INTERVAL = float(os.environ.get("ACM_POLL_INTERVAL", "300"))
+POLL_FAIL_MIN = 360.0
+POLL_FAIL_MAX = 1800.0
+POLL_TIMEOUT = 60
+# 조회를 맡은 acm 이 이만큼 안에 끝내지 못하면 다른 acm 이 다시 맡는다
+POLL_CLAIM = POLL_TIMEOUT + 30
+USAGE_ARGS = ["-p", "/usage", "--output-format", "json", "--no-session-persistence", "--safe-mode",
+              "--model", "haiku", "--max-turns", "1", "--tools", ""]
+
+# /usage 가 실패하면 토큰이 만료됐을 수 있다. 그때만 haiku 에 짧은 요청 하나를 보내 Claude Code 가 토큰을 갱신하게 한다.
+# 갱신은 Claude Code 가 평소처럼 잠금을 잡고 키체인에 다시 쓰는 것이라, 같은 계정 세션이 떠 있어도 꼬이지 않는다.
+# 훅·플러그인·MCP·도구를 모두 끄고 세션 기록도 남기지 않는다. 입력 3천 토큰 남짓이 든다.
+TOKEN_REFRESH_ARGS = ["-p", "ok", "--safe-mode", "--no-session-persistence", "--model", "haiku",
+                      "--max-turns", "1", "--tools", ""]
+TOKEN_REFRESH_RETRY = 1800.0
+# 갱신을 띄운 뒤 다시 조회할 때까지 기다리는 시간
+TOKEN_REFRESH_RECHECK = 90.0
+
+# claude 세션이 자기 하위 프로세스에 남기는 값과 acm 의 계정 표시. 뒤에서 띄우는 claude 에 물려주면
+# 띄운 세션의 소켓과 세션 ID 를 가리킨 채 남고, 띄운 세션이 끝난 뒤에는 없는 소켓을 가리킨다
+SESSION_ENV = ("CLAUDECODE", "CLAUDE_PID", "CLAUDE_EFFORT", "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_ENTRYPOINT",
+               "CLAUDE_CODE_EXECPATH", "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_SESSION_ID",
+               "CLAUDE_CODE_SESSION_ATTENDED", "CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDE_CODE_MESSAGING_TOKEN",
+               "ACM_ACCOUNT", "ACM_LABEL", "ACM_ROLE", "ACM_CODEX_ACCOUNT")
+SESSION_ENV_PREFIXES = ("CLAUDE_CODE_SESSION_", "CLAUDE_CODE_MESSAGING_")
+# 뒤에서 띄우는 claude 의 표시. 세션 목록과 배정에서 뺀다
+BACKGROUND_ROLES = ("publisher", "token-refresh", "poll")
+
+
+def session_env_keys(env):
+    return sorted(set(SESSION_ENV) | {k for k in env if k.startswith(SESSION_ENV_PREFIXES)})
+
+
+def detached_env():
+    """뒤에서 띄우는 claude 에 줄 환경. 이 명령을 부른 세션에 묶인 값은 뺀다."""
+    drop = session_env_keys(os.environ)
+    return {k: v for k, v in os.environ.items() if k not in drop}
+
+
+def claude_bin():
+    """claude 실행 파일. 메뉴바 앱처럼 PATH 가 짧은 곳에서 불려도 찾는다."""
+    found = shutil.which("claude")
+    if found:
+        return found
+    for cand in (os.path.join(HOME, ".local", "bin", "claude"), os.path.join(HOME, ".claude", "local", "claude"),
+                 "/opt/homebrew/bin/claude", "/usr/local/bin/claude"):
+        if os.access(cand, os.X_OK):
+            return cand
+    return "claude"
+
+
+def account_env(acc, role):
+    """그 계정으로 뒤에서 띄우는 claude 의 환경."""
+    env = detached_env()
+    if config_dir(acc) is not None:
+        env["CLAUDE_CONFIG_DIR"] = config_dir(acc)
+    env["ACM_ROLE"] = role
+    return env
+
+
+MONTHS = {m: i for i, m in enumerate(("Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                      "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"), 1)}
+# `Current week (Fable): 0% used · resets Nov 8 at 8am (Asia/Seoul)` 같은 줄. 2.1.316 의 형식이다
+USAGE_LINE = re.compile(r"^Current (?:session|week \((?P<scope>[^)]+)\)): (?P<pct>\d+(?:\.\d+)?)% used"
+                        r"(?: · resets (?P<reset>.+))?$")
+RESET_DATE = re.compile(r"^(?P<mon>[A-Z][a-z]{2}) (?P<day>\d{1,2})(?:, (?P<year>\d{4}))?(?:,| at) "
+                        r"(?P<hour>\d{1,2})(?::(?P<min>\d{2}))? ?(?P<ampm>am|pm)(?: \((?P<tz>[^)]+)\))?$", re.I)
+RESET_TIME = re.compile(r"^(?P<hour>\d{1,2})(?::(?P<min>\d{2}))? ?(?P<ampm>am|pm)(?: \((?P<tz>[^)]+)\))?$", re.I)
+
+
+def parse_reset(text, now):
+    """/usage 의 리셋 표기를 epoch 초로. 읽지 못하면 None."""
+    text = text.replace(" ", " ").replace(" ", " ").strip()
+    m = RESET_DATE.match(text) or RESET_TIME.match(text)
+    if not m:
+        return None
+    tz = None
+    if m.group("tz") and ZoneInfo is not None:
+        try:
+            tz = ZoneInfo(m.group("tz"))
+        except (KeyError, ValueError, OSError):
+            tz = None
+    tz = tz or datetime.now().astimezone().tzinfo
+    hour = int(m.group("hour")) % 12 + (12 if m.group("ampm").lower() == "pm" else 0)
+    minute = int(m.group("min") or 0)
+    today = datetime.fromtimestamp(now, tz)
+    if "mon" in m.groupdict():
+        # 해가 다를 때만 해를 쓴다
+        year = int(m.group("year")) if m.group("year") else today.year
+        try:
+            dt = datetime(year, MONTHS[m.group("mon")], int(m.group("day")), hour, minute, tzinfo=tz)
+        except (KeyError, ValueError):
+            return None
+    else:
+        dt = today.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if dt.timestamp() < now - 60:
+            dt += timedelta(days=1)
+    return dt.timestamp()
+
+
+def parse_usage_text(text, now):
+    """`claude -p /usage` 출력에서 창마다 사용률과 리셋 시각을 꺼낸다. Week(all models) 줄이 없으면 None."""
+    out = {"scoped": []}
+    for line in (text or "").splitlines():
+        m = USAGE_LINE.match(line.strip())
+        if not m:
+            continue
+        w = {"used_percentage": float(m.group("pct")),
+             "resets_at": parse_reset(m.group("reset"), now) if m.group("reset") else None}
+        scope = m.group("scope")
+        if scope is None:
+            out["five_hour"] = w
+        elif scope == "all models":
+            out["seven_day"] = w
+        else:
+            out["scoped"].append(dict(w, name=scope))
+    return out if "seven_day" in out else None
+
+
+def read_usage(acc):
+    """(파싱한 사용량, 실패 사유). 그 계정의 Claude Code 로 /usage 를 한 번 돌린다."""
+    try:
+        r = subprocess.run([claude_bin()] + USAGE_ARGS, cwd=STATE_DIR, env=account_env(acc, "poll"),
+                           stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=POLL_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return None, "/usage 응답 없음"
+    except OSError:
+        return None, "claude 를 띄우지 못함"
+    try:
+        text = json.loads(r.stdout).get("result") or ""
+    except (ValueError, AttributeError):
+        text = r.stdout or r.stderr or ""
+    parsed = parse_usage_text(text, time.time())
+    if parsed is None:
+        first = next((line.strip() for line in text.splitlines() if line.strip()), "") or f"종료 코드 {r.returncode}"
+        return None, f"/usage 를 읽지 못함: {first[:120]}"
+    return parsed, None
+
+
+def start_token_refresh(acc):
+    """그 계정으로 claude -p 를 뒤에서 띄운다. acm 은 기다리지 않는다."""
+    try:
+        subprocess.Popen([claude_bin()] + TOKEN_REFRESH_ARGS, cwd=STATE_DIR, env=account_env(acc, "token-refresh"),
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    except OSError:
+        return False
+    return True
+
+
+def poll_account(name, acc):
+    """그 계정의 /usage 를 한 번 읽고 결과를 poll 상태에 남긴다."""
+    if tool_of(acc) == "codex":
+        return poll_codex_account(name, acc)
+    state_path = os.path.join(POLL_DIR, f"{name}.json")
+    state = read_json(state_path) or {}
+    parsed, why = read_usage(acc)
+    now = time.time()
+    if parsed is None:
+        backoff = min(POLL_FAIL_MAX, max(POLL_FAIL_MIN, (state.get("backoff") or POLL_INTERVAL) * 1.5))
+        wait, note = backoff, why
+        # 429 는 기다리면 풀린다. 그 밖의 실패는 토큰 만료일 수 있어 30분에 한 번 갱신을 띄운다
+        if "429" not in why and now - (state.get("refresh_at") or 0) >= TOKEN_REFRESH_RETRY and start_token_refresh(acc):
+            state["refresh_at"] = now
+            wait, note = TOKEN_REFRESH_RECHECK, f"{why} · 토큰 갱신을 띄움"
+        elif "429" not in why and state.get("refresh_at"):
+            retry = time.strftime("%H:%M", time.localtime(state["refresh_at"] + TOKEN_REFRESH_RETRY))
+            note = f"{why} · 갱신해도 안 되면 acm -a {name} auth login (다음 갱신 {retry})"
+        state.update(next_at=now + wait, backoff=backoff, note=note, fail_at=int(now))
+    else:
+        t = int(now)
+        rec = {"updated_at": t, "scoped": [dict(s, at=t) for s in parsed["scoped"]]}
+        for key in ("five_hour", "seven_day"):
+            if key in parsed:
+                rec[key] = dict(parsed[key], at=t)
+        state.update(usage=rec, next_at=now + POLL_INTERVAL, backoff=POLL_INTERVAL, note=None, ok_at=t)
+        state.pop("fail_at", None)
+    save_json(state_path, state)
+
+
+def due_accounts(data, now, names=None, force=False):
+    """조회할 때가 된 로그인 계정."""
+    due = []
+    for name in data["order"]:
+        if names is not None and name not in names:
+            continue
+        acc = data["accounts"][name]
+        # Codex 는 이메일을 조회로 알게 되니 auth.json 만 있으면 읽는다
+        if not (logged_in(acc) if tool_of(acc) == "codex" else acc.get("email")):
+            continue
+        state = read_json(os.path.join(POLL_DIR, f"{name}.json")) or {}
+        if force or now >= (state.get("next_at") or 0):
+            due.append(name)
+    return due
+
+
+def run_poll(data, names=None, force=False):
+    """조회할 때가 된 계정을 맡아 /usage 로 읽는다. 끝날 때까지 기다리고, 맡은 계정을 돌려준다."""
+    os.makedirs(POLL_DIR, exist_ok=True)
+    now = time.time()
+    with open(LOCK_FILE, "w") as lock:
+        # 동시에 띄운 acm 끼리 같은 계정을 두 번 조회하지 않게 조회할 몫을 먼저 잡아 둔다
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        due = due_accounts(data, now, names, force)
+        for name in due:
+            path = os.path.join(POLL_DIR, f"{name}.json")
+            state = read_json(path) or {}
+            state["next_at"] = now + POLL_CLAIM
+            save_json(path, state)
+    if due:
+        with ThreadPoolExecutor(max_workers=len(due)) as pool:
+            list(pool.map(lambda n: poll_account(n, data["accounts"][n]), due))
+    return due
+
+
+def refresh_usage(data, wait=False, names=None):
+    """조회할 때가 된 계정이 있으면 /usage 로 읽는다. 기본은 뒤에서 돌리고 바로 돌아온다.
+    세션이 없는 계정은 사용량이 늘지 않으니, 띄울 때 몇 분 묵은 값으로 골라도 된다."""
+    if wait:
+        return run_poll(data, names)
+    if not due_accounts(data, time.time(), names):
+        return []
+    try:
+        subprocess.Popen([sys.executable, os.path.abspath(__file__), "poll", "--quiet"], cwd=STATE_DIR,
+                         env=dict(detached_env(), ACM_HOME=STATE_DIR), stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError:
+        pass
+    return []
+
+
+def poll_note(name):
+    """조회 실패 사유. 그 뒤로 statusline 이 새 기록을 남겼으면 지운다. 그 계정 세션이 토큰도 갱신했다."""
+    state = read_json(os.path.join(POLL_DIR, f"{name}.json")) or {}
+    note = state.get("note")
+    if note and state.get("fail_at"):
+        sl = read_json(os.path.join(USAGE_DIR, f"{name}.json")) or {}
+        if (sl.get("updated_at") or 0) > state["fail_at"]:
+            return None
+    return note
+
+
+def cmd_poll(data, args):
+    """조회할 때가 된 계정을 지금 /usage 로 읽는다. --force 는 때와 상관없이 모두."""
+    remember_emails(data)
+    done = run_poll(data, force="--force" in args)
+    if "--quiet" in args:
+        return
+    data = load_accounts()
+    if not done:
+        print(f"조회할 때가 된 계정이 없습니다 ({POLL_INTERVAL:.0f}초마다 읽는다. 지금 모두 읽으려면 acm poll --force)")
+        return
+    now = time.time()
+    for name in done:
+        acc = data["accounts"][name]
+        note = poll_note(name)
+        u = account_usage(name, now)
+        scoped = "".join(f" · {s['short']} {s['pct']:.0f}%" for s in u["scoped"])
+        print(f"{account_label(name, acc)} [{name}]: " + (note or fmt_u(u) + scoped))
+
+
+# ---------- Codex 사용량 ----------
+# Codex 도 토큰을 꺼내지 않는다. 그 계정의 CODEX_HOME 으로 `codex app-server` 를 stdio 로 띄워 JSON-RPC 로
+# account/read 와 account/rateLimits/read 를 묻는다. 모델을 부르지 않고 0.5~2초에 끝난다(0.165.0 에서 실측).
+# 창은 요금제마다 다르다. 무료 요금제는 30일 창 하나(primary 43200분)이고, 유료 요금제는 5시간과 주간 창이 온다.
+
+CODEX_RPC_TIMEOUT = 30
+
+
+def codex_bin():
+    """codex 실행 파일. 메뉴바 앱처럼 PATH 가 짧은 곳에서 불려도 찾는다."""
+    found = shutil.which("codex")
+    if found:
+        return found
+    for cand in ("/opt/homebrew/bin/codex", "/usr/local/bin/codex", os.path.join(HOME, ".local", "bin", "codex")):
+        if os.access(cand, os.X_OK):
+            return cand
+    return "codex"
+
+
+def codex_rpc(acc, requests, timeout=CODEX_RPC_TIMEOUT):
+    """(응답, 실패 사유). 응답은 {method: result} 이고, 실패하면 그때까지 받은 응답을 돌려준다."""
+    env = detached_env()
+    env["CODEX_HOME"] = codex_home(acc)
+    env["ACM_ROLE"] = "poll"
+    try:
+        p = subprocess.Popen([codex_bin(), "app-server"], cwd=STATE_DIR, env=env, stdin=subprocess.PIPE,
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, start_new_session=True)
+    except OSError:
+        return {}, "codex 를 띄우지 못함"
+    lines = Queue()
+
+    def pump():
+        for line in p.stdout:
+            lines.put(line)
+        lines.put(None)
+    threading.Thread(target=pump, daemon=True).start()
+    end = time.time() + timeout
+
+    def call(rid, method, params):
+        p.stdin.write(json.dumps({"jsonrpc": "2.0", "id": rid, "method": method, "params": params}) + "\n")
+        p.stdin.flush()
+        while True:
+            try:
+                line = lines.get(timeout=max(0.0, end - time.time()))
+            except Empty:
+                return None
+            if line is None:
+                return None
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(msg, dict) and msg.get("id") == rid:
+                return msg
+
+    out = {}
+    try:
+        init = call(0, "initialize", {"clientInfo": {"name": "acm", "version": VERSION}})
+        if not init or "result" not in init:
+            return out, "codex app-server 가 응답하지 않음"
+        p.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "initialized"}) + "\n")
+        p.stdin.flush()
+        for rid, (method, params) in enumerate(requests, 1):
+            msg = call(rid, method, params)
+            if msg is None:
+                return out, f"{method} 응답 없음"
+            if "error" in msg:
+                err = msg["error"] if isinstance(msg["error"], dict) else {}
+                return out, f"{method}: {str(err.get('message') or msg['error'])[:120]}"
+            out[method] = msg.get("result")
+        return out, None
+    except (OSError, ValueError) as e:
+        return out, f"codex app-server 오류: {e}"
+    finally:
+        try:
+            p.stdin.close()
+        except OSError:
+            pass
+        # app-server 가 띄운 자식(플러그인 목록을 받는 git 같은 것)까지 그룹째 끝낸다. start_new_session 이라 그룹 id 가 pid 다
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.killpg(p.pid, sig)
+            except OSError:
+                break
+            try:
+                p.wait(5)
+                break
+            except subprocess.TimeoutExpired:
+                continue
+
+
+def window_name(minutes):
+    """창 길이를 화면에 쓸 이름으로. 300분은 5h, 10080분은 Week, 43200분은 30d."""
+    m = int(minutes or 0)
+    if m == 10080:
+        return "Week"
+    if m and m % 1440 == 0:
+        return f"{m // 1440}d"
+    if m and m % 60 == 0:
+        return f"{m // 60}h"
+    return f"{m}m" if m else "?"
+
+
+def codex_windows(snap, at):
+    """RateLimitSnapshot 의 primary 와 secondary 를 usage 기록의 창 모양으로."""
+    out = []
+    for key in ("primary", "secondary"):
+        w = snap.get(key) if isinstance(snap, dict) else None
+        pct = number(w.get("usedPercent")) if isinstance(w, dict) else None
+        if pct is None:
+            continue
+        out.append({"used_percentage": pct, "resets_at": number(w.get("resetsAt")),
+                    "window_minutes": number(w.get("windowDurationMins")), "at": at})
+    return out
+
+
+def parse_codex_usage(res, at):
+    """(usage 기록, 계정 정보). account/read 와 account/rateLimits/read 의 응답에서 꺼낸다."""
+    got = res.get("account/read") or {}
+    account = got.get("account") if isinstance(got.get("account"), dict) else {}
+    lim = res.get("account/rateLimits/read") or {}
+    snap = lim.get("rateLimits") if isinstance(lim.get("rateLimits"), dict) else {}
+    main_id = snap.get("limitId")
+    # 다른 한도(모델별 같은 것)는 보여 주기만 하고 배정에는 쓰지 않는다
+    others = []
+    for lid, other in (lim.get("rateLimitsByLimitId") or {}).items():
+        if lid == main_id or not isinstance(other, dict):
+            continue
+        for w in codex_windows(other, at):
+            others.append(dict(w, name=other.get("limitName") or other.get("normalModelSlug") or lid))
+    rec = {"tool": "codex", "updated_at": at, "windows": codex_windows(snap, at), "scoped": others,
+           "plan": snap.get("planType") or account.get("planType"),
+           # 백엔드가 지금 쓸 수 있는지 직접 알려 준 값. None 이면 모른다
+           "allowed": lim.get("ordinaryUsageAllowed")}
+    ident = {"email": account.get("email"), "plan": account.get("planType"),
+             "account_id": (got.get("workspaceRouting") or {}).get("chatgptAccountId") or lim.get("accountId")}
+    return rec, ident
+
+
+def codex_usage(polled, now):
+    """Codex usage 기록을 account_usage 모양으로. 5시간 창은 five 자리에, 긴 창 중 가장 많이 쓴 창은 seven 자리에 둔다."""
+    wins = [w for w in polled.get("windows") or [] if isinstance(w, dict)]
+    short = [w for w in wins if 0 < (number(w.get("window_minutes")) or 0) <= 360]
+    long = sorted((w for w in wins if w not in short), key=lambda w: -window_pct(w, now))
+    five_w = short[0] if short else None
+    seven_w = long[0] if long else None
+    secs = lambda w: (number(w.get("window_minutes")) or 0) * 60 or WEEK_SECS
+    extra = [{"name": window_name(w.get("window_minutes")), "pct": window_pct(w, now), "resets_at": window_reset(w, now),
+              "window": secs(w)} for w in long[1:]]
+    # 백엔드가 막았다고 알렸고, 그때 본 창이 아직 리셋되지 않았으면 막힌 것으로 본다
+    denied = polled.get("allowed") is False and any(window_reset(w, now) for w in wins)
+    return {
+        "five": window_pct(five_w, now) if five_w else None,
+        "five_reset": window_reset(five_w, now) if five_w else None,
+        "seven": window_pct(seven_w, now) if seven_w else 0.0,
+        "seven_reset": window_reset(seven_w, now) if seven_w else None,
+        "seven_window": secs(seven_w) if seven_w else WEEK_SECS,
+        "seven_name": window_name(seven_w.get("window_minutes")) if seven_w else "Week",
+        "extra": extra,
+        "denied": denied,
+        "plan": polled.get("plan"),
+        "scoped": [],
+        "others": [{"name": o.get("name"), "window": window_name(o.get("window_minutes")), "pct": window_pct(o, now),
+                    "resets_at": window_reset(o, now)} for o in polled.get("scoped") or [] if isinstance(o, dict)],
+        "updated_at": polled.get("updated_at"),
+        "source": "app-server" if polled.get("updated_at") else None,
+        "model": None,
+    }
+
+
+def remember_codex_identity(name, ident):
+    """조회로 알게 된 Codex 계정의 이메일과 요금제, ChatGPT 계정 ID 를 accounts.json 에 적는다."""
+    def change(fresh):
+        acc = fresh["accounts"].get(name)
+        if acc is not None:
+            acc.update({k: v for k, v in ident.items() if v})
+    update_accounts(change)
+
+
+def poll_codex_account(name, acc):
+    """그 Codex 계정의 사용량을 app-server 로 한 번 읽고 결과를 poll 상태에 남긴다."""
+    state_path = os.path.join(POLL_DIR, f"{name}.json")
+    state = read_json(state_path) or {}
+    res, why = codex_rpc(acc, [("account/read", {}),
+                               ("account/rateLimits/read", {"excludeResetCreditDetails": True})])
+    if not why and not (res.get("account/read") or {}).get("account"):
+        why = f"로그인 안 됨 (acm -a {name} login)"
+    now = time.time()
+    if why:
+        backoff = min(POLL_FAIL_MAX, max(POLL_FAIL_MIN, (state.get("backoff") or POLL_INTERVAL) * 1.5))
+        state.update(next_at=now + backoff, backoff=backoff, note=why, fail_at=int(now))
+    else:
+        t = int(now)
+        rec, ident = parse_codex_usage(res, t)
+        state.update(usage=rec, next_at=now + POLL_INTERVAL, backoff=POLL_INTERVAL, note=None, ok_at=t)
+        state.pop("fail_at", None)
+        remember_codex_identity(name, ident)
+    save_json(state_path, state)
+
+
+def codex_session_account(data, env):
+    """그 환경의 codex 가 쓰는 계정. CODEX_HOME 이 없으면 root 계정(~/.codex)이다. 등록되지 않은 폴더면 None."""
+    home = env.get("CODEX_HOME") or None
+    real = os.path.realpath(home) if home else None
+    for name in tool_accounts(data, "codex"):
+        acc = data["accounts"][name]
+        if (home is None and config_dir(acc) is None) or (real and os.path.realpath(codex_home(acc)) == real):
+            return name
+    return None
+
+
+# ---------- 실행 중인 세션 ----------
+
+def parse_etime(text):
+    """ps 의 etime([[dd-]hh:]mm:ss) 을 초로 바꾼다."""
+    days, _, rest = text.strip().rpartition("-")
+    parts = [int(p) for p in rest.split(":")]
+    while len(parts) < 3:
+        parts.insert(0, 0)
+    return (int(days) if days else 0) * 86400 + parts[0] * 3600 + parts[1] * 60 + parts[2]
+
+
+def quick_run(cmd, timeout=10):
+    """명령의 stdout. 시간 안에 끝나지 않거나 실행하지 못하면 빈 문자열이다."""
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout
+    except (subprocess.TimeoutExpired, OSError):
+        return ""
+
+
+def proc_env(pid):
+    got = proc_info(pid)
+    return got[1] if got else None
+
+
+def proc_info(pid):
+    """(argv, 환경변수). 다른 사용자의 프로세스처럼 읽지 못하면 None.
+    ps eww 는 인자와 환경변수를 공백 하나로 이어 보여서, 인자에 든 KEY=값 이나 공백 든 경로를 환경변수와 가를 수 없다.
+    macOS 의 KERN_PROCARGS2 는 argc 와 실행 경로, argv, 환경변수를 NUL 로 나눠 돌려준다."""
+    if sys.platform.startswith("linux"):
+        try:
+            with open(f"/proc/{pid}/environ", "rb") as f:
+                items = f.read().split(b"\0")
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                args = f.read().split(b"\0")
+        except OSError:
+            return None
+    else:
+        try:
+            import ctypes
+            import ctypes.util
+            libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+            argmax, size = ctypes.c_int(0), ctypes.c_size_t(ctypes.sizeof(ctypes.c_int))
+            # CTL_KERN=1, KERN_ARGMAX=8, KERN_PROCARGS2=49
+            if libc.sysctl((ctypes.c_int * 2)(1, 8), 2, ctypes.byref(argmax), ctypes.byref(size), None, ctypes.c_size_t(0)):
+                return None
+            buf, size = ctypes.create_string_buffer(argmax.value), ctypes.c_size_t(argmax.value)
+            if libc.sysctl((ctypes.c_int * 3)(1, 49, pid), 3, buf, ctypes.byref(size), None, ctypes.c_size_t(0)):
+                return None
+        except (OSError, AttributeError, ValueError):
+            return None
+        raw = buf.raw[:size.value]
+        if len(raw) < 4:
+            return None
+        argc = int.from_bytes(raw[:4], sys.byteorder)
+        # 실행 경로 뒤에는 NUL 채움이 있고, 그다음 argv 와 환경변수가 이어진다. 환경변수는 빈 문자열에서 끝난다
+        rest = raw[4:].partition(b"\0")[2].lstrip(b"\0").split(b"\0")
+        args, items = rest[:argc], rest[argc:]
+    env = {}
+    for item in items:
+        if not item:
+            break
+        key, sep, value = item.partition(b"=")
+        if sep:
+            env[key.decode(errors="replace")] = value.decode(errors="replace")
+    return [a.decode(errors="replace") for a in args if a], env
+
+
+def running_sessions(data, with_cwd=True):
+    """이 Mac 에서 돌고 있는 최상위 claude 와 codex 프로세스, 그 계정과 작업 폴더."""
+    out = quick_run(["ps", "-axo", "pid=,ppid=,uid=,etime=,comm="])
+    procs = {}
+    uid = os.getuid()
+    for line in out.splitlines():
+        parts = line.split(None, 4)
+        # 다른 사용자의 claude 는 환경변수를 읽을 수 없고 이 사용자의 계정과도 상관없다
+        if len(parts) == 5 and parts[2] == str(uid):
+            procs[int(parts[0])] = (int(parts[1]), parts[3], os.path.basename(parts[4]))
+    kinds = {"claude": "claude", "claude.exe": "claude", "codex": "codex"}
+    kind = lambda pid: kinds.get(procs[pid][2]) if pid in procs else None
+    pids = [pid for pid in procs if kind(pid) and kind(procs[pid][0]) != kind(pid)]
+    # 환경변수를 읽지 못하면 None 으로 둔다. 빈 환경으로 보면 CLAUDE_CONFIG_DIR 가 없는 기본 계정으로 잘못 센다
+    infos = {pid: proc_info(pid) for pid in pids}
+    if not pids:
+        return []
+    joined = ",".join(map(str, pids))
+    cwds, current = {}, None
+    # -b 는 네트워크 볼륨처럼 응답 없는 파일 시스템에서 멈출 수 있는 커널 호출을 피한다
+    lsof = ["lsof", "-b", "-a", "-d", "cwd", "-Fpn", "-p", joined] if with_cwd else ["true"]
+    for line in quick_run(lsof).splitlines():
+        if line.startswith("p"):
+            current = int(line[1:])
+        elif line.startswith("n") and current:
+            cwds[current] = line[1:]
+
+    sessions = []
+    for pid in sorted(pids, key=lambda p: parse_etime(procs[p][1])):
+        argv, env = infos[pid] or ([], None)
+        if env is not None and env.get("ACM_ROLE") in BACKGROUND_ROLES:
+            continue
+        tool = kind(pid)
+        # codex 가 뒤에 띄워 두는 app-server 데몬 같은 것은 세션이 아니다
+        if tool == "codex" and any(a in CODEX_BACKGROUND_ARGS for a in argv[1:]):
+            continue
+        if env is None:
+            name = None
+        else:
+            name = session_account(data, env) if tool == "claude" else codex_session_account(data, env)
+        sessions.append({
+            "pid": pid,
+            "tool": tool,
+            "account": name,
+            "label": account_label(name, data["accounts"][name]) if name else None,
+            "cwd": cwds.get(pid),
+            "elapsed_s": parse_etime(procs[pid][1]),
+            "via": "acm" if env and ("ACM_CODEX_ACCOUNT" if tool == "codex" else "ACM_ACCOUNT") in env else tool,
+        })
+    return sessions
+
+
+def identify_codex(data):
+    """로그인했는데 아직 이메일을 모르는 Codex 계정은 기다려서 한 번 읽는다.
+    Codex 이메일은 조회로만 알게 돼서, 뒤에서 읽으면 로그인 직후 status 가 로그인 전처럼 보인다.
+    로그인한 뒤 아직 한 번도 읽지 않았을 때만 기다린다. 읽었는데 실패했거나 API 키 로그인처럼 이메일이 없으면
+    다음부터는 뒤에서 읽어서, 앱이 30초마다 불러도 매번 막히지 않는다."""
+    names = []
+    for name in tool_accounts(data, "codex"):
+        acc = data["accounts"][name]
+        if not logged_in(acc) or acc.get("email"):
+            continue
+        st = read_json(os.path.join(POLL_DIR, f"{name}.json")) or {}
+        tried = max(number(st.get("ok_at")) or 0, number(st.get("fail_at")) or 0)
+        try:
+            login_at = os.path.getmtime(os.path.join(codex_home(acc), "auth.json"))
+        except OSError:
+            continue
+        if tried < login_at:
+            names.append(name)
+    # 다시 로그인했으면 지난 조회가 정한 다음 조회 시각과 상관없이 읽는다
+    if not names or not run_poll(data, names, force=True):
+        return
+    fresh = load_accounts()["accounts"]
+    for name in names:
+        data["accounts"][name].update({k: v for k, v in (fresh.get(name) or {}).items()
+                                       if k in ("email", "plan", "account_id") and v})
+
+
+def status_snapshot(data):
+    """앱과 `acm status --json` 이 쓰는 현황."""
+    remember_emails(data)
+    identify_codex(data)
+    # 조회는 뒤에서 돌린다. 메뉴바 앱이 30초마다 부르니 기다리지 않는다
+    refresh_usage(data)
+    now = time.time()
+    sessions = running_sessions(data)
+    reserved = reserved_account(data)
+    # 모델별 주간 한도를 견줄 때 쓰는 모델. 설정이나 마지막 세션에서 짐작한다
+    model = session_model([])
+    dup = same_login(data)
+    org_mates = {n: [m for m in names if m != n] for _, names in same_org(data).values() for n in names}
+    accounts = []
+    for name in data["order"]:
+        acc = data["accounts"][name]
+        tool = tool_of(acc)
+        u = account_usage(name, now)
+        score, blocked = score_account(u, model if tool == "claude" else None, now, FIVE_HOUR_CAP, SEVEN_DAY_CAP)
+        accounts.append({
+            "id": name,
+            "tool": tool,
+            "label": account_label(name, acc),
+            "email": acc.get("email"),
+            # 로그아웃한 계정은 지난 조회의 요금제가 남아 있어도 보이지 않는다
+            "plan": (u.get("plan") or acc.get("plan")) if acc.get("email") else None,
+            "five_hour": None if u["five"] is None else {"pct": u["five"], "resets_at": u["five_reset"]},
+            # Codex 무료 요금제처럼 긴 창이 주간이 아니면 name 이 30d 다
+            "seven_day": {"pct": u["seven"], "resets_at": u["seven_reset"], "name": u["seven_name"],
+                          "window_minutes": round(u["seven_window"] / 60)},
+            "extra": u["extra"],
+            "denied": u["denied"],
+            "others": u.get("others", []),
+            "scoped": [dict(s, applies=scope_matches(s["name"], model)) for s in u["scoped"]],
+            "score": round(score, 1),
+            "exhausted": blocked,
+            "reserved": name == reserved,
+            "reserve_held": name == reserved and reserve_held(name, now, model),
+            "updated_at": u["updated_at"],
+            "source": u["source"],
+            "poll_note": poll_note(name) if acc.get("email") or (tool == "codex" and logged_in(acc)) else None,
+            "login_broken": bool(acc.get("email")) and login_broken(data, name),
+            "same_as": dup.get(name),
+            "same_org": org_mates.get(name, []),
+            "sessions": sum(1 for s in sessions if s["account"] == name),
+        })
+    tools = [t for t in TOOLS if tool_accounts(data, t)]
+    next_by_tool = {}
+    for tool in tools:
+        try:
+            nxt, why = pick(data, data.get("mode", "usage"), model if tool == "claude" else None, tool=tool)
+            next_by_tool[tool] = {"id": nxt, "label": account_label(nxt, data["accounts"][nxt]), "why": why}
+        except SystemExit:
+            next_by_tool[tool] = None
+    return {"generated_at": int(now), "mode": data.get("mode", "usage"), "model": model, "tools": tools,
+            "next": next_by_tool.get("claude"), "next_by_tool": next_by_tool, "accounts": accounts, "sessions": sessions,
+            "reserve": {"five_hour_cap": RESERVE_FIVE_HOUR_CAP, "seven_day_cap": RESERVE_SEVEN_DAY_CAP}}
+
+
+def pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    out = subprocess.run(["ps", "-o", "comm=", "-p", str(pid)], capture_output=True, text=True).stdout.lower()
+    # exec 하기 직전의 acm 은 아직 Python 이다
+    return "claude" in out or "codex" in out or "python" in out
+
+
+def registered_pids(name):
+    """acm 이 띄우고 아직 살아 있는 세션 pid."""
+    d = os.path.join(RUN_DIR, name)
+    if not os.path.isdir(d):
+        return set()
+    alive = set()
+    for entry in os.listdir(d):
+        if entry.isdigit() and pid_alive(int(entry)):
+            alive.add(int(entry))
+        else:
+            try:
+                os.remove(os.path.join(d, entry))
+            except OSError:
+                pass
+    return alive
+
+
+# ---------- 계정 고르기 ----------
+
+def rotate_after(order, last):
+    if last in order:
+        i = order.index(last) + 1
+        return order[i:] + order[:i]
+    return list(order)
+
+
+def reserved_account(data):
+    """여유를 남겨 둘 계정. 발행 모으기가 켜져 있을 때의 대표 계정이다."""
+    enabled, pub = publisher_conf(data)
+    return pub if enabled else None
+
+
+def reserve_held(name, now, model=None):
+    _, blocked = score_account(account_usage(name, now), model, now, RESERVE_FIVE_HOUR_CAP, RESERVE_SEVEN_DAY_CAP)
+    return blocked
+
+
+# 주간 창은 리셋까지 남은 시간 비율로 남은 여유를 나눠서, 리셋이 가까운데 많이 남은 계정을 먼저 쓴다.
+# 남은 시간 비율이 이보다 작아도 이 값으로 본다. 그래서 리셋 직전이어도 최대 10배까지만 크게 친다
+RESET_FLOOR = 0.1
+
+
+def pace(pct, resets_at, cap, now, window=WEEK_SECS):
+    """주간 속도 비율. 1 이면 리셋까지 고른 속도로 쓸 만큼 남았다.
+    리셋이 가까운데 많이 남았으면 1 보다 크고, 앞당겨 많이 썼으면 1 보다 작다."""
+    left = max(0.0, cap - pct)
+    frac = 1.0 if not resets_at or resets_at <= now else min(1.0, max(RESET_FLOOR, (resets_at - now) / window))
+    return left / frac / 100
+
+
+def scope_matches(scope, model):
+    """'Fable', 'Sonnet only' 같은 모델별 주간 한도가 이 모델에 걸리는지."""
+    word = scope_short(scope).lower()
+    return bool(model and word and word != "all models" and word in model.lower())
+
+
+def score_account(u, model, now, five_cap, seven_cap):
+    """(점수, 막힘). 점수는 5h 남은 여유에 주간 속도 비율을 곱한 값이다. 5h 한도가 없는 계정은 5h 자리를 100 으로 본다.
+    주간 창은 Week 와, 이번 세션 모델에 걸리는 모델별 주간 한도 중 더 빠듯한 쪽을 쓴다."""
+    weekly = ([(u["seven"], u["seven_reset"], u.get("seven_window") or WEEK_SECS)]
+              + [(s["pct"], s["resets_at"], WEEK_SECS) for s in u["scoped"] if scope_matches(s["name"], model)]
+              # Codex 는 긴 창이 여럿일 수 있다. 창마다 제 길이로 속도를 잰다
+              + [(e["pct"], e["resets_at"], e["window"]) for e in u.get("extra") or []])
+    factor = min(pace(p, r, seven_cap, now, w) for p, r, w in weekly)
+    five_left = 100.0 if u["five"] is None else max(0.0, five_cap - u["five"])
+    blocked = near_limit(u["five"], max(p for p, _, _ in weekly), five_cap, seven_cap) or bool(u.get("denied"))
+    return five_left * factor, blocked
+
+
+def settings_model(path):
+    conf = read_json(path)
+    model = conf.get("model") if isinstance(conf, dict) else None
+    return model if isinstance(model, str) and model else None
+
+
+def session_model(argv, cwd=None):
+    """이번 세션이 쓸 모델의 짐작. 모델별 주간 한도를 견줄 때만 쓴다.
+    Claude Code 와 같은 순서로 --model, ANTHROPIC_MODEL, 프로젝트와 사용자 설정을 보고, 없으면 statusline 이
+    마지막으로 본 세션의 모델을 쓴다."""
+    for i, a in enumerate(argv):
+        if a == "--":
+            break
+        if a == "--model" and i + 1 < len(argv):
+            return argv[i + 1]
+        if a.startswith("--model="):
+            return a.split("=", 1)[1]
+    if os.environ.get("ANTHROPIC_MODEL"):
+        return os.environ["ANTHROPIC_MODEL"]
+    cwd = cwd or os.getcwd()
+    for path in (os.path.join(cwd, ".claude", "settings.local.json"), os.path.join(cwd, ".claude", "settings.json"),
+                 os.path.join(SHARED, "settings.json")):
+        model = settings_model(path)
+        if model:
+            return model
+    recs = [r for r in (read_json(p) for p in glob.glob(os.path.join(USAGE_DIR, "*.json"))) if r and r.get("model")]
+    return max(recs, key=lambda r: r.get("updated_at") or 0)["model"] if recs else None
+
+
+def login_broken(data, name):
+    """로그인이 풀린 계정인지. .claude.json 에 로그인 정보가 남아 있어도 토큰이 죽은 계정이다.
+    사용량 조회가 한도 말고 다른 이유로 실패했고, 토큰 갱신을 띄운 뒤에도 성공하지 못했고,
+    그 뒤로 그 계정 세션이 사용량을 남기거나 다시 로그인하지 않았을 때다."""
+    if tool_of(data["accounts"][name]) != "claude":
+        return False
+    st = read_json(os.path.join(POLL_DIR, f"{name}.json"))
+    if not isinstance(st, dict) or not poll_note(name):
+        return False
+    fail, ok, refresh = (number(st.get(k)) or 0 for k in ("fail_at", "ok_at", "refresh_at"))
+    if not refresh or fail <= max(ok, refresh) or "429" in str(st.get("note") or ""):
+        return False
+    try:
+        # 다시 로그인하면 .claude.json 이 바뀐다. 다음 조회가 끝날 때까지는 풀렸다고 보지 않는다
+        return os.path.getmtime(claude_json_path(data["accounts"][name])) <= fail
+    except OSError:
+        return True
+
+
+def oauth_account(acc):
+    cj = read_json(claude_json_path(acc))
+    o = cj.get("oauthAccount") if isinstance(cj, dict) else None
+    return o if isinstance(o, dict) else {}
+
+
+def account_identity(acc):
+    """로그인한 계정을 가르는 값. Claude 는 계정 UUID, 없으면 이메일. Codex 는 app-server 가 알려 준 ChatGPT 계정 ID."""
+    if tool_of(acc) == "codex":
+        # chatgptAccountId 는 팀 워크스페이스 구성원이 같이 쓰는 값이라 이메일과 함께 본다
+        if not logged_in(acc) or not (acc.get("email") or acc.get("account_id")):
+            return None
+        return ("codex", acc.get("email"), acc.get("account_id"))
+    o = oauth_account(acc)
+    return o.get("accountUuid") or o.get("emailAddress")
+
+
+def same_org(data):
+    """{조직 UUID: (조직 이름, [acm 계정])}. 서로 다른 Claude 계정이 한 조직에 묶인 것만 모은다.
+    개인 구독은 계정마다 자기 조직이 따로 있어서, 묶였다면 Team 이나 Enterprise 처럼 조직 한도를 나눠 쓸 수 있다.
+    같은 Claude 계정끼리는 same_login 이 따로 알린다."""
+    dup = same_login(data)
+    groups = {}
+    for name in tool_accounts(data, "claude"):
+        if name in dup:
+            continue
+        o = oauth_account(data["accounts"][name])
+        if o.get("organizationUuid"):
+            groups.setdefault(o["organizationUuid"], (o.get("organizationName"), []))[1].append(name)
+    return {org: g for org, g in groups.items() if len(g[1]) > 1}
+
+
+def same_login(data):
+    """{acm 계정: 같은 Claude 계정으로 먼저 로그인한 acm 계정}. 브라우저가 claude.ai 에 이미 로그인한 계정으로
+    승인하면 이렇게 된다. 묶음에 대표 계정이 있으면 대표 계정을 남긴다."""
+    reserved = reserved_account(data)
+    first, dup = {}, {}
+    for name in sorted(data["order"], key=lambda n: n != reserved):
+        ident = account_identity(data["accounts"][name])
+        if not ident:
+            continue
+        if ident in first:
+            dup[name] = first[ident]
+        else:
+            first[ident] = name
+    return dup
+
+
+def blocked_reason(data, row, reserved, model):
+    """막힌 계정의 사용률과 가장 빠른 리셋을 한 줄로."""
+    u = row["u"]
+    scoped = [s for s in u["scoped"] if scope_matches(s["name"], model)]
+    resets = [r for r in [u["five_reset"], u["seven_reset"]] + [s["resets_at"] for s in scoped]
+              + [e["resets_at"] for e in u.get("extra") or []] if r]
+    text = (f"{account_label(row['name'], data['accounts'][row['name']])} {fmt_u(u)}"
+            + "".join(f" · {s['short']} {s['pct']:.0f}%" for s in scoped)
+            + (f" · {fmt_reset(min(resets))} 리셋" if resets else ""))
+    if row["name"] == reserved:
+        text += f" · 대표 계정은 Week {RESERVE_SEVEN_DAY_CAP:.0f}% 까지만 씀"
+    return text
+
+
+def last_pick(data, tool):
+    """그 도구에서 직전에 자동으로 고른 계정. Claude 는 예전처럼 last 에, 다른 도구는 last_by_tool 에 둔다."""
+    return data.get("last") if tool == "claude" else (data.get("last_by_tool") or {}).get(tool)
+
+
+def set_last_pick(data, tool, name):
+    if tool == "claude":
+        data["last"] = name
+        update_accounts(lambda d: d.update(last=name))
+    else:
+        data.setdefault("last_by_tool", {})[tool] = name
+        update_accounts(lambda d: d.setdefault("last_by_tool", {}).update({tool: name}))
+
+
+def pick(data, mode, model=None, exclude=(), strict=False, tool="claude"):
+    """(계정, 고른 까닭). 그 도구의 계정 중에서만 고르고, exclude 의 계정은 고르지 않는다.
+    strict 면 한도 근처이거나 예비 기준을 넘은 계정으로는 보내지 않고 (None, 까닭) 을 돌려준다. 이어 가기가 쓴다."""
+    now = time.time()
+    accounts = tool_accounts(data, tool)
+    if not accounts:
+        die(f"{TOOL_NAMES[tool]} 계정이 없습니다. acm add" + (" --codex" if tool == "codex" else "") + " 로 더합니다")
+    order = rotate_after(accounts, last_pick(data, tool))
+    ready = [n for n in order if logged_in(data["accounts"][n]) and n not in exclude]
+    same = broken = []
+    if strict:
+        # 한도에 걸린 계정과 같은 Claude 계정으로는 이어 가 봐야 다시 멈춘다
+        gone = {account_identity(data["accounts"][n]) for n in exclude if n in data["accounts"]} - {None}
+        same = [n for n in ready if account_identity(data["accounts"][n]) in gone]
+        ready = [n for n in ready if n not in same]
+    # 같은 Claude 계정으로 로그인한 acm 계정은 하나만 견준다. 사용량이 같은 계정이고, 대표 계정의 여유를 다른 이름으로 쓰게 된다
+    dup = same_login(data)
+    ready = [n for n in ready if n not in dup]
+    if strict:
+        # 로그인이 풀린 계정으로 보내면 세션이 바로 인증에 실패한다
+        broken = [n for n in ready if login_broken(data, n)]
+        ready = [n for n in ready if n not in broken]
+    if not ready and strict:
+        if broken:
+            return None, "이어 갈 계정의 로그인이 풀려 있습니다. " + ", ".join(
+                f"{account_label(n, data['accounts'][n])} (acm -a {n} auth login)" for n in broken)
+        if same:
+            return None, (", ".join(f"{account_label(n, data['accounts'][n])} [{n}]" for n in same)
+                          + " 이 한도에 걸린 계정과 같은 Claude 계정으로 로그인돼 있습니다. acm status 로 확인합니다")
+        return None, "이어 갈 다른 계정이 없습니다. acm add 로 계정을 더합니다"
+    if not ready:
+        # 처음 설치했거나 로그아웃한 뒤다. 멈추면 셸 함수와 IDE 확장으로는 claude 를 띄울 수 없으니, 첫 계정으로 띄워 로그인 화면을 보인다
+        return accounts[0], "로그인된 계정이 없어 첫 계정으로 띄움. 로그인하면 다음부터 고른다"
+    # 대표 계정의 여유는 Claude 아티팩트 발행 몫이라 다른 도구에는 없다
+    reserved = reserved_account(data) if tool == "claude" else None
+    if mode == "rr" and not strict:
+        held = [n for n in ready if n == reserved and reserve_held(n, now, model)]
+        return ([n for n in ready if n not in held] or ready)[0], "round-robin"
+
+    live = {}
+    for sess in running_sessions(data, with_cwd=False):
+        live.setdefault(sess["account"], set()).add(sess["pid"])
+    rows = []
+    for n in ready:
+        u = account_usage(n, now)
+        score, exhausted = score_account(u, model, now, FIVE_HOUR_CAP, SEVEN_DAY_CAP)
+        if n == reserved:
+            exhausted = exhausted or reserve_held(n, now, model)
+        # acm 을 거치지 않고 띄운 세션도 세고, 막 띄워서 아직 claude 가 안 된 acm 도 센다
+        active = len(live.get(n, set()) | registered_pids(n))
+        rows.append({"name": n, "u": u, "active": active, "exhausted": exhausted, "score": score})
+    if strict and all(r["exhausted"] for r in rows):
+        return None, "다른 계정이 모두 한도 근처입니다. " + " / ".join(blocked_reason(data, r, reserved, model) for r in rows)
+    # 다 막혀도 대표 계정은 마지막까지 남긴다
+    pool = [r for r in rows if not r["exhausted"]] or [r for r in rows if r["name"] != reserved] or rows
+    # 점수가 가장 높은 계정부터 쓴다. 세션 수는 점수가 비슷한 계정끼리만 가른다.
+    # 그래도 같으면 rotate_after 순서(직전에 고른 계정의 다음)가 이긴다
+    top = max(r["score"] for r in pool)
+    near = [r for r in pool if r["score"] >= top - USAGE_BAND]
+    best = min(near, key=lambda r: (r["active"], -r["score"]))
+    u = best["u"]
+    scoped = "".join(f" · {s['short']} {s['pct']:.0f}%" for s in u["scoped"] if scope_matches(s["name"], model))
+    why = f"{fmt_u(u)}{scoped} · 점수 {best['score']:.0f} · 실행 중 {best['active']}"
+    if best["exhausted"]:
+        why += " · 모든 계정이 한도 근처"
+    return best["name"], why
+
+
+# ---------- 공유 링크 ----------
+
+def claude_pids():
+    """이 사용자가 띄운 claude 프로세스. 발행 세션과 acm 밖에서 띄운 세션, 하위 프로세스도 센다.
+    다른 사용자의 claude 는 이 사용자의 공유 폴더를 쓰지 않으니 세지 않는다."""
+    out = quick_run(["ps", "-axo", "pid=,uid=,comm="])
+    pids = []
+    for line in out.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) == 3 and parts[0].isdigit() and parts[1] == str(os.getuid()) \
+                and os.path.basename(parts[2].strip()) in ("claude", "claude.exe"):
+            pids.append(int(parts[0]))
+    return pids
+
+
+def relocate_shared(fix=False):
+    """RELOCATED 항목의 실체를 STORE_DIR 로 옮기고 ~/.claude 쪽은 링크로 둔다. 문제 목록을 돌려준다."""
+    problems = []
+    for entry in RELOCATED:
+        src = os.path.join(SHARED, entry)
+        store = os.path.join(STORE_DIR, entry)
+        if os.path.islink(src):
+            if os.path.realpath(src) != os.path.realpath(store):
+                problems.append(f"~/.claude/{entry} 가 {os.readlink(src)} 를 가리킵니다. acm 은 {store} 를 씁니다")
+            continue
+        if not os.path.isdir(src):
+            continue
+        if not fix:
+            problems.append(f"~/.claude/{entry} 가 ~/.claude 안의 실제 폴더라 추가 계정 세션은 그 안을 고칠 때마다 확인을 묻습니다"
+                            " (claude 세션을 모두 닫고 `acm sync --fix`)")
+            continue
+        if os.path.lexists(store):
+            problems.append(f"{store} 가 이미 있어 ~/.claude/{entry} 를 옮기지 않았습니다. 두 곳을 합친 뒤 다시 돌리세요")
+            continue
+        live = claude_pids()
+        if live:
+            problems.append(f"claude 프로세스 {len(live)}개가 떠 있어 ~/.claude/{entry} 를 옮기지 않았습니다. 모두 닫고 다시 돌리세요")
+            continue
+        os.makedirs(STORE_DIR, exist_ok=True)
+        try:
+            os.rename(src, store)
+        except OSError as e:
+            problems.append(f"~/.claude/{entry} 를 {store} 로 옮기지 못했습니다: {e}")
+            continue
+        os.symlink(store, src)
+        problems.append(f"~/.claude/{entry} 를 {store} 로 옮기고 링크했습니다")
+    return problems
+
+
+def has_extra_accounts(data):
+    """Claude 추가 계정이 있는지. 공유 폴더 옮기기와 아티팩트 모으기, 한도 이어 가기는 Claude 계정에만 쓴다."""
+    return any(tool_of(acc) == "claude" and config_dir(acc) is not None for acc in data["accounts"].values())
+
+
+def sync_links(name, acc, fix=False):
+    """~/.claude 의 공유 항목을 계정 디렉터리로 링크한다. 문제 목록을 돌려준다."""
+    d = config_dir(acc)
+    if d is None:
+        return []
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    problems = []
+    for entry in sorted(os.listdir(SHARED)):
+        if entry in PER_ACCOUNT or entry.startswith(".claude.json"):
+            continue
+        src = os.path.join(SHARED, entry)
+        dst = os.path.join(d, entry)
+        if os.path.islink(dst):
+            if os.readlink(dst) != src:
+                problems.append(f"{name}: {entry} 가 다른 곳({os.readlink(dst)})을 가리킵니다")
+            continue
+        if os.path.lexists(dst):
+            # 링크 자리에 실제 파일이 생김 (링크 전에 만들어졌거나 원자적 쓰기로 덮임)
+            if fix:
+                park = os.path.join(d, ".acm-drift", f"{entry}.{int(time.time())}")
+                os.makedirs(os.path.dirname(park), exist_ok=True)
+                os.rename(dst, park)
+                os.symlink(src, dst)
+                problems.append(f"{name}: {entry} 를 {park} 로 옮기고 링크했습니다. 필요하면 내용을 ~/.claude 쪽에 합치세요")
+            else:
+                problems.append(f"{name}: {entry} 가 링크가 아닌 실제 파일입니다 (`acm sync --fix`)")
+            continue
+        os.symlink(src, dst)
+    return problems
+
+
+def sync_codex_links(name, acc, fix=False):
+    """~/.codex 의 공유 항목을 Codex 추가 계정 폴더로 링크한다. 문제 목록을 돌려준다.
+    로그인을 먼저 하고 등록한 폴더에는 Codex 가 만든 실제 파일이 있을 수 있어, fix 면 그 파일을 .acm-drift 로 옮기고 링크한다."""
+    d = config_dir(acc)
+    if d is None:
+        return []
+    # codex 는 CODEX_HOME 폴더가 없으면 멈춘다. ~/.codex 가 아직 없어도 계정 폴더는 만든다
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    if not os.path.isdir(CODEX_ROOT):
+        return []
+    problems = []
+    for entry in sorted(os.listdir(CODEX_ROOT)):
+        # .acm- 로 시작하는 것은 acm 이 config.toml 을 고치며 잠깐 두는 임시 파일이다
+        if entry in CODEX_PER_ACCOUNT or entry.endswith(CODEX_TRANSIENT) or entry.startswith(".acm-"):
+            continue
+        src = os.path.join(CODEX_ROOT, entry)
+        dst = os.path.join(d, entry)
+        if os.path.islink(dst):
+            if os.readlink(dst) != src:
+                problems.append(f"{name}: {entry} 가 다른 곳({os.readlink(dst)})을 가리킵니다")
+            continue
+        if os.path.lexists(dst):
+            if fix:
+                park = os.path.join(d, ".acm-drift", f"{entry}.{int(time.time())}")
+                os.makedirs(os.path.dirname(park), exist_ok=True)
+                os.rename(dst, park)
+                # SQLite DB 는 아직 합치지 않은 기록이 WAL 에 남아 있을 수 있어 함께 옮긴다
+                for suffix in CODEX_TRANSIENT:
+                    if os.path.lexists(dst + suffix):
+                        os.rename(dst + suffix, park + suffix)
+                os.symlink(src, dst)
+                problems.append(f"{name}: {entry} 를 {park} 로 옮기고 ~/.codex 쪽으로 링크했습니다")
+            else:
+                problems.append(f"{name}: {entry} 가 링크가 아닌 실제 파일입니다 (`acm sync --fix`)")
+            continue
+        os.symlink(src, dst)
+    # 고칠 문제가 아니라서 목록에 넣지 않고 알리기만 한다
+    if mirror_hook_trust(acc):
+        info(f"{name}: ~/.codex 에서 신뢰한 훅을 이 계정에서도 신뢰한 것으로 config.toml 에 적었습니다")
+    return problems
+
+
+# config.toml 의 훅 신뢰 기록 표 하나. 맨 앞에서 시작하는 머리줄과, 다음 머리줄이 나오기 전까지의 줄.
+# 들여 쓴 머리줄도 다음 표의 시작으로 본다
+HOOK_STATE_RE = re.compile(r'^\[hooks\.state\."([^"\n]+)"\][ \t]*\n((?:(?![ \t]*\[)[^\n]*\n)*)', re.M)
+# 옮겨 적는 줄은 한 줄로 끝나는 키 = 값 뿐이다. 여러 줄 값이나 표를 잘못 옮기면 config.toml 이 깨진다
+HOOK_STATE_LINE_RE = re.compile(r'^[A-Za-z0-9_-]+[ \t]*=[ \t]*("[^"\\\n]*"|true|false|-?[0-9]+)[ \t]*$')
+
+
+def mirror_hook_trust(acc):
+    """~/.codex 에서 신뢰한 훅을 Codex 추가 계정에서도 신뢰한 것으로 config.toml 에 적는다. 적었으면 True.
+    Codex 는 신뢰 기록의 키를 링크를 풀지 않은 hooks.json 경로로 만들어서, 같은 파일인데도 계정마다 신뢰를 다시 받는다.
+    해시는 훅 내용으로만 정해져서 root 의 기록을 옮기면 이미 신뢰한 같은 내용을 신뢰하는 것이고, 내용이 바뀌면 양쪽 다 다시 묻는다.
+    같은 표를 두 번 적거나 표를 반쯤 옮기면 config.toml 이 깨져 모든 계정의 Codex 가 뜨지 않는다. 그래서 계정 쪽 기록이 이미 있으면
+    어떤 꼴이든 건드리지 않고, root 기록에 한 줄짜리 키 = 값 말고 다른 줄이 있거나 trusted_hash 가 없으면 옮기지 않는다.
+    Codex 는 config.toml 을 잠그지 않아서, 다시 읽어 견준 뒤 바꾸기 직전의 아주 짧은 틈에 Codex 가 쓴 변경은 덮일 수 있다.
+    빠진 기록이 있을 때만 쓰니 새 계정을 붙이거나 훅을 다시 신뢰한 뒤 한 번씩이다."""
+    d = config_dir(acc)
+    if d is None:
+        return False
+    real = os.path.realpath
+    for entry in ("hooks.json", "config.toml"):
+        mine = os.path.join(d, entry)
+        if not os.path.islink(mine) or real(mine) != real(os.path.join(CODEX_ROOT, entry)):
+            return False
+    # root 의 config.toml 이 dotfiles 같은 곳을 가리키는 링크여도 링크를 실제 파일로 바꾸지 않게 가리키는 파일에 쓴다
+    path = real(os.path.join(CODEX_ROOT, "config.toml"))
+    try:
+        with open(path) as f:
+            text = f.read()
+    except (OSError, UnicodeDecodeError):
+        return False
+    # 마지막 줄에 줄바꿈이 없어도 그 표를 끝까지 읽게 맞춘다
+    src = text if text.endswith("\n") or not text else text + "\n"
+    root_prefix = os.path.join(CODEX_ROOT, "hooks.json") + ":"
+    acc_prefix = os.path.join(d, "hooks.json") + ":"
+    add = []
+    for m in HOOK_STATE_RE.finditer(src):
+        key = m.group(1)
+        lines = [ln.strip() for ln in m.group(2).splitlines()]
+        lines = [ln for ln in lines if ln and not ln.startswith("#")]
+        if not key.startswith(root_prefix) or not lines:
+            continue
+        if not all(HOOK_STATE_LINE_RE.match(ln) for ln in lines) or not any(ln.startswith("trusted_hash") for ln in lines):
+            continue
+        mine = acc_prefix + key[len(root_prefix):]
+        if f'"{mine}"' not in src:
+            add.append(f'[hooks.state."{mine}"]\n' + "\n".join(lines) + "\n")
+    if not add:
+        return False
+    new = src + "".join("\n" + block for block in add)
+    tmp = os.path.join(os.path.dirname(path), f".acm-config.{os.getpid()}.toml")
+    try:
+        with open(tmp, "w") as f:
+            f.write(new)
+        shutil.copymode(path, tmp)
+        # 읽은 뒤 Codex 가 고쳤으면 그 변경을 덮지 않게 이번에는 적지 않는다. 다음 실행 때 다시 본다
+        with open(path) as f:
+            if f.read() != text:
+                os.unlink(tmp)
+                return False
+        os.replace(tmp, path)
+    except OSError:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        return False
+    return True
+
+
+def sync_account(name, acc, fix=False):
+    """계정 폴더의 공유 링크를 맞춘다. 도구마다 root 가 다르다."""
+    return sync_codex_links(name, acc, fix) if tool_of(acc) == "codex" else sync_links(name, acc, fix)
+
+
+def sync_claude_json(acc):
+    """기본 계정의 user 범위 MCP 와 프로젝트 신뢰 정보를 다른 계정에 복사한다."""
+    if config_dir(acc) is None or tool_of(acc) != "claude":
+        return
+    os.makedirs(config_dir(acc), mode=0o700, exist_ok=True)
+    base = read_json(DEFAULT_CLAUDE_JSON)
+    base = base if isinstance(base, dict) else {}
+    path = claude_json_path(acc)
+    cur = read_json(path)
+    if cur is None and os.path.exists(path):
+        # 그 계정 세션이 쓰는 중이거나 깨진 파일이다. 덮어쓰면 로그인 정보와 프로젝트 기록이 지워지니 이번에는 건드리지 않는다
+        info(f"{path} 를 읽지 못해 이번에는 기본 계정 설정을 맞추지 않았습니다")
+        return
+    if not isinstance(cur, dict):
+        cur = {k: base[k] for k in SEED_KEYS if k in base}
+    if "mcpServers" in base:
+        cur["mcpServers"] = base["mcpServers"]
+    for k in PREF_KEYS:
+        if k in base:
+            cur[k] = base[k]
+        else:
+            cur.pop(k, None)
+    projects = cur.setdefault("projects", {})
+    for key, val in (base.get("projects") or {}).items():
+        if key not in projects:
+            projects[key] = {k: v for k, v in val.items() if k.startswith("has") or k in PROJECT_KEYS}
+    save_json(path, cur)
+    os.chmod(path, 0o600)
+
+
+# ---------- 하위 명령 ----------
+
+ACCOUNT_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,32}")
+
+
+def register_codex_root():
+    """Codex root 계정(~/.codex)을 등록한다. 이미 있으면 그대로 둔다. (계정 id, 새로 등록했는지)."""
+    made = []
+
+    def change(d):
+        for n in d["order"]:
+            if tool_of(d["accounts"][n]) == "codex" and d["accounts"][n].get("dir") is None:
+                return
+        n = 1
+        while f"cx{n}" in d["accounts"]:
+            n += 1
+        d["accounts"][f"cx{n}"] = {"tool": "codex", "dir": None}
+        d["order"].append(f"cx{n}")
+        made.append(f"cx{n}")
+    fresh = update_accounts(change)
+    root = next(n for n in tool_accounts(fresh, "codex") if config_dir(fresh["accounts"][n]) is None)
+    return root, bool(made)
+
+
+def unregistered_codex_dirs(data):
+    """`CODEX_HOME=~/.codex-<id> codex login` 으로 먼저 만들어 둔, 아직 등록하지 않은 Codex 폴더."""
+    known = {os.path.realpath(codex_home(a)) for a in data["accounts"].values() if tool_of(a) == "codex"}
+    out = []
+    for d in sorted(glob.glob(os.path.join(HOME, ".codex-*"))):
+        name = os.path.basename(d)[len(".codex-"):]
+        # 로그인까지 마친 폴더만 고른다. ~/.codex-backup 같은 폴더를 계정으로 삼아 안의 파일을 옮기지 않게 한다
+        if os.path.isdir(d) and not os.path.islink(d) and os.path.realpath(d) not in known and ACCOUNT_ID_RE.fullmatch(name) \
+                and os.path.exists(os.path.join(d, "auth.json")):
+            out.append((name, d))
+    return out
+
+
+def add_codex(data, args):
+    """acm add --codex [id]. Codex root 가 등록돼 있지 않으면 먼저 등록한다.
+    id 를 빼면 먼저 만들어 둔 ~/.codex-<id> 폴더가 하나일 때 그 폴더를 등록하고, 없으면 다음 cx 번호로 만든다."""
+    if len(args) > 1:
+        die("사용법: acm add --codex [계정이름]")
+    root, made = register_codex_root()
+    data = load_accounts()
+    if made:
+        email = data["accounts"][root].get("email")
+        state = ("로그인됨" + (f", {email}" if email else "")) if logged_in(data["accounts"][root]) else f"로그인: acm -a {root} login"
+        print(f"Codex 기본 계정 {root} 등록: {CODEX_ROOT} ({state})")
+    found = unregistered_codex_dirs(data)
+    if args:
+        name = args[0]
+    elif len(found) == 1:
+        name = found[0][0]
+    elif made:
+        return
+    else:
+        name = next_account_id(data, "codex")
+    if not ACCOUNT_ID_RE.fullmatch(name):
+        die(f"계정 이름은 영문, 숫자, -, _ 로 32자까지 씁니다: {name}")
+    if name in data["accounts"]:
+        die(f"{name} 는 이미 있습니다")
+    d = os.path.join(HOME, f".codex-{name}")
+    adopted = os.path.isdir(d)
+    acc = {"tool": "codex", "dir": d}
+    # 먼저 로그인해 둔 폴더에는 Codex 가 만든 실제 파일이 있을 수 있다. .acm-drift 로 옮기고 ~/.codex 쪽을 링크한다
+    for p in sync_codex_links(name, acc, fix=adopted):
+        info(p)
+
+    def change(fresh):
+        fresh["accounts"].setdefault(name, acc)
+        if name not in fresh["order"]:
+            fresh["order"].append(name)
+    update_accounts(change)
+    print(f"{name} 추가: {d}" + (" (있던 폴더를 이어 씀)" if adopted else ""))
+    if logged_in(acc):
+        print(f"로그인돼 있습니다. 이메일과 요금제는 acm poll --force 로 바로 읽습니다")
+    else:
+        print(f"로그인: acm -a {name} login --device-auth")
+        print("  화면의 주소를 이 계정으로 로그인할 브라우저에서 열고 코드를 넣는다. 기본 브라우저가 다른 ChatGPT 계정에")
+        print("  로그인돼 있으면 시크릿 창을 쓴다. 그냥 승인하면 그 계정으로 묶인다")
+
+
+def cmd_add(data, args):
+    if "--codex" in args:
+        return add_codex(data, [a for a in args if a != "--codex"])
+    if len(args) != 1:
+        die("사용법: acm add <계정이름> | acm add --codex [계정이름]")
+    name = args[0]
+    if name in data["accounts"]:
+        die(f"{name} 는 이미 있습니다")
+    d = os.path.join(HOME, f".claude-{name}")
+    acc = {"dir": d}
+    sync_claude_json(acc)
+    for p in sync_links(name, acc):
+        info(p)
+    data["accounts"][name] = acc
+    data["order"].append(name)
+
+    def change(fresh):
+        fresh["accounts"].setdefault(name, acc)
+        if name not in fresh["order"]:
+            fresh["order"].append(name)
+    update_accounts(change)
+    for p in relocate_shared():
+        info(p)
+    print(f"{name} 추가: {d}")
+    print(f"로그인: acm -a {name} auth login   (또는 acm -a {name} 로 띄운 뒤 /login)")
+    if len(tool_accounts(data, "claude")) == 2:
+        # 계정이 하나일 때 setup 이 건너뛴 두 단계는 계정을 더해도 저절로 켜지지 않는다
+        print("Claude 계정이 둘이 됐습니다. 로그인한 뒤 acm setup 을 돌리면 아티팩트 모으기와 한도 이어 가기를 맞춥니다")
+
+
+def cmd_sync(data, args):
+    fix = "--fix" in args
+    problems = relocate_shared(fix) if has_extra_accounts(data) else []
+    for name in data["order"]:
+        acc = data["accounts"][name]
+        problems += sync_account(name, acc, fix=fix)
+        sync_claude_json(acc)
+    for p in problems:
+        print(p)
+    print("동기화 완료" if not problems else f"확인할 항목 {len(problems)}건")
+
+
+def fmt_reset(ts):
+    if not ts:
+        return "-"
+    return time.strftime("%m/%d %H:%M", time.localtime(ts))
+
+
+def cmd_status(data, args):
+    snap = status_snapshot(data)
+    if "--json" in args:
+        print(json.dumps(snap, ensure_ascii=False))
+        return
+    now = snap["generated_at"]
+    groups = [(t, [a for a in snap["accounts"] if a["tool"] == t]) for t in TOOLS]
+    groups = [(t, rows) for t, rows in groups if rows]
+    notes = []
+    for i, (tool, rows) in enumerate(groups):
+        if len(groups) > 1:
+            print(("\n" if i else "") + f"[{TOOL_NAMES[tool]}]")
+        (status_claude if tool == "claude" else status_codex)(data, snap, rows, now, notes)
+    if notes:
+        print("\n" + "\n".join(notes))
+    unknown = sum(1 for x in snap["sessions"] if not x["account"])
+    if unknown:
+        print(f"\n계정을 알 수 없는 세션 {unknown}개 (acm 에 등록되지 않은 CLAUDE_CONFIG_DIR 나 CODEX_HOME)")
+    limited = limited_sessions()
+    if limited:
+        last = limited[0]
+        print(f"\n한도에 걸려 멈춘 세션 {len(limited)}개. 가장 최근은 {last.get('label') or '?'} · {short_folder(last.get('cwd'))}. "
+              "그 세션을 닫고 acm resume 으로 다른 계정에서 이어 간다")
+    picks = snap["next_by_tool"]
+    if len(picks) > 1:
+        print(f"\n분배 방식: {snap['mode']}")
+        for tool, nxt in picks.items():
+            print(f"다음 배정 {TOOL_NAMES[tool]}: " + (f"{nxt['label']} [{nxt['id']}] · {nxt['why']}" if nxt else "-"))
+    else:
+        nxt = snap["next"] or next(iter(picks.values()), None)
+        print(f"\n분배 방식: {snap['mode']}  (다음 배정: {nxt['label'] + ' · ' + nxt['why'] if nxt else '-'})")
+    if snap["model"] and "claude" in picks:
+        print(f"모델별 주간 한도는 {snap['model']} 기준으로 견준다 (설정이나 마지막 세션에서 짐작)")
+
+
+def status_age(a, now):
+    return "-" if not a["updated_at"] else f"{int((now - a['updated_at']) // 60)}m ago ({a['source']})"
+
+
+def status_claude(data, snap, rows, now, notes):
+    # 앱과 같은 규칙. 로그인한 계정 중 하나라도 5시간 한도가 있으면 5H 열을 두고, 모두 없으면 뺀다
+    shows_five = any(a["five_hour"] for a in rows if a["email"])
+    five_head = f" {'5H':>5} {'5H RESET':>12}" if shows_five else ""
+    print(f"{'ID':<6} {'LABEL':<14} {'EMAIL':<30} {'PLAN':<6}{five_head} {'WEEK':>5} {'WEEK RESET':>12} {'SESS':>4}  UPDATED")
+    for a in rows:
+        five = a["five_hour"]
+        five_cells = ""
+        if shows_five:
+            # " 없음" 은 터미널에서 다섯 칸이라 "100%" 칸과 줄이 맞는다
+            five_cells = (f" {five['pct']:>4.0f}% {fmt_reset(five['resets_at']):>12}" if five
+                          else f"  없음 {'-':>12}" if a["updated_at"] else f" {'-':>5} {'-':>12}")
+        week = f"{a['seven_day']['pct']:>4.0f}%" if a["updated_at"] else f"{'-':>5}"
+        print(f"{a['id']:<6} {a['label']:<14} {a['email'] or '(no login)':<30} {a['plan'] or '-':<6}{five_cells} "
+              f"{week} {fmt_reset(a['seven_day']['resets_at']):>12} {a['sessions']:>4}  {status_age(a, now)}")
+        if a["same_as"]:
+            other = snap_label(snap, a["same_as"])
+            notes.append(f"  {a['label']} [{a['id']}]: {other} 과 같은 Claude 계정으로 로그인돼 있어 자동 배정에서 뺀다. "
+                         f"시크릿 창처럼 claude.ai 에 다른 계정으로 로그인한 브라우저에서 acm -a {a['id']} auth login")
+        elif a["login_broken"]:
+            notes.append(f"  {a['label']} [{a['id']}]: 로그인이 풀렸다. 토큰 갱신도 실패해서 이어 가기에서 뺀다. acm -a {a['id']} auth login")
+        elif a["poll_note"]:
+            notes.append(f"  {a['label']}: 사용량 조회 — {a['poll_note']}")
+        for sc in a["scoped"]:
+            reset = f" · {fmt_reset(sc['resets_at'])} 리셋" if sc["resets_at"] else ""
+            used = "이번 배정에 견줌" if sc["applies"] else "다른 모델 한도라 배정에 견주지 않음"
+            notes.append(f"  {a['label']}: {sc['short']} 주간 {sc['pct']:.0f}%{reset} ({used})")
+        if shows_five and not five and a["updated_at"]:
+            notes.append(f"  {a['label']}: 5h 한도가 없는 계정이다 (Ultra 인증 계정). Week 한도만 본다")
+    for org, (org_name, names) in same_org(data).items():
+        notes.append(f"  {', '.join(snap_label(snap, n) for n in names)}: 같은 조직 {org_name or org[:8]} 에 묶여 있다. "
+                     "조직 계정끼리는 한도를 나눠 쓴다는 보고가 있어, 나눠 띄워도 한도가 늘지 않을 수 있다 (미확인)")
+    # 사용량을 아직 읽지 못한 계정이 있으면 5h 창이 없는 까닭을 알 수 없어서 단정하지 않는다
+    if not shows_five and any(a["email"] for a in rows) and all(a["updated_at"] for a in rows if a["email"]):
+        notes.append("  모든 Claude 계정에 5h 한도가 없어서 (Ultra 인증 계정) 5H 열을 뺐다")
+    for a in rows:
+        if a["reserved"]:
+            state = "지금 자동 배정에서 뺌" if a["reserve_held"] else "그 전까지는 다른 계정과 똑같이 배정"
+            caps = (f"5h {RESERVE_FIVE_HOUR_CAP:.0f}% · " if a["five_hour"] else "") + f"Week {RESERVE_SEVEN_DAY_CAP:.0f}%"
+            notes.append(f"  {a['label']}: 대표 계정이라 {caps} 부터 자동 배정에서 뺀다 ({state})")
+
+
+def status_codex(data, snap, rows, now, notes):
+    """Codex 계정 표. 긴 창은 요금제마다 길이가 달라서 LIMIT 칸에 창 이름을 함께 쓴다 (Week 40%, 30d 100%)."""
+    shows_five = any(a["five_hour"] for a in rows if a["email"])
+    five_head = f" {'5H':>5} {'5H RESET':>12}" if shows_five else ""
+    print(f"{'ID':<6} {'LABEL':<14} {'EMAIL':<30} {'PLAN':<6}{five_head} {'LIMIT':>9} {'RESET':>12} {'SESS':>4}  UPDATED")
+    for a in rows:
+        five = a["five_hour"]
+        five_cells = ""
+        if shows_five:
+            five_cells = (f" {five['pct']:>4.0f}% {fmt_reset(five['resets_at']):>12}" if five
+                          else f"  없음 {'-':>12}" if a["updated_at"] else f" {'-':>5} {'-':>12}")
+        week = a["seven_day"]
+        limit = f"{week['name']} {week['pct']:.0f}%" if a["updated_at"] else "-"
+        print(f"{a['id']:<6} {a['label']:<14} {a['email'] or '(no login)':<30} {a['plan'] or '-':<6}{five_cells} "
+              f"{limit:>9} {fmt_reset(week['resets_at']):>12} {a['sessions']:>4}  {status_age(a, now)}")
+        tag = f"{a['label']} [{a['id']}]"
+        if a["same_as"]:
+            notes.append(f"  {tag}: {snap_label(snap, a['same_as'])} 과 같은 ChatGPT 계정으로 로그인돼 있어 자동 배정에서 뺀다. "
+                         f"acm -a {a['id']} logout 뒤 다른 계정으로 acm -a {a['id']} login --device-auth")
+        elif a["denied"]:
+            resets = [r for r in [week["resets_at"]] + [(five or {}).get("resets_at")] + [e["resets_at"] for e in a["extra"]] if r]
+            when = f" {fmt_reset(max(resets))} 리셋" if resets else ""
+            notes.append(f"  {tag}: Codex 가 지금은 쓸 수 없다고 알려 자동 배정에서 뺀다 ({week['name']} {week['pct']:.0f}%{when})")
+        elif a["poll_note"]:
+            notes.append(f"  {tag}: 사용량 조회 — {a['poll_note']}")
+        for e in a["extra"]:
+            reset = f" · {fmt_reset(e['resets_at'])} 리셋" if e["resets_at"] else ""
+            notes.append(f"  {tag}: {e['name']} {e['pct']:.0f}%{reset} (배정에 견줌)")
+        for o in a["others"]:
+            reset = f" · {fmt_reset(o['resets_at'])} 리셋" if o["resets_at"] else ""
+            notes.append(f"  {tag}: {o['name']} {o['window']} {o['pct']:.0f}%{reset} (따로 걸린 한도라 배정에 견주지 않음)")
+
+
+def snap_label(snap, name):
+    a = next((x for x in snap["accounts"] if x["id"] == name), None)
+    return f"{a['label']} [{name}]" if a else name
+
+
+def cmd_label(data, args):
+    if len(args) != 2:
+        die("사용법: acm label <계정> <표시이름>   (지우려면 표시이름 자리에 --clear)")
+    name = resolve(data, args[0])
+    label = None if args[1] == "--clear" else args[1]
+    if label:
+        taken = [n for n, a in data["accounts"].items() if n != name and label in (n, a.get("label"))]
+        if taken:
+            die(f"{label} 는 이미 {taken[0]} 이 쓰고 있습니다")
+
+    def change(d):
+        acc = d["accounts"].get(name)
+        if acc is None:
+            return
+        if label:
+            acc["label"] = label
+        else:
+            acc.pop("label", None)
+    change(data)
+    update_accounts(change)
+    print(f"{name} → {account_label(name, data['accounts'][name])}")
+
+
+def cmd_pick(data, args):
+    mode = "rr" if "--rr" in args else data.get("mode", "usage")
+    tool = args[0] if args and args[0] in TOOLS else "claude"
+    args = args[1:] if args and args[0] in TOOLS else args
+    remember_emails(data)
+    refresh_usage(data)
+    # acm pick --model fable 처럼 claude 에 넘길 인자를 주면 그 모델 기준으로 고른다
+    name, why = pick(data, mode, session_model(args) if tool == "claude" else None, tool=tool)
+    print(f"{account_label(name, data['accounts'][name])} [{name}]  ({why})")
+
+
+def cmd_mode(data, args):
+    if not args or args[0] not in ("usage", "rr"):
+        die("사용법: acm mode usage|rr")
+    data["mode"] = args[0]
+    update_accounts(lambda d: d.update(mode=args[0]))
+    print(f"분배 방식: {args[0]}")
+
+
+STATUSLINE_TAP = os.path.join(HOME, ".local", "bin", "acm-statusline")
+# 예전 acm 은 원래 statusline 명령을 이 파일에 따로 두었다. Claude Code 가 보호하지 않는 파일이라 세션이 묻지 않고 고쳐
+# 모든 세션의 statusline 에서 코드를 돌릴 수 있었다. 지금은 settings.json 의 statusLine 명령에 래퍼 인자로 넣는다
+LEGACY_STATUSLINE_INNER = os.path.join(STATE_DIR, "statusline-inner")
+
+
+def statusline_parts(command):
+    """statusLine 명령이 acm-statusline 을 거치면 (True, 원래 명령), 아니면 (False, None).
+    원래 명령은 래퍼의 인자로 들어 있다. 인자가 없는 예전 설치는 statusline-inner 파일에서 읽는다."""
+    if not isinstance(command, str):
+        return False, None
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return False, None
+    if not tokens or os.path.basename(tokens[0]) != "acm-statusline":
+        return False, None
+    if len(tokens) > 1:
+        # 래퍼는 "$*" 를 실행하니 따옴표 없이 여러 낱말로 적혀 있어도 이어 붙인 것과 같다
+        return True, " ".join(tokens[1:])
+    try:
+        with open(LEGACY_STATUSLINE_INNER) as f:
+            return True, f.read().strip()
+    except OSError:
+        return True, ""
+
+
+def statusline_command(inner):
+    """원래 명령을 따옴표로 감싸 래퍼의 인자 하나로 넣은 statusLine 명령."""
+    return shlex.quote(STATUSLINE_TAP) + (" " + shlex.quote(inner) if inner else "")
+
+
+def with_statusline(text, cur, new):
+    """settings.json 글에서 statusLine 명령만 new 로 바꾼다. 다른 줄과 서식은 그대로 둔다.
+    new 가 None 이면 statusLine 을 뺀다. 글자 그대로 바꾸지 못하면 JSON 을 다시 쓴다."""
+    def command_of(t):
+        return (json.loads(t).get("statusLine") or {}).get("command")
+    if cur is not None and new is not None:
+        for enc in (json.dumps(cur, ensure_ascii=False), json.dumps(cur)):
+            if enc in text:
+                candidate = text.replace(enc, json.dumps(new, ensure_ascii=False), 1)
+                if command_of(candidate) == new:
+                    return candidate
+    obj = json.loads(text)
+    if new is None:
+        obj.pop("statusLine", None)
+    else:
+        line = obj.get("statusLine") if isinstance(obj.get("statusLine"), dict) else {"type": "command"}
+        line["command"] = new
+        obj["statusLine"] = line
+    return json.dumps(obj, indent=2, ensure_ascii=False) + "\n"
+
+
+def write_statusline_settings(settings, text, new_text):
+    backup = f"{settings}.acm-bak-{time.strftime('%Y%m%d%H%M%S')}"
+    with open(backup, "w") as f:
+        f.write(text)
+    with open(settings, "w") as f:
+        f.write(new_text)
+    try:
+        os.remove(LEGACY_STATUSLINE_INNER)
+    except OSError:
+        pass
+    return backup
+
+
+def cmd_install_statusline(data, args):
+    settings = os.path.join(SHARED, "settings.json")
+    with open(settings) as f:
+        text = f.read()
+    cur = (json.loads(text).get("statusLine") or {}).get("command")
+    wrapped, inner = statusline_parts(cur)
+    if not wrapped:
+        inner = cur or ""
+    new = statusline_command(inner)
+    if cur == new:
+        if os.path.exists(LEGACY_STATUSLINE_INNER):
+            os.remove(LEGACY_STATUSLINE_INNER)
+        print("이미 설치돼 있습니다")
+        return
+    new_text = with_statusline(text, cur, new)
+    if (json.loads(new_text).get("statusLine") or {}).get("command") != new:
+        die("settings.json 수정에 실패했습니다")
+    backup = write_statusline_settings(settings, text, new_text)
+    if wrapped and len(shlex.split(cur)) == 1:
+        print("statusLine 의 원래 명령을 statusline-inner 파일에서 settings.json 의 래퍼 인자로 옮겼습니다")
+    elif wrapped:
+        print("statusLine 의 래퍼 인자를 따옴표 하나로 감싸 정리했습니다")
+    else:
+        print("statusLine 을 acm-statusline 으로 감쌌습니다. 원래 명령은 래퍼 인자로 남아 그대로 실행됩니다")
+    print(f"백업: {backup}")
+
+
+# ---------- 발행 세션 ----------
+# 아티팩트는 띄운 계정 소유로 발행된다. 계정마다 흩어지지 않게 한 계정의 발행 전용 세션이 모아서 발행한다.
+
+PUBLISHER_DIR = os.path.join(STATE_DIR, "publisher")
+PUBLISHER_ROLE = os.path.join(PUBLISHER_DIR, "ROLE.md")
+PUBLISHER_SESSION = "acm-publisher"
+PUBLISHER_TOOLS = "Read,Artifact,SendMessage,ListAgents,ToolSearch"
+# 발행 세션은 Artifact 규칙 판단과 기존 아티팩트 갱신을 맡으니 작은 모델로 내리지 않는다.
+# alias 가 아니라 정확한 ID 로 고정한다. 점검해 주는 감사가 없으니 모델이 은퇴하거나 새 세대가 나오면 직접 바꾼다.
+PUBLISHER_MODEL = "claude-sonnet-5-5"
+PUBLISHER_EFFORT = "high"
+# 발행 세션은 필요할 때 acm publisher check 가 띄우고, 같은 창의 감시가 쉬는 시간을 재서 끈다.
+# 일을 마치고 PUBLISHER_IDLE 초, 띄운 뒤 일을 한 번도 받지 않으면 PUBLISHER_IDLE_MAX 초가 기준이다.
+# 쉬는 시간은 Claude Code 가 세션마다 남기는 sessions/<pid>.json 의 status 와 statusUpdatedAt 으로 잰다.
+PUBLISHER_IDLE = float(os.environ.get("ACM_PUBLISHER_IDLE", "30"))
+PUBLISHER_IDLE_MAX = float(os.environ.get("ACM_PUBLISHER_IDLE_MAX", "300"))
+PUBLISHER_READY_TIMEOUT = 60
+# check 가 남기는 시각. check 와 그 뒤의 SendMessage 사이에 감시가 세션을 끄지 않게 한다
+PUBLISHER_LEASE = os.path.join(PUBLISHER_DIR, ".lease")
+PUBLISHER_WATCH_LOG = os.path.join(PUBLISHER_DIR, "watch.log")
+# 발행 세션이 읽고 발행하는 로컬 파일은 이 폴더 아래에만 둔다. 다른 세션은 acm publisher check <파일> 로 여기에 올린다.
+# 발행 세션은 다른 세션의 메시지를 묻지 않고 처리하니, 프롬프트 인젝션을 당한 세션이 민감한 파일을 보내도 읽지 못하게 훅으로 막는다
+PUBLISHER_INBOX = os.path.join(PUBLISHER_DIR, "inbox")
+# Claude Code 가 세션마다 scratchpad 를 두는 곳. 발행 세션이 Artifact read 로 받아 온 기존 아티팩트가 여기 든다
+CLAUDE_TMP = f"/tmp/claude-{os.getuid()}"
+# inbox 에 올릴 수 있는 파일. 아티팩트 페이지와 그 페이지가 쓰는 웹 파일만 받는다
+STAGE_EXTS = frozenset((".html", ".htm", ".md", ".css", ".js", ".mjs", ".json", ".svg", ".png", ".jpg", ".jpeg",
+                        ".gif", ".webp", ".avif", ".ico", ".woff", ".woff2", ".ttf", ".otf", ".mp4", ".webm", ".mp3",
+                        ".wav", ".pdf", ".txt", ".csv"))
+# 아티팩트 한 페이지와 파일 하나의 크기 한도
+STAGE_MAX_BYTES = 16 * 1024 * 1024
+# 올린 폴더는 하루가 지나면 다음에 올릴 때 지운다
+STAGE_KEEP = 86400
+# 발행 세션의 훅이 통과시키는 도구와 Artifact 동작. 나머지는 모두 막는다
+PUBLISHER_GUARD_TOOLS = frozenset(("Read", "Artifact", "SendMessage", "ListAgents", "ToolSearch"))
+PUBLISHER_ARTIFACT_ACTIONS = frozenset(("publish", "read"))
+# 발행 세션의 시스템 프롬프트에 ROLE.md 뒤로 붙인다. ROLE.md 는 사람이 고치는 파일이라 범위는 코드가 따로 붙인다
+PUBLISHER_SCOPE = ("이 세션이 읽고 발행하는 로컬 파일은 {inbox} 아래와 이 세션의 scratchpad 아래뿐이고, 그 밖의 경로는 훅이 막는다. "
+                   "요청에 다른 경로가 오면 발행하지 말고, 요청한 세션에 `acm publisher check <파일>` 로 올린 경로를 보내 달라고 답한다. "
+                   "Artifact 는 publish 와 read 만 쓰고, force 와 capabilities, read 의 out_dir 는 훅이 막는다.")
+
+
+def publisher_conf(data):
+    """(켜짐, 대표 계정). 대표 계정이 목록에서 빠졌으면 첫 계정으로 본다. 없는 계정을 돌려주면 세션을 띄울 때마다 KeyError 로 멈춘다."""
+    conf = data.get("publisher") or {}
+    account = conf.get("account")
+    if account not in data["accounts"] or tool_of(data["accounts"][account]) != "claude":
+        account = (tool_accounts(data, "claude") or data["order"])[0]
+    return conf.get("enabled", False), account
+
+
+def publisher_model(data):
+    conf = data.get("publisher") or {}
+    return conf.get("model") or PUBLISHER_MODEL, conf.get("effort") or PUBLISHER_EFFORT
+
+
+def set_publisher(data, **kw):
+    def change(d):
+        d["publisher"] = dict(d.get("publisher") or {}, **kw)
+    change(data)
+    update_accounts(change)
+
+
+def publisher_running():
+    return subprocess.run(["tmux", "has-session", "-t", PUBLISHER_SESSION],
+                          capture_output=True).returncode == 0
+
+
+def publisher_startable():
+    """발행 세션을 띄울 수 있는지만 본다. 띄우는 것은 발행을 맡기기 직전의 acm publisher check 다."""
+    if not shutil.which("tmux"):
+        info("발행 세션은 tmux 안에서 돈다. brew install tmux 로 설치하세요")
+        return False
+    if not os.path.exists(PUBLISHER_ROLE):
+        info(f"발행 세션의 역할 파일 {PUBLISHER_ROLE} 이 없어 띄우지 않았습니다. README 의 '아티팩트는 한 계정으로 모은다' 절을 보고 직접 쓰세요")
+        return False
+    return True
+
+
+def publisher_entry(data):
+    """발행 세션이 Claude Code 세션 목록에 남긴 기록. 아직 안 올라왔거나 프로세스가 끝났으면 None."""
+    _, name = publisher_conf(data)
+    d = os.path.join(config_dir(data["accounts"][name]) or SHARED, "sessions")
+    try:
+        files = os.listdir(d)
+    except OSError:
+        return None
+    for f in files:
+        rec = read_json(os.path.join(d, f)) if f.endswith(".json") else None
+        if rec and rec.get("name") == PUBLISHER_SESSION and isinstance(rec.get("pid"), int) and pid_alive(rec["pid"]):
+            return rec
+    return None
+
+
+def start_publisher(data, quiet=False, wait=False):
+    if not shutil.which("tmux"):
+        die("발행 세션은 tmux 안에서 돈다. brew install tmux 로 설치하세요")
+    if publisher_running():
+        if not quiet:
+            print(f"발행 세션이 이미 떠 있습니다 (tmux attach -t {PUBLISHER_SESSION})")
+        return wait_publisher(data) if wait else True
+    if not os.path.exists(PUBLISHER_ROLE):
+        info(f"발행 세션의 역할 파일 {PUBLISHER_ROLE} 이 없어 띄우지 않았습니다. README 의 '아티팩트는 한 계정으로 모은다' 절을 보고 직접 쓰세요")
+        return False
+    _, name = publisher_conf(data)
+    acc = data["accounts"][name]
+    # tmux 서버가 이미 떠 있으면 그 서버를 처음 띄운 프로세스의 환경을 쓰니, 창 안에서도 한 번 더 뺀다
+    env = ["env"] + [a for k in session_env_keys(os.environ) for a in ("-u", k)]
+    if config_dir(acc) is not None:
+        env.append(f"CLAUDE_CONFIG_DIR={config_dir(acc)}")
+    env += [f"ACM_ACCOUNT={name}", f"ACM_LABEL={account_label(name, acc)}", "ACM_ROLE=publisher"]
+    with open(PUBLISHER_ROLE) as f:
+        role = f.read().rstrip() + "\n\n" + PUBLISHER_SCOPE.format(inbox=PUBLISHER_INBOX)
+    os.makedirs(PUBLISHER_INBOX, mode=0o700, exist_ok=True)
+    model, effort = publisher_model(data)
+    # --restricted 도 파일 도구를 작업 폴더로 묶지만, 그 모드의 세션은 메시지 소켓을 열지 않아 SendMessage 를 받지 못한다.
+    # 그래서 파일 범위는 훅으로 막는다
+    cmd = env + ["claude", "--model", model, "--effort", effort, "-n", PUBLISHER_SESSION,
+                 "--tools", PUBLISHER_TOOLS, "--allowedTools", "Artifact", "--strict-mcp-config",
+                 "--settings", publisher_settings(), "--append-system-prompt", role]
+    # 감시는 claude 와 같은 창에서 돈다. 세션이 어떻게 끝나든 창과 함께 사라져서 따로 거둘 것이 없다.
+    # tmux 창은 띄운 셸의 환경을 받지 않으니 상태 폴더와 기준을 직접 넘긴다
+    watch = ["env", f"ACM_HOME={STATE_DIR}", f"ACM_PUBLISHER_IDLE={PUBLISHER_IDLE:g}",
+             f"ACM_PUBLISHER_IDLE_MAX={PUBLISHER_IDLE_MAX:g}",
+             sys.executable, os.path.abspath(__file__), "publisher", "watch"]
+    shell = f"{shlex.join(watch)} </dev/null >>{shlex.quote(PUBLISHER_WATCH_LOG)} 2>&1 & exec {shlex.join(cmd)}"
+    # tmux 서버가 없으면 이 호출이 서버를 띄우고 서버는 이 환경을 물려받는다. tmux 안의 터미널이 아니어도 된다
+    started = subprocess.run(["tmux", "new-session", "-d", "-s", PUBLISHER_SESSION, "-x", "200", "-y", "50",
+                              "-c", PUBLISHER_DIR, shell], env=detached_env())
+    # check 두 개가 동시에 띄우면 늦은 쪽은 같은 이름이 있어 실패한다. 먼저 뜬 세션을 그대로 쓴다
+    if started.returncode != 0 and not publisher_running():
+        info("tmux 로 발행 세션을 띄우지 못했습니다")
+        return False
+    if not quiet:
+        print(f"발행 세션을 {account_label(name, acc)} [{name}] · {model} {effort} 로 띄웠습니다 (tmux attach -t {PUBLISHER_SESSION})")
+    return wait_publisher(data) if wait else True
+
+
+def wait_publisher(data):
+    """발행 세션이 세션 목록에 올라와 SendMessage 를 받을 수 있을 때까지 기다린다."""
+    deadline = time.time() + PUBLISHER_READY_TIMEOUT
+    while time.time() < deadline:
+        if publisher_entry(data):
+            return True
+        if not publisher_running():
+            return False
+        time.sleep(0.5)
+    return False
+
+
+def watch_publisher(data):
+    """발행 세션이 쉬는 시간을 재다가 기준을 넘으면 끈다. 발행 세션과 같은 창에서 돈다."""
+    started = time.time()
+    first = None  # 처음 본 idle 의 statusUpdatedAt. 이보다 뒤에 상태가 바뀌었으면 일을 한 것이다
+    worked = False
+    while publisher_running():
+        rec = publisher_entry(data)
+        if rec and rec.get("status") == "idle":
+            changed = (rec.get("statusUpdatedAt") or 0) / 1000
+            first = changed if first is None else first
+            worked = worked or changed > first
+            since = max(changed, os.path.getmtime(PUBLISHER_LEASE) if os.path.exists(PUBLISHER_LEASE) else 0)
+        elif rec:
+            worked, since = True, None
+        else:
+            # 목록에 아직 안 올라왔다. 시작 화면에서 멈췄어도 기준이 지나면 끈다
+            since = started
+        limit = PUBLISHER_IDLE if worked else PUBLISHER_IDLE_MAX
+        if since is not None and time.time() - since >= limit:
+            print(f"{datetime.now():%m/%d %H:%M:%S} {'일을 마치고' if worked else '일 없이'} {limit:.0f}초가 지나 발행 세션을 끈다", flush=True)
+            subprocess.run(["tmux", "kill-session", "-t", PUBLISHER_SESSION])
+            return
+        time.sleep(5)
+
+
+def under(path, root):
+    return path == root or path.startswith(root.rstrip(os.sep) + os.sep)
+
+
+def home_top(real):
+    """real 이 홈 아래면 홈 바로 아래 항목의 이름을, 아니면 None 을 돌려준다.
+    APFS 는 대소문자를 가리지 않고 /System/Volumes/Data 로도 같은 폴더에 닿아서, 문자열이 아니라 inode 로 홈을 알아본다."""
+    try:
+        home = os.stat(HOME)
+    except OSError:
+        return None
+    child, parent = real, os.path.dirname(real)
+    while parent != child:
+        try:
+            st = os.stat(parent)
+        except OSError:
+            return None
+        if (st.st_dev, st.st_ino) == (home.st_dev, home.st_ino):
+            return os.path.basename(child)
+        child, parent = parent, os.path.dirname(parent)
+    return None
+
+
+def stage_problem(path):
+    """inbox 에 올리면 안 되는 파일이면 이유를 돌려준다.
+    홈 바로 아래 숨은 폴더(~/.ssh, ~/.aws, ~/.claude, ~/.acm 등)와 ~/Library 에는 토큰과 설정이 들어서 받지 않는다."""
+    real = os.path.realpath(path)
+    if not os.path.isfile(real):
+        return "파일이 없다"
+    name = os.path.basename(real)
+    if name.startswith("."):
+        return "숨은 파일은 받지 않는다"
+    ext = os.path.splitext(name)[1].lower()
+    if ext not in STAGE_EXTS:
+        return f"{ext or '확장자 없는'} 파일은 받지 않는다. 아티팩트에 쓰는 웹 파일만 받는다"
+    top = home_top(real)
+    if top is not None and (top.startswith(".") or top.lower() == "library"):
+        return f"~/{top} 아래 파일은 받지 않는다"
+    if os.path.getsize(real) > STAGE_MAX_BYTES:
+        return f"{STAGE_MAX_BYTES // (1024 * 1024)}MB 를 넘는다"
+    return None
+
+
+def fd_path(fd):
+    """열린 파일의 실제 경로. 커널이 알려 주는 값이라 연 뒤에 경로 중간이 링크로 바뀌어도 속지 않는다."""
+    try:
+        if sys.platform.startswith("linux"):
+            return os.readlink(f"/proc/self/fd/{fd}")
+        # macOS 의 F_GETPATH 는 50 이다. 파이썬 3.9 의 fcntl 에는 이 이름이 없을 수 있다
+        out = fcntl.fcntl(fd, getattr(fcntl, "F_GETPATH", 50), b"\0" * 1024)
+        return out.split(b"\0", 1)[0].decode() or None
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+
+
+def copy_staged(path, target):
+    """검사한 파일을 그대로 복사한다. 이유가 있으면 복사하지 않고 돌려준다.
+    검사와 복사 사이에 경로가 다른 파일을 가리키게 바뀌면, 이름으로 다시 열어 복사할 때 그 다른 파일이 올라간다.
+    그래서 한 번 열고, 그 파일의 실제 경로로 다시 검사하고, 같은 파일에서 읽는다."""
+    try:
+        # O_NONBLOCK 은 그사이 FIFO 로 바뀌었을 때 여는 데서 멈추지 않게 한다
+        fd = os.open(os.path.realpath(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError as e:
+        return f"열지 못했다 ({e.strerror})"
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            return "일반 파일이 아니다"
+        actual = fd_path(fd)
+        if actual is None:
+            return "실제 경로를 확인하지 못했다"
+        why = stage_problem(actual)
+        if why:
+            return why
+        out = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(out, "wb") as dst:
+            os.lseek(fd, 0, os.SEEK_SET)
+            left = STAGE_MAX_BYTES + 1
+            while left > 0:
+                chunk = os.read(fd, min(1 << 20, left))
+                if not chunk:
+                    break
+                dst.write(chunk)
+                left -= len(chunk)
+        if left <= 0:
+            os.remove(target)
+            return f"{STAGE_MAX_BYTES // (1024 * 1024)}MB 를 넘는다"
+        return None
+    finally:
+        os.close(fd)
+
+
+def stage_problems(paths):
+    """올릴 파일 목록의 문제. 첫 파일이 페이지이고, 추가 파일은 첫 파일 폴더 아래에 있어야 상대 링크가 그대로 맞는다."""
+    problems = [f"{p}: {why}" for p in paths for why in [stage_problem(p)] if why]
+    base = os.path.dirname(os.path.realpath(paths[0]))
+    problems += [f"{p}: 추가 파일은 첫 파일과 같은 폴더 아래에 있어야 한다"
+                 for p in paths[1:] if not under(os.path.realpath(p), base)]
+    return problems
+
+
+def inbox_ok():
+    """inbox 가 링크가 아닌 진짜 폴더인지. 링크로 바뀌어 있으면 훅의 허용 범위와 정리 대상이 그 링크가 가리키는 곳으로 옮겨 간다."""
+    try:
+        st = os.lstat(PUBLISHER_INBOX)
+    except OSError:
+        return False
+    return stat.S_ISDIR(st.st_mode) and st.st_uid == os.getuid()
+
+
+def prune_inbox(now=None):
+    now = now or time.time()
+    if not inbox_ok():
+        return
+    try:
+        names = os.listdir(PUBLISHER_INBOX)
+    except OSError:
+        return
+    for n in names:
+        p = os.path.join(PUBLISHER_INBOX, n)
+        try:
+            if now - os.lstat(p).st_mtime < STAGE_KEEP:
+                continue
+            if os.path.isdir(p) and not os.path.islink(p):
+                shutil.rmtree(p)
+            else:
+                os.remove(p)
+        except OSError:
+            pass
+
+
+def stage_files(paths):
+    """파일을 inbox 의 새 폴더로 복사하고 (올린 경로, 첫 파일 폴더 기준 상대 경로) 목록을 돌려준다."""
+    problems = stage_problems(paths)
+    if problems:
+        die("발행할 파일을 올리지 않았습니다.\n" + "\n".join("  " + p for p in problems))
+    os.makedirs(PUBLISHER_INBOX, mode=0o700, exist_ok=True)
+    if not inbox_ok():
+        die(f"{PUBLISHER_INBOX} 가 링크이거나 내 폴더가 아니라서 올리지 않았습니다. 지우고 다시 실행하세요")
+    os.chmod(PUBLISHER_INBOX, 0o700)
+    prune_inbox()
+    dest = os.path.join(PUBLISHER_INBOX, f"{datetime.now():%Y%m%d-%H%M%S}-{os.urandom(3).hex()}")
+    base = os.path.dirname(os.path.realpath(paths[0]))
+    staged = []
+    for p in paths:
+        rel = os.path.relpath(os.path.realpath(p), base)
+        if any(r == rel for _, r in staged):
+            continue
+        target = os.path.join(dest, rel)
+        os.makedirs(os.path.dirname(target), mode=0o700, exist_ok=True)
+        why = copy_staged(p, target)
+        if why:
+            shutil.rmtree(dest, ignore_errors=True)
+            die(f"발행할 파일을 올리지 않았습니다.\n  {p}: {why}")
+        staged.append((target, rel))
+    return staged
+
+
+def publisher_guard_problem(event):
+    """발행 세션의 도구 호출이 범위를 벗어나면 이유를, 괜찮으면 None 을 돌려준다.
+    로컬 파일은 inbox 와 이 세션의 scratchpad 아래만 다룬다. scratchpad 는 경로에 세션 ID 가 든 폴더로 알아본다.
+    허용 목록 방식이라 경로를 대소문자나 다른 볼륨 경로로 바꿔 쓰면 통과하지 못하고 막힌다."""
+    tool = event.get("tool_name")
+    inp = event.get("tool_input") or {}
+    if tool not in PUBLISHER_GUARD_TOOLS:
+        return f"발행 세션은 {tool} 도구를 쓰지 않는다"
+    if tool not in ("Read", "Artifact"):
+        return None
+    cwd = event.get("cwd") or PUBLISHER_DIR
+    inbox = os.path.realpath(PUBLISHER_INBOX)
+    scratch_root = os.path.realpath(CLAUDE_TMP)
+    sid = str(event.get("session_id") or "")
+    inbox_real = inbox_ok()
+
+    def allowed(path, bases):
+        # 상대 경로는 도구가 어느 쪽을 기준으로 풀어도 범위 안이어야 하고, .. 는 받지 않는다
+        if not isinstance(path, str) or not path:
+            return False
+        path = os.path.expanduser(path)
+        if ".." in path.split(os.sep):
+            return False
+        for base in bases:
+            real = os.path.realpath(os.path.join(base, path))
+            if not ((inbox_real and under(real, inbox))
+                    or (sid and under(real, scratch_root) and sid in real.split(os.sep))):
+                return False
+        return True
+
+    if tool == "Read":
+        return None if allowed(inp.get("file_path"), [cwd]) else "inbox 밖 파일은 읽지 않는다"
+    action = inp.get("action") or "publish"
+    if action not in PUBLISHER_ARTIFACT_ACTIONS:
+        return f"Artifact {action} 는 발행 세션이 하지 않는다"
+    if inp.get("out_dir"):
+        return "Artifact read 의 out_dir 로 파일을 내려받지 않는다"
+    if inp.get("force"):
+        return "Artifact force 로 더 새 판을 덮어쓰지 않는다"
+    if inp.get("capabilities") is not None:
+        return "Artifact capabilities 는 발행 세션이 정하지 않는다"
+    if action != "publish":
+        return None
+    bases = [cwd]
+    if inp.get("root") is not None:
+        if not allowed(inp["root"], [cwd]):
+            return "root 가 inbox 밖이다"
+        bases.append(os.path.join(cwd, os.path.expanduser(inp["root"])))
+    paths = [inp["file_path"]] if inp.get("file_path") else []
+    paths += list(inp.get("file_paths") or [])
+    files = inp.get("files")
+    if isinstance(files, dict):
+        for src in files.values():
+            # {artifact, path} 는 서버에서 복사하고 null 은 지우는 것이라 로컬 파일을 읽지 않는다
+            if isinstance(src, str):
+                paths.append(src)
+            elif isinstance(src, dict) and "from" in src:
+                paths.append(src["from"])
+    elif isinstance(files, list):
+        paths += [f.get("path") for f in files if isinstance(f, dict)]
+    bad = [str(p) for p in paths if not allowed(p, bases)]
+    return f"inbox 밖 파일은 발행하지 않는다: {', '.join(bad)}" if bad else None
+
+
+def publisher_guard_main():
+    """발행 세션의 PreToolUse 훅. 막을 때는 이유를 stderr 에 쓰고 2 로 끝난다.
+    훅이 2 가 아닌 코드로 끝나면 Claude Code 는 도구를 그대로 실행하니, 입력을 읽다 실패해도 막는다."""
+    try:
+        why = publisher_guard_problem(json.load(sys.stdin))
+    except Exception as e:
+        why = f"훅 입력을 읽지 못했다 ({type(e).__name__})"
+    if why:
+        print(f"acm 발행 세션 범위 밖이라 막았다: {why}", file=sys.stderr)
+        return 2
+    return 0
+
+
+def publisher_settings():
+    """발행 세션에 --settings 로 넘기는 훅 설정. 계정 설정의 훅은 그대로 두고 이 훅만 더한다.
+    acm 이 import 단계에서 죽거나 python 을 못 찾아도 막히게 끝에 || exit 2 를 붙인다.
+    -I 로 PYTHONPATH 같은 환경변수를 무시하고, 다른 설정의 disableAllHooks 가 이 훅을 끄지 못하게 false 로 둔다."""
+    guard = shlex.join(["/usr/bin/env", f"ACM_HOME={STATE_DIR}", sys.executable, "-I", os.path.abspath(__file__),
+                        "publisher", "guard"]) + " || exit 2"
+    return json.dumps({"disableAllHooks": False,
+                       "hooks": {"PreToolUse": [{"matcher": "*",
+                                                 "hooks": [{"type": "command", "command": guard, "timeout": 30}]}]}})
+
+
+def cmd_publisher(data, args):
+    sub = args[0] if args else "status"
+    enabled, name = publisher_conf(data)
+    if sub == "on":
+        set_publisher(data, enabled=True, account=name)
+        # 발행 세션은 여기서 띄우지 않는다. 발행을 맡기기 직전의 acm publisher check 가 띄운다
+        publisher_startable()
+        print("다른 계정으로 띄우는 세션은 이제 아티팩트 발행을 발행 세션에 맡깁니다. 발행 세션은 맡길 때 뜨고 쉬면 꺼집니다")
+    elif sub == "off":
+        set_publisher(data, enabled=False, account=name)
+        if publisher_running():
+            subprocess.run(["tmux", "kill-session", "-t", PUBLISHER_SESSION])
+        print("발행 세션을 끄고, 각 세션이 자기 계정으로 발행하게 되돌렸습니다")
+    elif sub == "start":
+        start_publisher(data)
+    elif sub == "stop":
+        if publisher_running():
+            subprocess.run(["tmux", "kill-session", "-t", PUBLISHER_SESSION])
+        print("발행 세션을 껐습니다")
+    elif sub == "account" and len(args) == 2:
+        new = resolve(data, args[1], "claude")
+        if tool_of(data["accounts"][new]) != "claude":
+            die(f"{new} 는 Codex 계정입니다. 아티팩트는 Claude 계정으로만 모은다")
+        set_publisher(data, account=new)
+        print(f"대표 계정을 {account_label(new, data['accounts'][new])} [{new}] 로 바꿨습니다. 떠 있는 발행 세션은 acm publisher stop 후 다시 띄워야 바뀝니다")
+    elif sub == "model" and len(args) in (2, 3):
+        set_publisher(data, model=args[1], **({"effort": args[2]} if len(args) == 3 else {}))
+        model, effort = publisher_model(data)
+        print(f"발행 세션 모델을 {model} {effort} 로 바꿨습니다. 떠 있는 발행 세션은 acm publisher stop 후 다시 띄워야 바뀝니다")
+    elif sub == "check":
+        # 다른 계정 세션이 발행을 맡기기 전에 부른다. 한도면 다른 계정으로 넘기지 않고 멈춘다.
+        # 파일을 주면 발행 세션이 읽을 수 있는 inbox 로 올린다. 한도를 읽기 전에 파일부터 본다
+        files = args[1:]
+        problems = stage_problems(files) if files else []
+        if problems:
+            die("발행할 파일을 올리지 않았습니다.\n" + "\n".join("  " + p for p in problems))
+        remember_emails(data)
+        # 발행 여부를 가르는 값이라 대표 계정만은 기다려서 새로 읽는다
+        refresh_usage(data, wait=True, names=[name])
+        now = time.time()
+        u = account_usage(name, now)
+        five, seven = u["five"], u["seven"]
+        label = account_label(name, data["accounts"][name])
+        # 발행 세션 모델에 걸리는 모델별 주간 한도도 본다
+        pub_model, _ = publisher_model(data)
+        _, blocked = score_account(u, pub_model, now, FIVE_HOUR_CAP, SEVEN_DAY_CAP)
+        if blocked:
+            parts = [] if five is None else [f"5h {five:.0f}% · {fmt_reset(u['five_reset'])} 리셋"]
+            parts.append(f"Week {seven:.0f}% · {fmt_reset(u['seven_reset'])} 리셋")
+            parts += [f"{s['short']} 주간 {s['pct']:.0f}% · {fmt_reset(s['resets_at'])} 리셋"
+                      for s in u["scoped"] if scope_matches(s["name"], pub_model)]
+            print(f"발행 불가: 대표 계정 {label} 이 한도 근처다 ({', '.join(parts)}). 다른 계정으로 발행하지 않는다")
+            sys.exit(1)
+        # 발행 세션은 이때 띄운다. 시각을 먼저 남겨 이어지는 SendMessage 전에 감시가 끄지 않게 한다
+        os.makedirs(PUBLISHER_DIR, exist_ok=True)
+        with open(PUBLISHER_LEASE, "w"):
+            pass
+        fresh = not publisher_running()
+        if not start_publisher(data, quiet=True, wait=True):
+            print(f"발행 불가: 발행 세션을 띄우지 못했다. 위 안내가 없으면 tmux attach -t {PUBLISHER_SESSION} 으로 화면을 확인한다")
+            sys.exit(1)
+        print(f"발행 가능: {label} · {fmt_usage(five, seven)}" + (" · 발행 세션을 새로 띄웠다" if fresh else ""))
+        if files:
+            staged = stage_files(files)
+            print("올린 파일. 발행 세션에는 아래 경로를 보낸다")
+            for i, (target, rel) in enumerate(staged):
+                print(f"  {target}" + (f"  (files 의 {rel})" if i else ""))
+    elif sub == "watch":
+        watch_publisher(data)
+    elif sub == "status":
+        acc = data["accounts"][name]
+        model, effort = publisher_model(data)
+        rec = publisher_entry(data) if publisher_running() else None
+        state = "없음. 발행을 맡길 때 acm publisher check 가 띄운다"
+        if publisher_running():
+            state = f"떠 있음 · {rec.get('status') if rec else '시작 중'} (tmux attach -t {PUBLISHER_SESSION})"
+        print(f"발행 모으기: {'켜짐' if enabled else '꺼짐'}")
+        print(f"대표 계정: {account_label(name, acc)} [{name}] · {model} {effort}")
+        print(f"발행 세션: {state}")
+        print(f"자동 종료: 일을 마치고 {PUBLISHER_IDLE:.0f}초, 일이 없으면 {PUBLISHER_IDLE_MAX:.0f}초")
+        print(f"역할 파일: {PUBLISHER_ROLE if os.path.exists(PUBLISHER_ROLE) else '없음'}")
+    else:
+        die("사용법: acm publisher on|off|start|stop|status|check [파일...]|account <계정>|model <모델> [effort]")
+
+
+def aside_configured():
+    """기본 계정 user 범위 MCP 에 aside 가 있는지. 다른 계정은 sync 로 같은 목록을 받는다."""
+    return "aside" in ((read_json(DEFAULT_CLAUDE_JSON) or {}).get("mcpServers") or {})
+
+
+def session_rules(data, name, publish, browser):
+    """대표 계정이 아닌 세션에 붙이는 운영 규칙. 발행 위임과 브라우저 우회 중 해당하는 것만 담는다."""
+    _, pub = publisher_conf(data)
+    pub_label = account_label(pub, data["accounts"][pub])
+    rules = [f"이 세션은 acm 으로 {account_label(name, data['accounts'][name])} 계정에 붙었다."]
+    if publish:
+        rules.append(
+            f"운영 규칙으로 아티팩트는 모두 {pub_label} 계정 하나로 모으고, 그래서 이 세션에는 Artifact 도구가 없다. "
+            "아티팩트를 발행하거나 갱신할 일이 생기면 HTML 파일을 로컬에 쓰고, Bash 로 "
+            "`acm publisher check <HTML 파일> [추가 파일...]` 을 실행한다. 이 명령은 지금 발행할 수 있는지 보고, "
+            "파일을 발행 세션이 읽을 수 있는 폴더로 올린다. 실패하면 맡기지 말고 그 출력을 사용자에게 전한다. "
+            f"성공하면 SendMessage 로 '{PUBLISHER_SESSION}' 세션에 출력에 나온 올린 경로와 icon, description 을 보낸다. "
+            "발행 세션은 올린 경로 밖의 파일은 읽지 못한다. 갱신이면 기존 url 을 함께 보낸다. "
+            "추가 파일은 HTML 과 같은 폴더 아래에 두고, files 에는 출력에 나온 올린 경로를 적는다. "
+            "대표 계정이 한도에 닿았어도 다른 계정으로 발행하지 않는다. "
+            "답으로 오는 URL 을 사용자에게 전한다.")
+    if browser:
+        rules.append(
+            f"Claude in Chrome 은 브라우저 확장에 로그인한 대표 계정({pub_label}) 세션에만 붙어서 이 세션에서는 연결되지 않는다. "
+            "화면 제어나 로그인된 사이트 작업이 필요하면 Chrome 도구를 시도하지 말고 aside MCP(mcp__aside__repl, mcp__aside__exec)로 "
+            "Aside Browser 를 쓴다. Aside Browser 에 로그인되지 않은 사이트는 사용자에게 Aside Browser 에서 직접 로그인해 달라고 한다.")
+    return " ".join(rules)
+
+
+# 계정을 고를 일이 아니라 그대로 claude 로 보내는 하위 명령. 셸 함수와 IDE 확장의 래퍼가 같이 쓴다
+PASSTHROUGH = ("agents", "attach", "auth", "auto-mode", "doctor", "gateway", "import", "install", "logs", "mcp",
+               "plugin", "plugins", "purge", "respawn", "rm", "setup-token", "stop", "kill", "ultrareview", "update",
+               "upgrade", "-v", "--version", "-h", "--help")
+
+# 사람이 터미널에 친 claude 만 acm 을 거치게 하는 셸 함수. 다른 도구가 부르는 claude 실행 파일은 그대로다.
+# 하위 명령(mcp, auth, update 등)은 계정을 고를 일이 아니라 그대로 claude 로 보낸다.
+SHELL_INIT = """claude() {
+  case "${1:-}" in
+    %s)
+      command claude "$@"; return ;;
+  esac
+  if [ -t 0 ] && [ -t 1 ] && command -v acm >/dev/null 2>&1; then
+    acm claude "$@"
+  else
+    command claude "$@"
+  fi
+}
+codex() {
+  case "${1:-}" in
+    %s)
+      command codex "$@"; return ;;
+  esac
+  if [ -t 0 ] && [ -t 1 ] && command -v acm >/dev/null 2>&1; then
+    acm codex "$@"
+  else
+    command codex "$@"
+  fi
+}
+""" % ("|".join(PASSTHROUGH), "|".join(CODEX_PASSTHROUGH))
+
+
+def cmd_shell_init(data, args):
+    print(SHELL_INIT, end="")
+
+
+def cmd_rm(data, args):
+    if len(args) != 1:
+        die("사용법: acm rm <계정>")
+    name = resolve(data, args[0])
+    acc = data["accounts"][name]
+    tool = tool_of(acc)
+    if config_dir(acc) is None and tool == "claude":
+        die(f"{name} 는 기본 계정(~/.claude)이라 뺄 수 없습니다")
+    live = [s for s in running_sessions(data, with_cwd=False) if s["account"] == name]
+    if live:
+        die(f"{account_label(name, acc)} 로 돌고 있는 세션이 {len(live)}개 있습니다. 세션을 닫고 다시 실행하세요")
+    was_publisher = (data.get("publisher") or {}).get("account") == name
+
+    def change(d):
+        d["accounts"].pop(name, None)
+        if name in d["order"]:
+            d["order"].remove(name)
+        # 대표 계정을 뺐으면 대표 지정도 지운다. 남겨 두면 publisher_conf 가 첫 계정으로 보지만 status 에서 헷갈린다
+        if (d.get("publisher") or {}).get("account") == name:
+            d["publisher"].pop("account")
+        if d.get("last") == name:
+            d["last"] = None
+        for t, n in list((d.get("last_by_tool") or {}).items()):
+            if n == name:
+                d["last_by_tool"].pop(t)
+    change(data)
+    update_accounts(change)
+    if was_publisher:
+        print(f"{name} 가 대표 계정이라 대표 지정을 지웠습니다. 이제 첫 계정 {data['order'][0]} 으로 모읍니다")
+    for path in (os.path.join(USAGE_DIR, f"{name}.json"), os.path.join(POLL_DIR, f"{name}.json")):
+        if os.path.exists(path):
+            os.remove(path)
+    print(f"{name} 를 계정 목록에서 뺐습니다.")
+    if tool == "codex":
+        if config_dir(acc) is None:
+            print(f"{CODEX_ROOT} 와 로그인 정보는 그대로 둡니다. 다시 쓰려면 acm add --codex")
+            return
+        print(f"계정 디렉터리 {config_dir(acc)} 와 로그인 정보는 남겨 둡니다. 다시 쓰려면 acm add --codex {name}, 완전히 지우려면:")
+        print(f"  CODEX_HOME={config_dir(acc)} codex logout")
+        print(f"  rm -rf {config_dir(acc)}    # 안의 공유 항목은 링크라서 ~/.codex 는 지워지지 않습니다")
+        return
+    print(f"계정 디렉터리 {config_dir(acc)} 와 로그인 정보는 남겨 둡니다. 다시 쓰려면 acm add {name}, 완전히 지우려면:")
+    print(f"  CLAUDE_CONFIG_DIR={config_dir(acc)} claude auth logout")
+    print(f"  rm -rf {config_dir(acc)}    # 안의 공유 항목은 링크라서 ~/.claude 는 지워지지 않습니다")
+
+
+def cmd_uninstall_statusline(data, args):
+    settings = os.path.join(SHARED, "settings.json")
+    with open(settings) as f:
+        text = f.read()
+    cur = (json.loads(text).get("statusLine") or {}).get("command")
+    wrapped, inner = statusline_parts(cur)
+    if not wrapped:
+        print("acm statusline 래퍼가 설치돼 있지 않습니다")
+        return
+    backup = write_statusline_settings(settings, text, with_statusline(text, cur, inner or None))
+    print(f"statusLine 을 원래 명령으로 되돌렸습니다: {inner or '(없음)'}")
+    print(f"백업: {backup}")
+
+
+# ---------- 한도에 걸린 세션 이어 가기 ----------
+# 세션이 한도로 멈추면 StopFailure 훅이 그 세션을 적고 터미널 알림을 띄운다. 훅 출력은 세션에 들어가지 않아서
+# 이어 가는 것은 사람이 세션을 닫고 acm resume 을 칠 때다. 세션 기록은 공유 폴더에 있어 다른 계정에서도 맥락이 그대로다
+
+LIMITED_DIR = os.path.join(STATE_DIR, "limited")
+# 이보다 오래된 기록은 이어 갈 일이 없다고 보고 지운다
+LIMITED_KEEP = 7 * 86400
+SESSION_ID_RE = re.compile(r"[A-Za-z0-9-]{8,64}")
+
+
+def stop_failure_command():
+    return shlex.join([ACM_BIN, "hook", "stop-failure"])
+
+
+def session_account(data, env=None):
+    """그 환경의 claude 가 쓰는 계정. claude 가 실제로 따르는 CLAUDE_CONFIG_DIR 로만 찾는다.
+    ACM_ACCOUNT 는 자식 프로세스로 물려 내려가서, 그 안에서 다른 설정 폴더로 띄운 claude 와 어긋날 수 있다.
+    등록되지 않은 설정 폴더면 None 이다."""
+    env = os.environ if env is None else env
+    cfg = env.get("CLAUDE_CONFIG_DIR") or None
+    for name in tool_accounts(data, "claude"):
+        d = config_dir(data["accounts"][name])
+        if d == cfg or (d and cfg and os.path.realpath(d) == os.path.realpath(cfg)):
+            return name
+    return None
+
+
+# 한도에 걸린 뒤에도 기록이 이만큼 넘게 이어졌으면, 리셋 뒤 그 계정에서 계속 쓴 세션이라 이어 갈 대상에서 뺀다
+LIMITED_GRACE = 120
+
+
+def short_folder(path):
+    """긴 폴더 경로를 끝 두 단계만 남겨 짧게."""
+    if not path:
+        return "?"
+    short = "~" + path[len(HOME):] if path.startswith(HOME) else path
+    parts = short.split("/")
+    return "…/" + "/".join(parts[-2:]) if len(parts) > 3 else short
+
+
+def limited_sessions():
+    """한도에 걸려 멈춘 뒤 아직 이어 가지 않은 세션 기록. 최근 것부터."""
+    recs = []
+    for path in glob.glob(os.path.join(LIMITED_DIR, "*.json")):
+        r = read_json(path)
+        if not isinstance(r, dict) or not SESSION_ID_RE.fullmatch(str(r.get("session_id") or "")):
+            continue
+        try:
+            if os.path.getmtime(r.get("transcript") or "") > (r.get("at") or 0) + LIMITED_GRACE:
+                continue
+        except (OSError, TypeError):
+            pass
+        recs.append(r)
+    return sorted(recs, key=lambda r: r.get("at") or 0, reverse=True)
+
+
+def prune_limited(now=None):
+    now = now or time.time()
+    for path in glob.glob(os.path.join(LIMITED_DIR, "*.json")):
+        rec = read_json(path)
+        if not isinstance(rec, dict) or now - (rec.get("at") or 0) > LIMITED_KEEP:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
+def hook_stop_failure(event, env=None):
+    """StopFailure 훅이 받은 입력을 처리하고 터미널에 보낼 알림 문구를 돌려준다. 한도가 아니면 None."""
+    if not isinstance(event, dict) or event.get("error") != "rate_limit":
+        return None
+    sid = str(event.get("session_id") or "")
+    if not SESSION_ID_RE.fullmatch(sid):
+        return None
+    # 발행 세션과 사용량 조회처럼 acm 이 ~/.acm 에서 띄운 세션은 사람이 이어 갈 세션이 아니다
+    cwd = os.path.realpath(str(event.get("cwd") or "."))
+    state = os.path.realpath(STATE_DIR)
+    if cwd == state or cwd.startswith(state + os.sep):
+        return None
+    data = load_accounts()
+    name = session_account(data, env)
+    label = account_label(name, data["accounts"][name]) if name else None
+    os.makedirs(LIMITED_DIR, mode=0o700, exist_ok=True)
+    prune_limited()
+    save_json(os.path.join(LIMITED_DIR, f"{sid}.json"), {
+        "session_id": sid, "account": name, "label": label, "cwd": event.get("cwd"),
+        "transcript": event.get("transcript_path"), "message": event.get("last_assistant_message"),
+        "at": int(time.time())})
+    return f"acm: {label or '이 계정'} 한도에 걸렸습니다. 세션을 닫고 acm resume 으로 다른 계정에서 이어 갑니다"
+
+
+def cmd_hook(data, args):
+    """Claude Code 훅이 부른다. 출력과 종료 코드가 세션을 막지 않게 어떤 오류도 밖으로 내지 않는다."""
+    if args[:1] != ["stop-failure"]:
+        return
+    try:
+        text = hook_stop_failure(json.load(sys.stdin))
+    except Exception as e:
+        info(f"StopFailure 훅 처리 실패 ({type(e).__name__})")
+        return
+    if text:
+        # iTerm2 는 OSC 9 를 데스크톱 알림으로 띄운다. Claude Code 가 화면에 떠 있을 때만 내보낸다
+        clean = "".join(ch for ch in text if ch.isprintable())
+        print(json.dumps({"terminalSequence": f"\033]9;{clean}\007"}, ensure_ascii=False))
+
+
+def open_session_pid(data, sid):
+    """그 세션 ID 로 지금 떠 있는 claude 의 pid. 없으면 None."""
+    dirs = {os.path.realpath(os.path.join(config_dir(acc) or SHARED, "sessions")) for acc in data["accounts"].values()
+            if tool_of(acc) == "claude"}
+    for d in dirs:
+        for path in glob.glob(os.path.join(d, "*.json")):
+            rec = read_json(path)
+            if isinstance(rec, dict) and rec.get("sessionId") == sid and isinstance(rec.get("pid"), int) \
+                    and pid_alive(rec["pid"]):
+                return rec["pid"]
+    return None
+
+
+def cmd_resume(data, args):
+    """한도에 걸린 세션을 다른 계정으로 다시 연다. 세션 ID 를 주지 않으면 가장 최근에 걸린 세션이다."""
+    forced = None
+    if args[:1] in (["-a"], ["--acc"]) and len(args) > 1:
+        forced, args = args[1], args[2:]
+    sid = args[0] if args and not args[0].startswith("-") else None
+    rest = args[1:] if sid else args
+    recs = limited_sessions()
+    if sid:
+        rec = next((r for r in recs if r["session_id"].startswith(sid)), None) or {"session_id": sid}
+    elif recs:
+        rec = recs[0]
+    else:
+        die("한도에 걸린 세션 기록이 없습니다. 이어 갈 세션이 따로 있으면 acm resume <세션 ID>")
+    sid = rec["session_id"]
+    if not SESSION_ID_RE.fullmatch(sid):
+        die(f"세션 ID 가 아닙니다: {sid}")
+    pid = open_session_pid(data, sid)
+    if pid:
+        die(f"세션 {sid[:8]} 이 아직 열려 있습니다 (pid {pid}). 같은 세션을 두 곳에서 열면 기록이 섞이니 그 세션을 닫고 다시 실행하세요")
+    cwd = rec.get("cwd")
+    if cwd:
+        # claude --resume 은 지금 폴더의 프로젝트 기록에서 세션을 찾는다
+        if not os.path.isdir(cwd):
+            die(f"세션을 열었던 폴더 {cwd} 가 없습니다")
+        os.chdir(cwd)
+    if forced:
+        target, why = resolve(data, forced, "claude"), "지정"
+        if tool_of(data["accounts"][target]) != "claude":
+            die(f"{target} 는 {TOOL_NAMES[tool_of(data['accounts'][target])]} 계정입니다. 한도 이어 가기는 Claude 세션만 한다")
+    else:
+        remember_emails(data)
+        refresh_usage(data)
+        exclude = {rec.get("account")} - {None}
+        target, why = pick(data, "usage", session_model(rest), exclude=exclude, strict=True)
+        if target is None:
+            die(f"이어 갈 계정이 없어 띄우지 않았습니다. {why}")
+    try:
+        os.remove(os.path.join(LIMITED_DIR, f"{sid}.json"))
+    except OSError:
+        pass
+    came = f"{rec['label']} 에서 " if rec.get("label") else ""
+    launch(data, ["-a", target, "--resume", sid] + rest, reason=f"{came}이어 가기 · {why}")
+
+
+def resume_hook_installed(settings):
+    groups = ((settings.get("hooks") or {}).get("StopFailure") or []) if isinstance(settings, dict) else []
+    return any(isinstance(g, dict) and any(isinstance(h, dict) and h.get("command") == stop_failure_command()
+                                            for h in g.get("hooks") or []) for g in groups)
+
+
+def write_settings_json(path, obj):
+    """settings.json 을 다시 쓴다. 바꾸기 전 글은 백업으로 남긴다."""
+    backup = f"{path}.acm-bak-{time.strftime('%Y%m%d%H%M%S')}"
+    shutil.copyfile(path, backup)
+    with open(path, "w") as f:
+        f.write(json.dumps(obj, indent=2, ensure_ascii=False) + "\n")
+    return backup
+
+
+def setup_resume_hook(run):
+    if not has_extra_accounts(load_accounts()):
+        run.skip("계정이 하나라 이어 갈 다른 계정이 없음")
+        return
+    path = os.path.join(SHARED, "settings.json")
+    settings = read_json(path) if os.path.exists(path) else {}
+    if not isinstance(settings, dict):
+        run.left(f"{path.replace(HOME, '~')} 를 JSON 으로 읽지 못해 StopFailure 훅을 넣지 못함")
+        return
+    if resume_hook_installed(settings):
+        run.ok("한도에 걸린 세션을 알리는 StopFailure 훅 있음")
+        return
+    if not run.ask("세션이 한도에 걸리면 알리고 acm resume 으로 다른 계정에서 이어 가게 StopFailure 훅을 넣을까요?"):
+        run.left("한도 이어 가기 훅 넣기 (acm setup)")
+        return
+    hooks = settings.setdefault("hooks", {})
+    hooks.setdefault("StopFailure", []).append(
+        {"matcher": "rate_limit", "hooks": [{"type": "command", "command": stop_failure_command(), "timeout": 10}]})
+    if os.path.exists(path):
+        backup = write_settings_json(path, settings)
+        run.done(f"StopFailure 훅을 넣었습니다. 백업: {backup.replace(HOME, '~')}")
+    else:
+        save_json(path, settings)
+        run.done("StopFailure 훅을 넣었습니다")
+
+
+def undo_resume_hook():
+    path = os.path.join(SHARED, "settings.json")
+    settings = read_json(path)
+    if not resume_hook_installed(settings):
+        return
+    groups = []
+    for g in settings["hooks"]["StopFailure"]:
+        if isinstance(g, dict):
+            g = dict(g, hooks=[h for h in g.get("hooks") or []
+                               if not (isinstance(h, dict) and h.get("command") == stop_failure_command())])
+            if not g["hooks"]:
+                continue
+        groups.append(g)
+    if groups:
+        settings["hooks"]["StopFailure"] = groups
+    else:
+        del settings["hooks"]["StopFailure"]
+    write_settings_json(path, settings)
+    print(f"{path.replace(HOME, '~')} 에서 acm 의 StopFailure 훅을 뺐습니다")
+
+
+# ---------- 처음 설정 ----------
+
+ACM_BIN = os.path.join(HOME, ".local", "bin", "acm")
+SETUP_FILE = os.path.join(STATE_DIR, "setup.json")
+RC_PATH_MARK = "# acm: acm 명령 위치"
+RC_PATH_LINE = 'export PATH="$HOME/.local/bin:$PATH"'
+RC_FUNC_MARK = "# acm: 터미널에서 친 claude 를 acm 으로 보낸다"
+RC_FUNC_LINE = 'if command -v acm >/dev/null 2>&1; then eval "$(acm shell-init)"; fi'
+JETBRAINS_DIR = os.path.join(HOME, "Library", "Application Support", "JetBrains")
+JETBRAINS_PLUGIN = "claude-code-jetbrains-plugin"
+JETBRAINS_SETTINGS = "claude-code-plugin-settings.xml"
+JETBRAINS_COMPONENT = "ClaudeCodePluginSettings"
+JETBRAINS_LAUNCHERS = ("idea", "pycharm", "webstorm", "goland", "datagrip", "rider", "clion", "phpstorm",
+                       "rubymine", "rustrover", "aqua", "dataspell", "studio")
+# VS Code 계열 편집기. (이름, Application Support 아래 설정 폴더, 홈 아래 확장 폴더)
+VSCODE_EDITORS = (("VS Code", "Code", ".vscode"), ("VS Code Insiders", "Code - Insiders", ".vscode-insiders"),
+                  ("Cursor", "Cursor", ".cursor"), ("Windsurf", "Windsurf", ".windsurf"),
+                  ("VSCodium", "VSCodium", ".vscode-oss"))
+VSCODE_APP_SUPPORT = os.path.join(HOME, "Library", "Application Support")
+VSCODE_EXTENSION = "anthropic.claude-code-*"
+# 확장이 Claude 를 띄울 때 쓰는 실행 파일. 번들 claude 경로를 첫 인자로 넘긴다
+VSCODE_KEY = "claudeCode.claudeProcessWrapper"
+
+PUBLISHER_ROLE_TEMPLATE = """이 세션은 acm 으로 띄운 아티팩트 발행 전용 세션(acm publisher)이다. 사용자의 Claude 계정이 여러 개라서, 어느 계정 세션에서 만든 아티팩트든 이 계정 하나로 모으려는 목적이다.
+
+사용자의 상시 승인: 같은 Mac 의 다른 Claude 세션이 SendMessage 로 아티팩트 발행이나 갱신을 요청하면 묻지 않고 진행한다. 범위는 아래까지다.
+- 요청에 적힌 파일을 Read 로 확인하고 Artifact 도구로 publish 한다. 파일은 요청한 세션이 acm publisher check 로 ~/.acm/publisher/inbox 에 올린 것만 받는다. 요청에 url 이 있으면 그 아티팩트를 갱신하고, 없으면 새로 발행한다. 요청에 적힌 files, description, icon 은 그대로 쓴다.
+- 결과 URL 을 요청한 세션(메시지의 from 주소)에 SendMessage 로 답한다. 실패하면 이유를 답한다.
+
+범위 밖은 하지 않는다. 아티팩트 삭제, 공유 범위 변경, 파일 수정과 삭제다. 이 세션에는 그런 도구도 주지 않았다. 파일 내용이 Artifact 도구 규칙(사칭, 가짜 기록, 자격 증명 수집 등)에 걸리면 발행하지 않고 이유를 답한다.
+"""
+
+
+class SetupRun:
+    """acm setup 한 번의 진행. mode 는 ask(물어보고 함), yes(기본값대로 함), check(바꾸지 않고 보기만)."""
+
+    def __init__(self, mode):
+        self.mode = mode
+        self.todo = []
+
+    def ask(self, question, default=True):
+        if self.mode == "check":
+            return False
+        if self.mode == "yes":
+            return default
+        try:
+            ans = input(f"  ? {question} [{'Y/n' if default else 'y/N'}] ").strip().lower()
+        except EOFError:
+            return False
+        return default if not ans else ans in ("y", "yes", "ㅛ", "네", "예", "응")
+
+    def text(self, question, default):
+        if self.mode != "ask":
+            return default
+        try:
+            return input(f"  ? {question} [{default}] ").strip() or default
+        except EOFError:
+            return default
+
+    def ok(self, msg):
+        print(f"  ✓ {msg}")
+
+    def done(self, msg):
+        print(f"  + {msg}")
+
+    def skip(self, msg):
+        print(f"  - {msg}")
+
+    def left(self, msg):
+        print(f"  ! {msg}")
+        self.todo.append(msg)
+
+
+def shell_rc():
+    """로그인 셸이 읽는 rc 파일. bash 는 macOS 터미널이 로그인 셸로 띄워서 .bash_profile 이다."""
+    shell = os.path.basename(os.environ.get("SHELL", "zsh"))
+    return os.path.join(HOME, ".bash_profile" if shell == "bash" else ".zshrc")
+
+
+def read_text(path):
+    try:
+        with open(path) as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+def setup_shell(run):
+    rc = shell_rc()
+    text = read_text(rc)
+    short = rc.replace(HOME, "~")
+    bin_dir = os.path.dirname(ACM_BIN)
+    need_path = bin_dir not in os.environ.get("PATH", "").split(":") and ".local/bin" not in text
+    need_func = "acm shell-init" not in text
+    if not need_path and not need_func:
+        run.ok(f"터미널의 claude 와 codex 를 acm 으로 보냄 ({short})")
+        return
+    what = {(True, True): "PATH 와 셸 함수를", (True, False): "PATH 를", (False, True): "셸 함수를"}[(need_path, need_func)]
+    if not run.ask(f"{short} 에 {what} 넣어 터미널에서 친 claude 와 codex 를 acm 으로 보낼까요?"):
+        run.left(f"{short} 에 `{RC_FUNC_LINE}` 넣기")
+        return
+    block = ""
+    if need_path:
+        block += f"\n{RC_PATH_MARK}\n{RC_PATH_LINE}\n"
+    if need_func:
+        block += f"\n{RC_FUNC_MARK}\n{RC_FUNC_LINE}\n"
+    with open(rc, "a") as f:
+        f.write(("\n" if text and not text.endswith("\n") else "") + block)
+    run.done(f"{short} 에 {what} 넣었습니다. 새 터미널부터 적용되고, 지금 창은 `source {short}`")
+
+
+def setup_tmux(run):
+    if shutil.which("tmux"):
+        run.ok("tmux 있음 (발행 세션을 뒤에서 띄우는 데만 쓴다. 터미널이 tmux 일 필요는 없다)")
+        return
+    if not shutil.which("brew"):
+        run.left("tmux 설치. Homebrew 가 없어 직접 설치해야 합니다")
+        return
+    if not run.ask("발행 세션을 뒤에서 띄우는 데 쓰는 tmux 를 brew 로 설치할까요?"):
+        run.left("brew install tmux")
+        return
+    if subprocess.run(["brew", "install", "tmux"]).returncode == 0 and shutil.which("tmux"):
+        run.done("tmux 를 설치했습니다")
+    else:
+        run.left("brew install tmux 실패. 직접 설치하세요")
+
+
+def jetbrains_running():
+    out = subprocess.run(["ps", "-axo", "comm="], capture_output=True, text=True).stdout
+    return any(".app/Contents/MacOS/" in line and os.path.basename(line.strip()) in JETBRAINS_LAUNCHERS
+               for line in out.splitlines())
+
+
+def jetbrains_configs():
+    """Claude Code 플러그인이 깔린 JetBrains 설정 폴더와 그 플러그인 설정 파일."""
+    try:
+        names = sorted(os.listdir(JETBRAINS_DIR))
+    except OSError:
+        return []
+    # 판마다 설정 폴더가 따로 남는다. 제품마다 가장 새 판만 본다
+    latest = {}
+    for name in names:
+        d = os.path.join(JETBRAINS_DIR, name)
+        if not os.path.isdir(os.path.join(d, "plugins", JETBRAINS_PLUGIN)):
+            continue
+        product, version = name.rstrip("0123456789."), name[len(name.rstrip("0123456789.")):]
+        key = tuple(int(x) for x in version.split(".") if x.isdigit())
+        if product not in latest or key > latest[product][0]:
+            latest[product] = (key, name, os.path.join(d, "options", JETBRAINS_SETTINGS))
+    return [(name, path) for _, name, path in sorted(latest.values(), key=lambda v: v[1])]
+
+
+def jetbrains_command(path):
+    """설정 파일의 claudeCommand. 파일이나 값이 없으면 None."""
+    import xml.etree.ElementTree as ET
+    try:
+        root = ET.parse(path).getroot()
+    except (OSError, ET.ParseError):
+        return None
+    for comp in root.iter("component"):
+        if comp.get("name") == JETBRAINS_COMPONENT:
+            for opt in comp.iter("option"):
+                if opt.get("name") == "claudeCommand":
+                    return opt.get("value")
+    return None
+
+
+def write_jetbrains_command(path, value):
+    """claudeCommand 를 value 로 쓴다. value 가 None 이면 그 항목을 지워 플러그인 기본값으로 되돌린다."""
+    import xml.etree.ElementTree as ET
+    try:
+        tree = ET.parse(path)
+        root = tree.getroot()
+    except (OSError, ET.ParseError):
+        root = ET.Element("application")
+        tree = ET.ElementTree(root)
+    comp = next((c for c in root.iter("component") if c.get("name") == JETBRAINS_COMPONENT), None)
+    if comp is None:
+        comp = ET.SubElement(root, "component", name=JETBRAINS_COMPONENT)
+    opt = next((o for o in comp.iter("option") if o.get("name") == "claudeCommand"), None)
+    if value is None:
+        if opt is not None:
+            comp.remove(opt)
+        if len(comp) == 0:
+            comp.text = None
+    else:
+        if opt is None:
+            opt = ET.SubElement(comp, "option", name="claudeCommand")
+        opt.set("value", value)
+    ET.indent(tree, space="  ")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tree.write(path, encoding="unicode")
+
+
+def setup_jetbrains(run):
+    configs = jetbrains_configs()
+    if not configs:
+        run.skip("JetBrains Claude Code 플러그인 없음")
+        return
+    pending = [(name, path) for name, path in configs if jetbrains_command(path) != ACM_BIN]
+    for name, path in configs:
+        if (name, path) not in pending:
+            run.ok(f"{name} 의 Claude Code 플러그인이 acm 으로 띄움")
+    if not pending:
+        return
+    names = ", ".join(name for name, _ in pending)
+    if jetbrains_running():
+        run.left(f"{names} 의 Claude 명령을 acm 으로. IDE 가 떠 있으면 끌 때 설정을 덮어쓰니, IDE 를 모두 끄고 `acm setup` 을 다시 돌리세요")
+        return
+    if not run.ask(f"{names} 의 Claude Code 플러그인이 claude 대신 acm 으로 띄우게 할까요?"):
+        run.left(f"{names} 의 플러그인 설정에서 Claude 명령을 {ACM_BIN} 으로")
+        return
+    saved = read_json(SETUP_FILE) or {}
+    originals = saved.setdefault("jetbrains", {})
+    for name, path in pending:
+        originals.setdefault(path, {"existed": os.path.exists(path), "value": jetbrains_command(path)})
+        write_jetbrains_command(path, ACM_BIN)
+    save_json(SETUP_FILE, saved)
+    run.done(f"{names} 의 Claude 명령을 acm 으로 바꿨습니다. IDE 를 다시 띄우면 적용됩니다")
+
+
+def jsonc_mask(text):
+    """JSONC 의 주석을 같은 길이의 공백으로 바꾼다. 줄바꿈과 문자열 안은 그대로 둬서 위치가 원문과 같다."""
+    out, i, n, in_str = list(text), 0, len(text), False
+    while i < n:
+        c = text[i]
+        if in_str:
+            if c == "\\":
+                i += 2
+                continue
+            in_str = c != '"'
+            i += 1
+            continue
+        if c == '"':
+            in_str = True
+            i += 1
+            continue
+        end = None
+        if text.startswith("//", i):
+            end = text.find("\n", i)
+            end = n if end < 0 else end
+        elif text.startswith("/*", i):
+            end = text.find("*/", i + 2)
+            end = n if end < 0 else end + 2
+        if end is None:
+            i += 1
+            continue
+        for k in range(i, end):
+            if out[k] != "\n":
+                out[k] = " "
+        i = end
+    return "".join(out)
+
+
+def jsonc_load(text):
+    """VS Code settings.json 처럼 주석과 끝 쉼표가 있는 JSON 을 읽는다. 비어 있으면 {}."""
+    masked = list(jsonc_mask(text))
+    in_str, i = False, 0
+    while i < len(masked):
+        c = masked[i]
+        if in_str:
+            if c == "\\":
+                i += 2
+                continue
+            in_str = c != '"'
+        elif c == '"':
+            in_str = True
+        elif c == ",":
+            rest = "".join(masked[i + 1:]).lstrip()
+            if rest[:1] in ("}", "]"):
+                masked[i] = " "
+        i += 1
+    cleaned = "".join(masked).strip()
+    return json.loads(cleaned) if cleaned else {}
+
+
+def vscode_configs():
+    """Claude Code 확장이 깔린 VS Code 계열 편집기와 그 사용자 settings.json."""
+    out = []
+    for name, app, ext in VSCODE_EDITORS:
+        if glob.glob(os.path.join(HOME, ext, "extensions", VSCODE_EXTENSION)):
+            out.append((name, os.path.join(VSCODE_APP_SUPPORT, app, "User", "settings.json")))
+    return out
+
+
+def vscode_wrapper(path):
+    """settings.json 의 claudeProcessWrapper. 없으면 None, 읽지 못하면 False."""
+    text = read_text(path)
+    try:
+        value = jsonc_load(text).get(VSCODE_KEY)
+    except (ValueError, AttributeError):
+        return False
+    return value
+
+
+def write_vscode_wrapper(path, value):
+    """settings.json 의 첫 { 바로 뒤에 줄바꿈과 한 줄을 넣는다. 다시 쓰지 않아서 주석과 서식이 그대로 남고,
+    remove_vscode_wrapper 가 넣은 것만 빼면 원래 글자 그대로 돌아온다."""
+    text = read_text(path)
+    line = f"    {json.dumps(VSCODE_KEY)}: {json.dumps(value)}"
+    if not jsonc_mask(text).strip():
+        new = "{\n" + line + "\n}\n"
+    else:
+        masked = jsonc_mask(text)
+        i = masked.find("{")
+        if i < 0:
+            raise ValueError("settings.json 이 { 로 시작하지 않습니다")
+        empty = masked[i + 1:].lstrip().startswith("}")
+        new = text[:i + 1] + "\n" + line + ("" if empty else ",") + text[i + 1:]
+    jsonc_load(new)  # 넣은 뒤에도 읽히는지 확인한다
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        f.write(new)
+
+
+def remove_vscode_wrapper(path, value):
+    """write_vscode_wrapper 가 넣은 줄바꿈과 줄을 뺀다. 그 줄을 찾지 못하면 False."""
+    text = read_text(path)
+    pattern = re.compile(r"\r?\n[ \t]*" + re.escape(json.dumps(VSCODE_KEY)) + r"[ \t]*:[ \t]*" + re.escape(json.dumps(value))
+                         + r"[ \t]*,?")
+    new, count = pattern.subn("", text, count=1)
+    if not count:
+        return False
+    with open(path, "w") as f:
+        f.write(new)
+    return True
+
+
+def setup_vscode(run):
+    configs = vscode_configs()
+    if not configs:
+        run.skip("VS Code 계열 Claude Code 확장 없음")
+        return
+    pending = []
+    for name, path in configs:
+        value = vscode_wrapper(path)
+        if value == ACM_BIN:
+            run.ok(f"{name} 의 Claude Code 확장이 acm 으로 띄움")
+        elif value is False:
+            run.left(f"{name} 의 {path.replace(HOME, '~')} 를 읽지 못했습니다. {VSCODE_KEY} 를 {ACM_BIN} 으로 직접 넣으세요")
+        elif value is not None:
+            run.left(f"{name} 의 {VSCODE_KEY} 가 이미 {value!r} 입니다. acm 으로 바꾸려면 직접 고치세요")
+        else:
+            pending.append((name, path))
+    if not pending:
+        return
+    names = ", ".join(name for name, _ in pending)
+    if not run.ask(f"{names} 의 Claude Code 확장이 claude 대신 acm 으로 띄우게 할까요?"):
+        run.left(f"{names} 의 설정에서 {VSCODE_KEY} 를 {ACM_BIN} 으로")
+        return
+    saved = read_json(SETUP_FILE) or {}
+    originals = saved.setdefault("vscode", {})
+    for name, path in pending:
+        existed = os.path.exists(path)
+        try:
+            write_vscode_wrapper(path, ACM_BIN)
+        except (OSError, ValueError) as e:
+            run.left(f"{name} 의 설정을 바꾸지 못했습니다: {e}")
+            continue
+        originals.setdefault(path, {"existed": existed})
+        run.done(f"{name} 의 Claude 실행 파일을 acm 으로 바꿨습니다. 창을 다시 불러오면(Developer: Reload Window) 적용됩니다")
+    save_json(SETUP_FILE, saved)
+
+
+def setup_ide(run):
+    setup_jetbrains(run)
+    setup_vscode(run)
+
+
+def next_account_id(data, tool="claude"):
+    # 번호는 그 도구의 계정 수 다음부터 센다. 옛 id(acc1, acc2)가 남은 설치에서 세 번째 계정이 cl2 가 되지 않게 한다
+    prefix, n = TOOL_ID_PREFIX[tool], max(2, len(tool_accounts(data, tool)) + 1)
+    while f"{prefix}{n}" in data["accounts"]:
+        n += 1
+    return f"{prefix}{n}"
+
+
+def login_account(name):
+    """그 계정으로 claude auth login 을 띄운다. 브라우저 로그인을 사람이 마쳐야 끝난다."""
+    subprocess.run([sys.executable, os.path.abspath(__file__), "-a", name, "auth", "login"])
+    return account_email(load_accounts()["accounts"][name])
+
+
+def login_problem(data, name, dup):
+    """로그인은 돼 있지만 그대로 쓰면 안 되는 까닭. 없으면 None."""
+    if name in dup:
+        other = dup[name]
+        return (f"{account_label(other, data['accounts'][other])} [{other}] 과 같은 Claude 계정으로 로그인됨. "
+                "시크릿 창처럼 claude.ai 에 다른 계정으로 로그인한 브라우저에서 승인해야 한다")
+    if login_broken(data, name):
+        return "로그인이 풀림. 사용량 조회와 토큰 갱신이 모두 실패했다"
+    return None
+
+
+def setup_accounts(run):
+    data = load_accounts()
+    dup = same_login(data)
+    for name in tool_accounts(data, "claude"):
+        acc = data["accounts"][name]
+        email = account_email(acc)
+        problem = login_problem(data, name, dup) if email else None
+        if email and not problem:
+            run.ok(f"{account_label(name, acc)} [{name}] 로그인됨 ({email})")
+        elif problem and run.mode == "ask" and run.ask(f"{account_label(name, acc)} [{name}] ({email}): {problem}. 다시 로그인할까요?"):
+            email = login_account(name)
+            data = load_accounts()
+            again = login_problem(data, name, same_login(data)) if email else "로그인 안 됨"
+            (run.left if again else run.done)(f"{name} 다시 로그인 {'완료 (' + email + ')' if not again else '— ' + again + '. acm -a ' + name + ' auth login'}")
+        elif problem:
+            run.left(f"{account_label(name, acc)} [{name}] ({email}): {problem}. acm -a {name} auth login")
+        elif run.mode == "ask" and run.ask(f"{name} 이 로그인돼 있지 않습니다. 지금 로그인할까요?"):
+            email = login_account(name)
+            (run.done if email else run.left)(f"{name} 로그인 {'완료 (' + email + ')' if email else '안 됨. acm -a ' + name + ' auth login'}")
+        else:
+            run.left(f"acm -a {name} auth login")
+    if not has_extra_accounts(data):
+        # 로그인은 사람이 해야 해서 --yes 로는 계정을 늘리지 않는다
+        if run.mode == "ask" and run.ask("다른 Claude 계정을 추가할까요?", default=False):
+            name = run.text("계정 id", next_account_id(data))
+            cmd_add(data, [name])
+            label = run.text("화면에 보일 이름 (비우면 이메일 앞부분)", "")
+            if label:
+                cmd_label(load_accounts(), [name, label])
+            email = login_account(name)
+            (run.done if email else run.left)(f"{name} 추가, 로그인 {'완료 (' + email + ')' if email else '안 됨. acm -a ' + name + ' auth login'}")
+        else:
+            run.skip("계정이 하나뿐. 늘리려면 acm add <id> 후 acm -a <id> auth login")
+            return
+    problems = relocate_shared()
+    if not problems:
+        run.ok("projects, skills, hooks 를 ~/.acm/shared 로 옮겨 둠")
+        return
+    if claude_pids():
+        run.left("claude 세션을 모두 닫고 `acm setup` 을 다시 돌려 projects, skills, hooks 를 옮기기")
+        return
+    if not run.ask("추가 계정 세션이 확인 없이 쓰도록 projects, skills, hooks 를 ~/.acm/shared 로 옮길까요?"):
+        run.left("claude 세션을 모두 닫고 acm sync --fix")
+        return
+    relocate_shared(fix=True)
+    left = relocate_shared()
+    for p in left:
+        run.left(p)
+    if not left:
+        run.done("projects, skills, hooks 를 ~/.acm/shared 로 옮겼습니다")
+
+
+def setup_codex(run):
+    """Codex 계정. 등록돼 있지 않으면 root(~/.codex) 를 등록할지 묻고, 등록한 계정의 로그인과 공유 링크를 본다."""
+    data = load_accounts()
+    names = tool_accounts(data, "codex")
+    if not names:
+        if not (os.path.isdir(CODEX_ROOT) and shutil.which("codex")):
+            run.skip("codex 와 ~/.codex 가 없어 건너뜀")
+        elif run.ask("Codex 도 acm 으로 띄울까요? 기본 계정 ~/.codex 를 등록한다"):
+            root, _ = register_codex_root()
+            run.done(f"Codex 기본 계정 {root} 등록 ({CODEX_ROOT}). 계정을 더하려면 acm add --codex")
+        else:
+            run.skip("Codex 계정을 등록하지 않음. 쓰려면 acm add --codex")
+        return
+    for name in names:
+        acc = data["accounts"][name]
+        if logged_in(acc):
+            run.ok(f"{account_label(name, acc)} [{name}] 로그인됨 ({acc.get('email') or 'auth.json 있음'}"
+                   + (f", {acc['plan']}" if acc.get("plan") else "") + ")")
+        else:
+            run.left(f"{name} 로그인: acm -a {name} login --device-auth (다른 ChatGPT 계정에 로그인한 브라우저라면 시크릿 창에서)")
+    for name in names:
+        for p in sync_codex_links(name, data["accounts"][name]):
+            run.left(p)
+    if len(names) == 1 and run.mode == "check":
+        run.skip("Codex 계정이 하나뿐. 늘리려면 acm add --codex 후 acm -a <id> login --device-auth")
+
+
+def setup_publisher(run):
+    data = load_accounts()
+    if not has_extra_accounts(data):
+        run.skip("계정이 하나라 아티팩트 모으기는 필요 없음")
+        return
+    enabled, pub = publisher_conf(data)
+    pub_name = f"{account_label(pub, data['accounts'][pub])} [{pub}]"
+    if os.path.exists(PUBLISHER_ROLE):
+        run.ok(f"발행 세션 승인 범위 있음 ({PUBLISHER_ROLE.replace(HOME, '~')})")
+    else:
+        if run.mode == "ask":
+            print("\n" + "\n".join("      " + line for line in PUBLISHER_ROLE_TEMPLATE.splitlines()) + "\n")
+        if run.ask("발행 세션이 다른 세션의 요청을 묻지 않고 발행하도록 위 승인 범위를 쓸까요?"):
+            os.makedirs(PUBLISHER_DIR, exist_ok=True)
+            with open(PUBLISHER_ROLE, "w") as f:
+                f.write(PUBLISHER_ROLE_TEMPLATE)
+            run.done(f"{PUBLISHER_ROLE.replace(HOME, '~')} 를 썼습니다. 범위를 바꾸려면 이 파일을 고칩니다")
+        else:
+            run.left(f"{PUBLISHER_ROLE.replace(HOME, '~')} 에 발행 세션 승인 범위 쓰기")
+    if enabled:
+        run.ok(f"아티팩트를 대표 계정 {pub_name} 으로 모음")
+    elif not os.path.exists(PUBLISHER_ROLE):
+        run.left("승인 범위를 쓴 뒤 acm publisher on")
+    else:
+        if run.mode == "ask":
+            # 아티팩트는 발행한 계정 소유라, 브라우저로 claude.ai 에 로그인해 둔 계정에 모아야 열어 볼 수 있다
+            choices = ", ".join(f"{account_label(n, data['accounts'][n])} [{n}]" for n in tool_accounts(data, "claude"))
+            key = run.text(f"아티팩트를 모을 대표 계정. 브라우저로 claude.ai 에 로그인해 둔 계정을 고릅니다 ({choices})", pub)
+            try:
+                found = resolve(data, key, "claude")
+                if tool_of(data["accounts"][found]) != "claude":
+                    raise SystemExit
+                pub = found
+            except SystemExit:
+                print(f"  {key} 는 Claude 계정이 아니거나 없어서 {pub} 으로 둡니다")
+            pub_name = f"{account_label(pub, data['accounts'][pub])} [{pub}]"
+        if not run.ask(f"다른 계정 세션의 아티팩트를 대표 계정 {pub_name} 으로 모을까요?"):
+            run.left("acm publisher on")
+            return
+        set_publisher(data, enabled=True, account=pub)
+        run.done(f"아티팩트를 {pub_name} 으로 모읍니다. 대표 계정은 acm publisher account <계정> 으로 바꿉니다")
+
+
+def undo_vscode(saved):
+    """setup 이 VS Code 계열 settings.json 에 넣은 줄을 뺀다."""
+    originals = saved.get("vscode") or {}
+    for path, orig in list(originals.items()):
+        short = path.replace(HOME, "~")
+        if os.path.exists(path) and vscode_wrapper(path) == ACM_BIN:
+            if not remove_vscode_wrapper(path, ACM_BIN):
+                print(f"{short} 에서 acm 이 넣은 줄을 찾지 못했습니다. {VSCODE_KEY} 를 직접 지우세요")
+                continue
+            if not orig.get("existed") and not jsonc_load(read_text(path)):
+                os.remove(path)
+                print(f"{short} 는 acm 이 만든 파일이라 지웠습니다")
+            else:
+                print(f"{short} 에서 {VSCODE_KEY} 를 뺐습니다")
+        del originals[path]
+
+
+def setup_undo():
+    """setup 이 넣은 rc 줄과 IDE 설정을 되돌린다. 계정과 발행 설정은 그대로 둔다."""
+    rc = shell_rc()
+    text = read_text(rc)
+    new = text
+    for mark, line in ((RC_PATH_MARK, RC_PATH_LINE), (RC_FUNC_MARK, RC_FUNC_LINE)):
+        new = new.replace(f"\n{mark}\n{line}\n", "")
+    if new != text:
+        with open(rc, "w") as f:
+            f.write(new)
+        print(f"{rc.replace(HOME, '~')} 에서 acm 이 넣은 줄을 뺐습니다")
+    saved = read_json(SETUP_FILE) or {}
+    undo_resume_hook()
+    # VS Code 계열은 떠 있어도 settings.json 을 덮어쓰지 않아서 먼저 되돌린다
+    undo_vscode(saved)
+    originals = saved.get("jetbrains") or {}
+    if originals and jetbrains_running():
+        save_json(SETUP_FILE, saved)
+        print("JetBrains IDE 가 떠 있어 플러그인 설정은 되돌리지 않았습니다. IDE 를 끄고 `acm setup --undo` 를 다시 돌리세요")
+        return
+    for path, orig in list(originals.items()):
+        if os.path.exists(path) and jetbrains_command(path) == ACM_BIN:
+            if not orig["existed"]:
+                os.remove(path)
+                print(f"{path.replace(HOME, '~')} 는 acm 이 만든 파일이라 지웠습니다")
+            else:
+                write_jetbrains_command(path, orig["value"])
+                print(f"{path.replace(HOME, '~')} 의 Claude 명령을 " + (f"{orig['value']} 로" if orig["value"] else "플러그인 기본값으로") + " 되돌렸습니다")
+        del originals[path]
+    if os.path.exists(SETUP_FILE):
+        save_json(SETUP_FILE, saved)
+
+
+def cmd_setup(data, args):
+    if "--undo" in args:
+        setup_undo()
+        return
+    mode = "check" if "--check" in args else "yes" if "--yes" in args else "ask" if sys.stdin.isatty() else "check"
+    run = SetupRun(mode)
+    print("acm 설정을 확인합니다" + (" (바꾸지 않고 보기만)" if mode == "check" else ""))
+    for title, step in (("터미널", setup_shell), ("발행 세션 실행", setup_tmux), ("IDE", setup_ide),
+                        ("계정", setup_accounts), ("Codex 계정", setup_codex), ("아티팩트 모으기", setup_publisher),
+                        ("한도 이어 가기", setup_resume_hook)):
+        print(f"\n{title}")
+        step(run)
+    print()
+    if os.path.isdir("/Applications/ACM.app"):
+        print("메뉴바 앱의 '새 세션…' 은 처음 누를 때 macOS 가 iTerm 제어를 묻습니다. 허용해야 창이 열립니다.")
+    if run.todo:
+        print(f"남은 일 {len(run.todo)}건. 처리한 뒤 `acm setup` 으로 다시 확인합니다.")
+    else:
+        print("모두 설정돼 있습니다.")
+
+
+# ---------- 점검과 판 ----------
+
+INSTALL_FILE = os.path.join(STATE_DIR, "install.json")
+# 세션 목록 기록에서 acm 이 읽는 키. 발행 세션 감시가 쓴다
+SESSION_RECORD_KEYS = ("pid", "status", "statusUpdatedAt")
+# ~/.claude 에 새로 생긴 항목 중 이런 이름은 계정마다 따로 둬야 할 수 있다. 링크로 같이 쓰면 계정이 섞인다
+ACCOUNT_HINTS = ("auth", "credential", "oauth", "token", "daemon", "statsig", "telemetry", "account")
+# 세션에 묶인 값으로 보이는 환경변수 이름 조각
+SESSION_HINTS = ("SESSION", "MESSAGING", "SOCKET", "CHILD", "ENTRYPOINT", "_PID")
+
+
+def claude_version():
+    try:
+        r = subprocess.run([claude_bin(), "--version"], capture_output=True, text=True, timeout=20, env=detached_env())
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return (r.stdout.split() or [None])[0]
+
+
+def doctor_usage(run, data):
+    ready = [n for n in data["order"] if (logged_in(data["accounts"][n]) if tool_of(data["accounts"][n]) == "codex"
+                                          else data["accounts"][n].get("email"))]
+    if not ready:
+        run.left("로그인한 계정이 없어 /usage 를 시험하지 못했습니다")
+        return
+    with ThreadPoolExecutor(max_workers=len(ready)) as pool:
+        list(pool.map(lambda n: poll_account(n, data["accounts"][n]), ready))
+    now = time.time()
+    for name in ready:
+        label = f"{account_label(name, data['accounts'][name])} [{name}]"
+        state = read_json(os.path.join(POLL_DIR, f"{name}.json")) or {}
+        codex = tool_of(data["accounts"][name]) == "codex"
+        if state.get("note"):
+            fix = "parse_codex_usage 를" if codex else "USAGE_LINE 과 RESET_DATE 를"
+            run.left(f"{label}: {state['note']}. 형식이 바뀌었으면 {fix} 고친다")
+            continue
+        u = account_usage(name, now)
+        scoped = "".join(f" · {s['short']} {s['pct']:.0f}%" for s in u["scoped"])
+        run.ok(f"{label}: {'codex app-server' if codex else '/usage'} 로 읽음 ({fmt_u(u)}{scoped})")
+
+
+def doctor_statusline(run, data, sessions):
+    settings = read_json(os.path.join(SHARED, "settings.json"))
+    command = ((settings if isinstance(settings, dict) else {}).get("statusLine") or {}).get("command")
+    wrapped, inner = statusline_parts(command)
+    if not wrapped:
+        run.left("statusLine 이 acm-statusline 이 아닙니다. 세션이 떠 있는 계정의 사용량이 늦게 갱신된다 (acm install-statusline)")
+        return
+    if command != statusline_command(inner):
+        run.left("statusLine 의 원래 명령이 예전처럼 ~/.acm/statusline-inner 에 있다. 래퍼가 이 파일을 읽지 않아 원래 statusline 이 안 보인다 (acm install-statusline)")
+        return
+    run.ok("statusLine 이 acm-statusline 을 거침")
+    now = time.time()
+    for name in sorted({s["account"] for s in sessions if s["account"]}):
+        sl = read_json(os.path.join(USAGE_DIR, f"{name}.json")) or {}
+        age = now - (sl.get("updated_at") or 0)
+        label = account_label(name, data["accounts"][name])
+        if age > 3600:
+            run.left(f"{label}: 세션이 떠 있는데 statusline 기록이 {int(age // 60)}분째 없습니다. rate_limits 입력이 바뀌었을 수 있다")
+        else:
+            run.ok(f"{label}: statusline 기록 {int(age // 60)}분 전")
+
+
+def doctor_sessions(run, data, sessions):
+    if not sessions:
+        run.skip("떠 있는 세션이 없어 세션 목록 기록은 건너뜀")
+        return
+    bad, missing = [], 0
+    for s in sessions:
+        acc = data["accounts"].get(s["account"]) if s["account"] else None
+        d = os.path.join((config_dir(acc) if acc else None) or SHARED, "sessions")
+        rec = read_json(os.path.join(d, f"{s['pid']}.json"))
+        if rec is None:
+            missing += 1
+        else:
+            bad += [k for k in SESSION_RECORD_KEYS if k not in rec]
+    if missing == len(sessions):
+        run.left("sessions/<pid>.json 이 하나도 없습니다. 발행 세션 자동 종료와 check 대기가 멈출 수 있다")
+    elif bad:
+        run.left(f"sessions/<pid>.json 에 {', '.join(sorted(set(bad)))} 가 없습니다. 발행 세션 감시를 고쳐야 한다")
+    else:
+        run.ok(f"세션 목록 기록 형식이 맞음 (세션 {len(sessions) - missing}개)")
+
+
+def doctor_accounts(run, data):
+    problems = relocate_shared() if has_extra_accounts(data) else []
+    for name in data["order"]:
+        problems += sync_account(name, data["accounts"][name])
+    for p in problems:
+        run.left(p)
+    if not problems:
+        run.ok("계정 폴더의 공유 링크가 맞음")
+    if not has_extra_accounts(data):
+        return
+    try:
+        entries = os.listdir(SHARED)
+    except OSError:
+        entries = []
+    suspects = [e for e in entries if e not in PER_ACCOUNT and not e.startswith(".claude.json")
+                and not os.path.islink(os.path.join(SHARED, e)) and any(h in e.lower() for h in ACCOUNT_HINTS)]
+    for e in suspects:
+        run.left(f"~/.claude/{e} 는 계정마다 따로 둬야 할 항목일 수 있습니다. 그렇다면 PER_ACCOUNT 에 더한다")
+
+
+def doctor_env(run):
+    if not os.environ.get("CLAUDECODE"):
+        run.skip("claude 세션 밖이라 세션 환경변수는 건너뜀")
+        return
+    known = set(session_env_keys(os.environ))
+    unknown = sorted(k for k in os.environ if k.startswith("CLAUDE_CODE_") and k not in known
+                     and any(h in k for h in SESSION_HINTS))
+    if unknown:
+        run.left(f"세션에 묶인 값으로 보이는 환경변수 {', '.join(unknown)}. 뒤에서 띄우는 claude 에 물려주지 않게 SESSION_ENV 에 더할지 본다")
+    else:
+        run.ok("세션 환경변수가 모두 SESSION_ENV 에 있음")
+
+
+def doctor_publisher(run, data):
+    enabled, name = publisher_conf(data)
+    if not enabled:
+        run.skip("발행 모으기 꺼짐")
+        return
+    model, effort = publisher_model(data)
+    run.ok(f"대표 계정 {account_label(name, data['accounts'][name])} [{name}] · {model} {effort}")
+    if not shutil.which("tmux"):
+        run.left("tmux 가 없어 발행 세션을 띄우지 못한다 (brew install tmux)")
+    if not os.path.exists(PUBLISHER_ROLE):
+        run.left(f"발행 세션 승인 범위 {PUBLISHER_ROLE.replace(HOME, '~')} 가 없다 (acm setup)")
+
+
+def cmd_doctor(data, args):
+    """acm 이 기대는 Claude Code 내부 구조가 그대로인지 실제로 확인한다. 문제가 있으면 1 로 끝난다."""
+    run = SetupRun("check")
+    remember_emails(data)
+    # statusline 기록과 sessions/<pid>.json 은 Claude Code 만 남긴다
+    sessions = [x for x in running_sessions(data, with_cwd=False) if x.get("tool", "claude") == "claude"]
+    ver = claude_version()
+    print(f"acm {VERSION} 이 Claude Code {ver or '?'} 에서 기대는 구조를 점검합니다 (마지막으로 확인한 판 {VERIFIED_CLAUDE})")
+    for title, step in (("사용량 읽기 (claude -p /usage, codex app-server)", lambda: doctor_usage(run, data)),
+                        ("statusline", lambda: doctor_statusline(run, data, sessions)),
+                        ("세션 목록", lambda: doctor_sessions(run, data, sessions)),
+                        ("계정 폴더", lambda: doctor_accounts(run, data)),
+                        ("세션 환경변수", lambda: doctor_env(run)),
+                        ("발행 세션", lambda: doctor_publisher(run, data))):
+        print(f"\n{title}")
+        step()
+    print()
+    if ver is None:
+        run.left("claude --version 이 응답하지 않습니다")
+    print("셸 함수와 IDE 설정은 acm setup --check 가 점검합니다.")
+    if run.todo:
+        print(f"확인할 항목 {len(run.todo)}건.")
+        sys.exit(1)
+    print("모두 기대한 대로입니다.")
+
+
+def cmd_version(data, args):
+    inst = read_json(INSTALL_FILE) or {}
+    line = f"acm {VERSION}"
+    if inst.get("commit"):
+        line += f" · {inst['commit']}" + (" (고친 채 설치)" if inst.get("dirty") else "")
+    if inst.get("installed_at"):
+        line += f" · {inst['installed_at']} 설치"
+    print(line)
+    if inst.get("source"):
+        print(f"소스: {inst['source']}")
+    print(f"claude {claude_version() or '?'} (acm 이 마지막으로 확인한 판 {VERIFIED_CLAUDE})")
+
+
+def cmd_upgrade(data, args):
+    """설치한 저장소를 git pull 로 당겨 install.sh 를 다시 돌린다."""
+    inst = read_json(INSTALL_FILE) or {}
+    src = inst.get("source")
+    if not src or not os.path.isfile(os.path.join(src, "install.sh")):
+        die("설치한 저장소를 찾지 못했습니다. 저장소를 받아 ./install.sh 를 다시 돌리면 다음부터 acm upgrade 가 됩니다")
+    if "--no-pull" not in args:
+        if subprocess.run(["git", "-C", src, "rev-parse", "--git-dir"], capture_output=True).returncode != 0:
+            die(f"{src} 가 git 저장소가 아닙니다. 소스를 직접 바꾼 뒤 acm upgrade --no-pull")
+        print(f"{src} 를 당깁니다")
+        if subprocess.run(["git", "-C", src, "pull", "--ff-only"]).returncode != 0:
+            die("git pull --ff-only 가 실패했습니다. 저장소에서 직접 맞춘 뒤 다시 돌리세요")
+    cmd = ["sh", os.path.join(src, "install.sh")] + (["--no-app"] if inst.get("no_app") else [])
+    sys.exit(subprocess.run(cmd, cwd=src).returncode)
+
+
+HELP = """acm — Claude 와 Codex 계정 여러 개에 독립 세션을 나눠 띄운다
+
+세션 띄우기
+  acm                              어느 도구로 열지 묻는다 (Codex 계정이 없으면 묻지 않고 Claude)
+  acm [claude 인자...]             남은 여유가 가장 큰 Claude 계정으로 claude 실행
+  acm claude [claude 인자...]      위와 같다. 도구를 밝혀 쓴다
+  acm codex [codex 인자...]        남은 여유가 가장 큰 Codex 계정으로 codex 실행. 배정은 Codex 계정끼리만 한다
+  acm -a <계정> [인자...]          계정을 지정해서 실행. 그 계정의 도구로 뜬다 (예: acm -a work -c, acm -a cx2)
+  acm --rr [claude 인자...]        이번만 라운드로빈으로 고르기
+  acm resume [세션 ID]             한도에 걸린 세션을 다른 계정으로 다시 연다. ID 를 빼면 가장 최근에 걸린 세션.
+                                   대표 계정은 예비 기준 아래일 때만 고르고, 갈 곳이 없으면 띄우지 않고 리셋 시각을 알린다
+  acm resume -a <계정> [세션 ID]   이어 갈 계정을 직접 지정
+  계정 옵션(-a, --rr)은 맨 앞에 둔다. 나머지 인자는 그대로 claude 나 codex 에 넘어간다.
+  <계정> 자리에는 id(cl2), 표시 이름, 이메일, 이메일 앞부분 중 아무것이나 쓴다.
+
+현황
+  acm status [--json]              계정별 요금제, 5h·Week·모델별 주간 사용률과 리셋, 실행 중인 세션 수
+  acm pick [codex] [--model <모델>]  지금 띄우면 어느 계정이 될지만 보기
+  acm poll [--force]               사용량을 지금 읽기. Claude 는 claude -p /usage, Codex 는 codex app-server (평소에는 뒤에서 5분마다)
+
+계정
+  acm add <id>                     Claude 계정 추가 (~/.claude-<id> 를 만든다)
+  acm -a <id> auth login           추가한 Claude 계정에 로그인
+  acm add --codex [id]             Codex 계정 추가 (~/.codex-<id>). 처음이면 ~/.codex 를 기본 계정으로 먼저 등록한다
+  acm -a <id> login --device-auth  추가한 Codex 계정에 로그인
+  acm label <계정> <표시이름>      화면에 보일 이름 (지우려면 --clear)
+  acm rm <계정>                    계정 목록에서 빼기 (Claude 기본 계정 cl1 은 뺄 수 없다)
+
+아티팩트
+  acm publisher on|off             다른 계정 세션의 아티팩트를 발행 세션이 모아 발행 (켜기·끄기)
+  acm publisher start|stop|status  발행 세션 띄우기, 끄기, 상태
+  acm publisher check [파일...]    지금 발행을 맡길 수 있는지 (대표 계정 한도). 발행 세션이 없으면 띄우고 기다린다.
+                                   파일을 주면 발행 세션이 읽을 수 있는 ~/.acm/publisher/inbox 로 올린다
+  acm publisher account <계정>     아티팩트를 모을 계정 (기본 cl1)
+  acm publisher model <모델> [effort]  발행 세션 모델 (기본 claude-sonnet-5-5 high)
+
+설정
+  acm setup [--yes|--check]        처음 설정과 점검. 셸 함수, tmux, IDE 플러그인, Claude 와 Codex 계정,
+                                   아티팩트 모으기, 한도 이어 가기를 하나씩 묻고 맞춘다
+                                   (--yes 는 묻지 않고 기본값대로, --check 는 바꾸지 않고 보기만. install.sh 가 부른다)
+  acm setup --undo                 setup 이 넣은 셸 줄과 IDE 설정을 되돌린다
+  acm mode usage|rr                기본 분배 방식 (usage: 사용량 기준, rr: 돌아가며)
+  acm sync [--fix]                 공유 링크, MCP, 개인 설정, 프로젝트 신뢰 정보를 기본 계정에 맞추기.
+                                   Codex 추가 계정은 ~/.codex 쪽 링크와 훅 신뢰를 맞춘다
+                                   (--fix 는 ~/.claude 의 projects, skills, hooks 를 ~/.acm/shared 로 옮긴다. claude 세션을 모두 닫고)
+  acm shell-init                   터미널의 claude 와 codex 를 acm 으로 보내는 셸 함수 (~/.zshrc 에 eval)
+  acm install-statusline           사용량 수집용 statusline 래퍼 설치 (install.sh 가 한다)
+  acm uninstall-statusline         statusline 을 원래 명령으로 되돌리기
+
+점검과 갱신
+  acm doctor                       acm 이 기대는 Claude Code 구조가 그대로인지 실제로 확인 (Claude Code 를 올린 뒤)
+  acm version | --version          acm 과 claude 의 판, 설치한 커밋
+  acm upgrade [--no-pull]          설치한 저장소를 git pull 하고 install.sh 를 다시 돌린다
+
+  acm help | -h | --help           이 도움말. claude 도움말은 claude --help
+
+환경변수
+  ACM_FIVE_HOUR_CAP=95  ACM_SEVEN_DAY_CAP=98   이 값 이상인 계정은 배정에서 뺀다
+  ACM_USAGE_BAND=5                              점수가 가장 높은 계정과 이만큼 안쪽이면 실행 중 세션이 적은 계정을 고른다
+  ACM_RESERVE_FIVE_HOUR_CAP=70  ACM_RESERVE_SEVEN_DAY_CAP=85   대표 계정을 자동 배정에서 빼는 기준
+  ACM_POLL_INTERVAL=300                         사용량을 읽는 간격(초, 계정당). Codex 계정도 같다
+  ACM_PUBLISHER_IDLE=30  ACM_PUBLISHER_IDLE_MAX=300   발행 세션을 끄는 기준(초). 일을 마친 뒤, 일 없이 떠 있을 때
+"""
+
+COMMANDS = {
+    "resume": cmd_resume,
+    "hook": cmd_hook,
+    "add": cmd_add,
+    "sync": cmd_sync,
+    "status": cmd_status,
+    "pick": cmd_pick,
+    "mode": cmd_mode,
+    "label": cmd_label,
+    "rm": cmd_rm,
+    "publisher": cmd_publisher,
+    "shell-init": cmd_shell_init,
+    "setup": cmd_setup,
+    "install-statusline": cmd_install_statusline,
+    "uninstall-statusline": cmd_uninstall_statusline,
+    "poll": cmd_poll,
+    "doctor": cmd_doctor,
+    "version": cmd_version,
+    "--version": cmd_version,
+    "upgrade": cmd_upgrade,
+}
+
+
+def add_flag(argv, flag, value, sep):
+    """argv 에 flag 가 이미 있으면 그 값 뒤에 sep 로 이어 붙이고, 없으면 맨 앞에 넣는다.
+    같은 플래그가 두 번 들어가면 claude 가 하나만 쓰니, 사용자나 IDE 확장이 넣은 값을 지우지 않게 합친다."""
+    out, merged, i = [], False, 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--":
+            out += argv[i:]
+            break
+        if not merged and a == flag and i + 1 < len(argv):
+            out += [flag, argv[i + 1] + sep + value]
+            merged, i = True, i + 2
+            continue
+        if not merged and a.startswith(flag + "="):
+            out.append(a + sep + value)
+            merged, i = True, i + 1
+            continue
+        out.append(a)
+        i += 1
+    return out if merged else [flag, value] + out
+
+
+def bundled_claude(arg):
+    """VS Code 계열 확장이 claudeProcessWrapper 로 acm 을 부를 때 첫 인자로 넘기는 번들 claude 경로인지.
+    확장 폴더(anthropic.claude-code-<버전>) 안의 실행 파일만 본다. 그렇지 않으면 `claude ./claude-setup.sh` 처럼
+    실행 권한이 있는 파일 경로를 프롬프트로 넘겼을 때 acm 이 그 파일을 실행한다."""
+    if not (os.path.isabs(arg) and os.path.basename(arg).lower().startswith("claude")):
+        return False
+    if not any(part.lower().startswith(VSCODE_EXTENSION[:-1]) for part in arg.split(os.sep)):
+        return False
+    return os.path.isfile(arg) and os.access(arg, os.X_OK)
+
+
+def launch(data, argv, binary=None, reason=None, tool=None):
+    """계정을 골라 claude 나 codex 를 띄운다. binary 는 IDE 확장이 넘긴 번들 claude 경로이고, 없으면 PATH 의 claude 다.
+    reason 은 -a 로 계정을 정해 띄울 때 보일 까닭이다. tool 을 주지 않으면 -a 로 정한 계정의 도구, 없으면 Claude 다."""
+    forced, mode = None, data.get("mode", "usage")
+    while argv:
+        if argv[0] in ("-a", "--acc") and len(argv) > 1:
+            forced, argv = argv[1], argv[2:]
+        elif argv[0] == "--rr":
+            mode, argv = "rr", argv[1:]
+        elif argv[0] == "--usage":
+            mode, argv = "usage", argv[1:]
+        else:
+            break
+
+    os.makedirs(STATE_DIR, exist_ok=True)
+    if forced:
+        own = tool_of(data["accounts"][resolve(data, forced, tool)])
+        if tool and own != tool:
+            die(f"{forced} 는 {TOOL_NAMES[own]} 계정입니다")
+        tool = own
+    if tool == "codex":
+        return launch_codex(data, argv, forced, mode, reason)
+    model = session_model(argv)
+    if not forced and mode == "usage":
+        remember_emails(data)
+        # 조회는 뒤에서 돌리고 기다리지 않는다. 세션이 없는 계정은 사용량이 늘지 않아 몇 분 묵은 값으로 골라도 된다
+        refresh_usage(data)
+    with open(LOCK_FILE, "w") as lock:
+        # 동시에 여러 세션을 띄워도 같은 계정으로 몰리지 않게 고르기와 등록을 묶는다
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        data = load_accounts()
+        remember_emails(data)
+        if forced:
+            name, why = resolve(data, forced, "claude"), reason or "지정"
+        else:
+            name, why = pick(data, mode, model)
+            set_last_pick(data, "claude", name)
+        acc = data["accounts"][name]
+        for p in sync_links(name, acc):
+            info(p)
+        # MCP 와 개인 설정, 프로젝트 신뢰 정보도 띄울 때마다 기본 계정에 맞춘다
+        sync_claude_json(acc)
+        if has_extra_accounts(data):
+            for p in relocate_shared():
+                info(p)
+        run = os.path.join(RUN_DIR, name)
+        os.makedirs(run, exist_ok=True)
+        # exec 하면 이 pid 가 그대로 claude 가 된다
+        open(os.path.join(run, str(os.getpid())), "w").close()
+
+    env = dict(os.environ)
+    if config_dir(acc) is None:
+        env.pop("CLAUDE_CONFIG_DIR", None)
+    else:
+        env["CLAUDE_CONFIG_DIR"] = config_dir(acc)
+    env["ACM_ACCOUNT"] = name
+    env["ACM_LABEL"] = account_label(name, acc)
+    enabled, pub = publisher_conf(data)
+    publish = enabled and name != pub and publisher_startable()
+    # Chrome 확장은 대표 계정 하나에만 로그인돼 있어서, 다른 계정 세션의 화면 제어는 aside 로 돌린다
+    browser = name != pub and aside_configured()
+    if publish or browser:
+        argv = add_flag(argv, "--append-system-prompt", session_rules(data, name, publish, browser), "\n\n")
+    if publish:
+        argv = add_flag(argv, "--disallowedTools", "Artifact", ",")
+    if sys.stderr.isatty():
+        info(f"{env['ACM_LABEL']} [{name}] ({acc.get('email') or '로그인 안 됨'}) · {why}"
+             + (" · 아티팩트는 발행 세션에 맡김" if publish else "")
+             + (" · 화면 제어는 aside" if browser else ""))
+    if binary:
+        os.execve(binary, [binary] + argv, env)
+    try:
+        os.execvpe("claude", ["claude"] + argv, env)
+    except FileNotFoundError:
+        found = claude_bin()
+        if found == "claude":
+            die("claude 실행 파일을 PATH 에서 찾지 못했습니다")
+        os.execve(found, [found] + argv, env)
+
+
+def launch_codex(data, argv, forced, mode, reason=None):
+    """Codex 계정을 골라 codex 를 띄운다. 배정은 Codex 계정끼리만 하고, 대표 계정 예비 기준은 없다.
+    세션 기록(sessions)은 ~/.codex 를 링크로 같이 쓰니 `acm codex resume <ID>` 는 어느 계정에서든 그 세션을 연다."""
+    if not tool_accounts(data, "codex"):
+        root, _ = register_codex_root()
+        info(f"Codex 기본 계정 {root} 를 등록했습니다 ({CODEX_ROOT}). 계정을 더하려면 acm add --codex")
+        data = load_accounts()
+    if not forced and argv and argv[0] in CODEX_PASSTHROUGH:
+        # 계정을 고를 일이 없는 하위 명령. 로그인은 acm -a <계정> login 으로 계정을 정해서 한다
+        found = codex_bin()
+        os.execv(found, [found] + argv) if os.path.isabs(found) else os.execvp(found, [found] + argv)
+    if not forced and mode == "usage":
+        remember_emails(data)
+        refresh_usage(data)
+    with open(LOCK_FILE, "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        data = load_accounts()
+        if forced:
+            name, why = resolve(data, forced, "codex"), reason or "지정"
+        else:
+            name, why = pick(data, mode, None, tool="codex")
+            set_last_pick(data, "codex", name)
+        acc = data["accounts"][name]
+        for p in sync_codex_links(name, acc):
+            info(p)
+        run = os.path.join(RUN_DIR, name)
+        os.makedirs(run, exist_ok=True)
+        open(os.path.join(run, str(os.getpid())), "w").close()
+
+    env = dict(os.environ)
+    if config_dir(acc) is None:
+        env.pop("CODEX_HOME", None)
+    else:
+        env["CODEX_HOME"] = config_dir(acc)
+    # ACM_ACCOUNT 는 쓰지 않는다. 이 세션 안에서 띄운 claude 의 statusline 래퍼가 ACM_ACCOUNT 를 보고
+    # Claude 사용량을 Codex 계정에 적게 된다
+    env["ACM_CODEX_ACCOUNT"] = name
+    if sys.stderr.isatty():
+        plan = f", {acc['plan']}" if acc.get("plan") else ""
+        info(f"Codex {account_label(name, acc)} [{name}] ({acc.get('email') or ('로그인됨' if logged_in(acc) else '로그인 안 됨')}{plan}) · {why}")
+    found = codex_bin()
+    if found == "codex" and not shutil.which("codex"):
+        die("codex 실행 파일을 PATH 에서 찾지 못했습니다")
+    os.execve(found, [found] + argv, env) if os.path.isabs(found) else os.execvpe(found, [found] + argv, env)
+
+
+def tools_available(data):
+    """세션을 열 수 있는 도구. Codex 는 계정을 등록했거나 codex 와 ~/.codex 가 있을 때다."""
+    out = ["claude"]
+    if tool_accounts(data, "codex") or (os.path.isdir(CODEX_ROOT) and shutil.which("codex")):
+        out.append("codex")
+    return out
+
+
+def ide_launched():
+    """IDE 플러그인이 띄운 터미널인지. 거기서는 묻지 않고 Claude 로 띄운다."""
+    return bool(os.environ.get("ENABLE_IDE_INTEGRATION") or os.environ.get("CLAUDE_CODE_SSE_PORT")
+                or os.environ.get("TERMINAL_EMULATOR", "").startswith("JetBrains"))
+
+
+def ask_tool(data):
+    """인자 없이 acm 만 쳤을 때 어느 도구로 세션을 열지 묻는다. 터미널이 아니거나 도구가 하나뿐이면 Claude 다."""
+    tools = tools_available(data)
+    if len(tools) < 2 or not (sys.stdin.isatty() and sys.stderr.isatty()) or ide_launched():
+        return "claude"
+    menu = "\n".join(f"  {i}) {TOOL_NAMES[t]}" + ("  (기본)" if i == 1 else "") for i, t in enumerate(tools, 1))
+    sys.stderr.write(f"어느 도구로 세션을 열까요?\n{menu}\n")
+    try:
+        for _ in range(3):
+            sys.stderr.write("번호 [1]: ")
+            sys.stderr.flush()
+            ans = sys.stdin.readline()
+            if not ans:
+                return tools[0]
+            ans = ans.strip().lower()
+            if not ans:
+                return tools[0]
+            if ans.isdigit() and 1 <= int(ans) <= len(tools):
+                return tools[int(ans) - 1]
+            if ans in tools:
+                return ans
+    except KeyboardInterrupt:
+        sys.stderr.write("\n")
+        sys.exit(130)
+    return tools[0]
+
+
+ACM_OPTIONS = ("-a", "--acc", "--rr", "--usage")
+
+
+def launch_plain(argv, binary, err, tool=None):
+    """계정을 고르다 예상하지 못한 오류가 나면 계정을 고르지 않고 claude 나 codex 를 그대로 띄운다.
+    셸 함수와 IDE 확장은 claude 를 acm 으로 보내서, acm 의 결함 하나가 claude 를 아예 못 쓰게 만들지 않게 한다."""
+    name = "codex" if tool == "codex" else "claude"
+    info(f"계정을 고르다 오류가 나서 {name} 를 그대로 띄웁니다 ({type(err).__name__}: {err}). acm doctor 로 확인하세요")
+    while argv and argv[0] in ACM_OPTIONS:
+        argv = argv[2:] if argv[0] in ("-a", "--acc") else argv[1:]
+    found = codex_bin() if tool == "codex" else (binary or claude_bin())
+    os.execv(found, [found] + argv) if os.path.isabs(found) else os.execvp(found, [found] + argv)
+
+
+def forced_tool(data, argv):
+    """-a 로 정한 계정의 도구. 못 찾으면 None. 대체 실행이 Codex 계정을 claude 로 띄우지 않게 미리 본다."""
+    i = 0
+    while i < len(argv) and argv[i] in ACM_OPTIONS:
+        if argv[i] in ("-a", "--acc"):
+            if i + 1 >= len(argv):
+                return None
+            key = argv[i + 1]
+            names = sorted(data["order"], key=lambda n: (n != key, tool_of(data["accounts"][n]) != "claude"))
+            for name in names:
+                acc = data["accounts"][name]
+                email = acc.get("email") or ""
+                if key in (name, acc.get("label"), email, email.split("@")[0]):
+                    return tool_of(acc)
+            return None
+        i += 1
+    return None
+
+
+def safe_launch(argv, binary=None, tool=None):
+    try:
+        data = load_accounts()
+        tool = tool or forced_tool(data, argv)
+        launch(data, argv, binary, tool=tool)
+    except Exception as e:
+        launch_plain(argv, binary, e, tool)
+
+
+def main():
+    argv = sys.argv[1:]
+    # VS Code 계열 확장의 claudeProcessWrapper 로 불렸다. 첫 인자가 확장에 든 claude 다
+    if argv and bundled_claude(argv[0]):
+        binary, rest = argv[0], argv[1:]
+        if rest and rest[0] in PASSTHROUGH:
+            os.execv(binary, [binary] + rest)
+        safe_launch(rest, binary)
+        return
+    if argv and argv[0] in ("help", "-h", "--help"):
+        print(HELP)
+        return
+    # 발행 세션의 훅. accounts.json 을 읽다 실패해도 막는 쪽으로 끝나게 다른 일보다 먼저 받는다
+    if argv[:2] == ["publisher", "guard"]:
+        sys.exit(publisher_guard_main())
+    # 상태 폴더에는 이메일과 사용량, 발행할 파일이 든다. 같은 Mac 의 다른 사용자가 읽지 못하게 나만 연다
+    try:
+        os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+        os.chmod(STATE_DIR, 0o700)
+    except OSError:
+        pass
+    if argv and argv[0] in COMMANDS:
+        COMMANDS[argv[0]](load_accounts(), argv[1:])
+        return
+    # acm claude …, acm codex … 는 도구를 정해서 띄운다. 도구 이름 없이 인자를 주면 예전처럼 Claude 다
+    if argv and argv[0] in TOOLS:
+        safe_launch(argv[1:], tool=argv[0])
+        return
+    tool = None
+    if not argv:
+        try:
+            tool = ask_tool(load_accounts())
+        except Exception:
+            tool = None
+    safe_launch(argv, tool=tool)
+
+
+if __name__ == "__main__":
+    main()

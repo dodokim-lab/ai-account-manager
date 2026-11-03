@@ -1,0 +1,68 @@
+#!/bin/sh
+# acm 용 statusline 래퍼.
+# statusline 입력의 rate_limits 를 계정별로 저장하고, 기존 statusline 명령을 그대로 실행한다.
+# 첫 줄 앞에 [계정] 표시를 붙인다.
+input=$(cat)
+dir="${ACM_HOME:-$HOME/.acm}"
+
+acc="$ACM_ACCOUNT"
+if [ -f "$dir/accounts.json" ]; then
+  # acm 이 정한 계정이 목록에 있는 Claude 계정이면 그대로 쓴다. acm 을 거치지 않고 띄운 세션이나,
+  # 계정을 새로 세팅하기 전에 띄워 목록에 없는 id 를 든 세션은 CLAUDE_CONFIG_DIR 로 계정을 찾는다.
+  # accounts.json 을 읽지 못하면 acm 이 정한 계정을 그대로 쓴다
+  if found=$(jq -r --arg a "$acc" --arg d "${CLAUDE_CONFIG_DIR:-}" '
+      .accounts as $all
+      | if $a != "" and ($all[$a] | type) == "object" and (($all[$a].tool // "claude") == "claude") then $a
+        else ($all | to_entries[] | select((.value.tool // "claude") == "claude" and (.value.dir // "") == $d) | .key) end' \
+      "$dir/accounts.json" 2>/dev/null); then
+    acc=$(printf '%s\n' "$found" | head -1)
+  fi
+fi
+
+if [ -n "$acc" ]; then
+  mkdir -p "$dir/usage"
+  rec="$dir/usage/$acc.json"
+  tmp="$dir/usage/.$acc.$$"
+  # Claude Code 가 statusline 을 중간에 끊어도 빈 임시 파일이 남지 않게 한다. SIGKILL 은 막지 못한다
+  trap 'rm -f "$tmp"' EXIT
+  trap 'exit 1' HUP INT TERM
+  # Claude Code 는 리셋 시각이 지난 창을 입력에서 뺀다. 빠진 창은 null 로 적지 않고 지난 기록을 그대로 둔다.
+  # 창마다 at 에 받은 시각을 적어서, acm 은 5h 창이 하루 넘게 안 보일 때만 5시간 한도가 없는 계정(Ultra 인증 계정)으로 본다
+  record() {
+    printf '%s' "$input" | jq -c --arg a "$acc" --slurpfile p "$1" '
+      (now | floor) as $t
+      | (($p[0] // {}) | if type == "object" then . else {} end) as $old
+      | def keep(w): if (w | type) == "object" then (w | .at //= ($old.updated_at // $t)) else null end;
+      select(.rate_limits.five_hour or .rate_limits.seven_day)
+      | {account: $a,
+         five_hour: (if .rate_limits.five_hour then .rate_limits.five_hour + {at: $t} else keep($old.five_hour) end),
+         seven_day: (if .rate_limits.seven_day then .rate_limits.seven_day + {at: $t} else keep($old.seven_day) end),
+         model: (.model.id // $old.model),
+         updated_at: $t}
+      | with_entries(select(.value != null))'
+  }
+  prev="$rec"
+  [ -s "$prev" ] || prev=/dev/null
+  # 지난 기록이 깨져 있으면 없는 것으로 보고 새로 쓴다
+  record "$prev" > "$tmp" 2>/dev/null || record /dev/null > "$tmp" 2>/dev/null
+  if [ -s "$tmp" ]; then mv "$tmp" "$rec"; else rm -f "$tmp"; fi
+fi
+
+label="$ACM_LABEL"
+if [ -z "$label" ] && [ -n "$acc" ]; then
+  label=$(jq -r --arg k "$acc" \
+    '.accounts[$k] | .label // ((.email // "") | split("@")[0] | select(. != "")) // $k' "$dir/accounts.json" 2>/dev/null)
+  [ -z "$label" ] && label="$acc"
+fi
+
+# 원래 statusline 명령은 settings.json 의 statusLine 명령에 이 래퍼의 인자로 들어 있다.
+# acm 이 따로 두는 파일에서 읽지 않는다. 그런 파일은 Claude Code 가 보호하지 않아 세션이 묻지 않고 고칠 수 있다
+inner="$*"
+[ -z "$inner" ] && { [ -n "$label" ] && printf '[%s]\n' "$label"; exit 0; }
+
+printf '%s' "$input" | sh -c "$inner" | {
+  if IFS= read -r first || [ -n "$first" ]; then
+    if [ -n "$label" ]; then printf '[%s] %s\n' "$label" "$first"; else printf '%s\n' "$first"; fi
+    cat
+  fi
+}
