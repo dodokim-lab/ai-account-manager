@@ -1843,9 +1843,14 @@ def status_codex(data, snap, rows, now, notes):
             notes.append(f"  {tag}: signed in to the same ChatGPT account as {snap_label(snap, a['same_as'])}, so excluded from automatic picks. "
                          f"Run acm -a {a['id']} logout, then acm -a {a['id']} login --device-auth with another account")
         elif a["denied"]:
-            resets = [r for r in [week["resets_at"]] + [(five or {}).get("resets_at")] + [e["resets_at"] for e in a["extra"]] if r]
+            wins = (([("5h", five["pct"], five["resets_at"])] if five else []) + [(week["name"], week["pct"], week["resets_at"])]
+                    + [(e["name"], e["pct"], e["resets_at"]) for e in a["extra"]])
+            # Name the full window and when it frees up, by the same rule as free_at. With none full, Codex waits for every window
+            full = [w for w in wins if w[1] is not None and w[1] >= 100]
+            label = ", ".join(f"{n} {p:.0f}%" for n, p, _ in full or [(week["name"], week["pct"], None)])
+            resets = [r for _, _, r in full or wins if r]
             when = f", resets {fmt_reset(max(resets))}" if resets else ""
-            notes.append(f"  {tag}: Codex reports it cannot be used now, so excluded from automatic picks ({week['name']} {week['pct']:.0f}%{when})")
+            notes.append(f"  {tag}: Codex reports it cannot be used now, so excluded from automatic picks ({label}{when})")
         elif a["poll_note"]:
             notes.append(f"  {tag}: usage poll: {a['poll_note']}")
         for e in a["extra"]:

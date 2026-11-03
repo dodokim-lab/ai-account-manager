@@ -1607,6 +1607,26 @@ class Codex(AcmCase):
         for part in ("[Claude]", "[Codex]", "30d 100%", "Next pick for Codex:", "cannot be used now"):
             self.assertIn(part, text)
 
+    def test_refused_note_names_the_full_window(self):
+        # cx2 is refused because its 5h window is full. The note used to name Week 16% and its reset days later
+        now = time.time()
+        data = self.codex_accounts()
+        self.codex_polled("cx2", [{"used_percentage": 100, "resets_at": now + 3600, "window_minutes": 300},
+                                  {"used_percentage": 16, "resets_at": now + 5 * 86400, "window_minutes": 10080}],
+                          allowed=False)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.acm.cmd_status(data, [])
+        note = next(line for line in out.getvalue().splitlines() if "[cx2]: Codex reports" in line)
+        self.assertIn(f"(5h 100%, resets {self.acm.fmt_reset(now + 3600)})", note)
+        # Refused with no full window: Codex waits for every window, so the latest reset is shown
+        self.codex_polled("cx2", [{"used_percentage": 40, "resets_at": now + 3600, "window_minutes": 300},
+                                  {"used_percentage": 16, "resets_at": now + 5 * 86400, "window_minutes": 10080}],
+                          allowed=False)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.acm.cmd_status(data, [])
+        note = next(line for line in out.getvalue().splitlines() if "[cx2]: Codex reports" in line)
+        self.assertIn(f"(Week 16%, resets {self.acm.fmt_reset(now + 5 * 86400)})", note)
+
     def test_launch_codex_sets_codex_home(self):
         data = self.codex_accounts()
         self.acm.codex_bin = lambda: "/fake/codex"
