@@ -136,6 +136,10 @@ acm setup --undo           # 넣은 셸 줄과 IDE 플러그인 설정을 되돌
 | `install.sh` | 설치와 제거 |
 | `~/.acm/` | 상태. `accounts.json` 과 계정별 사용량, 조회와 세션 기록, 발행 세션 폴더. 소유자만 여는 0700 으로 맞춘다 |
 
+## 기여하거나 취약점을 알리려면
+
+PR 을 올리기 전에 돌릴 검사와 지킬 규칙은 [CONTRIBUTING.md](CONTRIBUTING.md) 에 영어로 있다. 보안 취약점은 공개 이슈 대신 [SECURITY.md](SECURITY.md) 에 적힌 대로 비공개로 신고한다.
+
 ## 라이선스
 
 MIT 라이선스로 배포한다. 전문은 `LICENSE` 파일에 있다.

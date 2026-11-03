@@ -1,0 +1,58 @@
+name: Bug report
+description: A command fails, or acm does something the README or docs say it should not
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Report security vulnerabilities privately as described in SECURITY.md, not with this form.
+        `acm status` and other output can show your emails, account labels, and folder paths. Replace them before pasting.
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version
+      placeholder: e.g. macOS 15.1 on Apple silicon
+    validations:
+      required: true
+  - type: textarea
+    id: version
+    attributes:
+      label: Output of `acm version`
+      description: It shows the acm version and commit, and the Claude Code version.
+      render: text
+    validations:
+      required: true
+  - type: input
+    id: codex
+    attributes:
+      label: Codex CLI version
+      description: "Only if the problem involves Codex accounts. The output of `codex --version`."
+      placeholder: e.g. codex-cli 0.165.0
+  - type: textarea
+    id: command
+    attributes:
+      label: What you ran
+      description: The command, or what you clicked in the menu bar app.
+      render: sh
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Output
+      description: Paste it as it appeared, including any error message.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Output of `acm doctor`
+      description: Helps when the problem started after a Claude Code update.
+      render: text

@@ -136,6 +136,10 @@ Both keep the account folders and `~/.acm`. They hold login data, so deleting th
 | `install.sh` | Install and uninstall |
 | `~/.acm/` | State: `accounts.json`, usage per account, poll and session records, the publisher session folder. Kept at 0700 so only you can open it |
 
+## Contributing and reporting vulnerabilities
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the checks to run and the rules to keep before you open a pull request. Report security vulnerabilities privately as described in [SECURITY.md](SECURITY.md), not in a public issue.
+
 ## License
 
 Released under the MIT License. See `LICENSE`.
