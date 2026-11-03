@@ -244,7 +244,7 @@ struct UsageBar: View {
             Text(title).font(.caption).lineLimit(1).frame(width: 42, alignment: .leading)
             if let window {
                 GaugeBar(pct: window.pct, height: 8)
-                Text("\(Int(window.pct.rounded()))%")
+                Text("\(Fmt.whole(window.pct, limit: 999))%")
                     .font(.caption.monospacedDigit().weight(.semibold))
                     .foregroundStyle(GaugeBar.color(window.pct))
                     .frame(width: 36, alignment: .trailing)
@@ -268,8 +268,9 @@ enum NewSession {
         panel.directoryURL = URL(fileURLWithPath: NSHomeDirectory() + "/workspace")
         NSApp.activate(ignoringOtherApps: true)
         guard panel.runModal() == .OK, let dir = panel.url?.path else { return }
-        // 경로는 iTerm 에 글자로 입력된다. 제어 문자가 섞이면 따옴표 밖에서 줄이 끝나거나 지워질 수 있어 띄우지 않는다
-        if dir.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }) {
+        // 경로는 iTerm 에 글자로 입력된다. 제어 문자가 섞이면 따옴표 밖에서 줄이 끝나거나 지워질 수 있어 띄우지 않는다.
+        // fish 는 작은따옴표 안의 \' 를 이스케이프로 읽어서, 역슬래시가 든 경로도 띄우지 않는다
+        if dir.contains("\\") || dir.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }) {
             NSSound.beep()
             return
         }

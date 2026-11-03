@@ -254,7 +254,7 @@ struct WidgetRow: View {
             if let window {
                 HStack(spacing: WidgetColumn.inner) {
                     GaugeBar(pct: window.pct).frame(width: WidgetColumn.gauge)
-                    Text("\(Int(window.pct.rounded()))%")
+                    Text("\(Fmt.whole(window.pct, limit: 999))%")
                         .foregroundStyle(GaugeBar.color(window.pct)).fontWeight(.semibold)
                         .lineLimit(1)
                         .frame(width: WidgetColumn.pct, alignment: .trailing)
@@ -279,7 +279,7 @@ struct WidgetRow: View {
     // "1일 7시간" 대신 "1d7h" 처럼 짧게
     private func short(_ ts: Double?) -> String {
         guard let ts else { return "" }
-        let s = max(0, Int(ts - Date().timeIntervalSince1970))
+        let s = max(0, Fmt.whole(ts - Date().timeIntervalSince1970))
         let d = s / 86400, h = (s % 86400) / 3600, m = (s % 3600) / 60
         if d > 0 { return "\(d)d\(h)h" }
         if h > 0 { return "\(h)h\(m)m" }

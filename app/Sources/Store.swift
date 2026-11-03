@@ -251,8 +251,13 @@ final class Store: ObservableObject {
 }
 
 enum Fmt {
+    // 사용량 파일이 깨져 아주 큰 값이 들어와도 Int 변환에서 앱이 죽지 않게 범위를 묶는다
+    static func whole(_ x: Double, limit: Double = 1e9) -> Int {
+        x.isFinite ? Int(min(max(x.rounded(), -limit), limit)) : 0
+    }
+
     static func duration(_ seconds: Double) -> String {
-        let s = max(0, Int(seconds))
+        let s = max(0, whole(seconds))
         let d = s / 86400, h = (s % 86400) / 3600, m = (s % 3600) / 60
         if d > 0 { return "\(d)일 \(h)시간" }
         if h > 0 { return "\(h)시간 \(m)분" }
