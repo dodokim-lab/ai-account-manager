@@ -460,24 +460,38 @@ class StatuslineInstall(AcmCase):
         self.acm.cmd_install_statusline({}, [])
         wrapped = self.command(path)
         self.assertEqual(shlex.split(wrapped), [self.acm.STATUSLINE_TAP, self.ORIGINAL])
-        self.assertFalse(os.path.exists(self.acm.LEGACY_STATUSLINE_INNER))
         self.acm.cmd_install_statusline({}, [])
         self.assertEqual(self.command(path), wrapped)
         self.acm.cmd_uninstall_statusline({}, [])
         with open(path) as f:
             self.assertEqual(f.read(), before)
 
-    def test_legacy_inner_file_moves_into_settings(self):
-        path = self.settings(self.acm.STATUSLINE_TAP)
+    def planted(self, text="echo planted"):
+        """세션이 묻지 않고 쓸 수 있는 ~/.acm 에 statusline 명령을 심어 둔 경우."""
         os.makedirs(self.acm.STATE_DIR, exist_ok=True)
-        with open(self.acm.LEGACY_STATUSLINE_INNER, "w") as f:
-            f.write(self.ORIGINAL + "\n")
+        path = os.path.join(self.acm.STATE_DIR, "statusline-inner")
+        with open(path, "w") as f:
+            f.write(text)
+        return path
+
+    def test_planted_inner_file_never_reaches_settings(self):
+        path = self.settings(self.acm.STATUSLINE_TAP)
+        self.planted()
         run = self.acm.SetupRun("check")
         self.acm.doctor_statusline(run, {"accounts": {}}, [])
-        self.assertTrue(any("statusline-inner" in t for t in run.todo))
+        self.assertFalse(run.todo)
         self.acm.cmd_install_statusline({}, [])
-        self.assertEqual(shlex.split(self.command(path))[1:], [self.ORIGINAL])
-        self.assertFalse(os.path.exists(self.acm.LEGACY_STATUSLINE_INNER))
+        self.assertEqual(self.command(path), self.acm.STATUSLINE_TAP)
+        self.acm.cmd_uninstall_statusline({}, [])
+        self.assertNotIn("statusLine", self.acm.read_json(path))
+
+    def test_install_without_settings_file_creates_it(self):
+        path = os.path.join(self.home, ".claude", "settings.json")
+        if os.path.exists(path):
+            os.remove(path)
+        self.acm.cmd_install_statusline({}, [])
+        self.assertEqual(self.command(path), self.acm.STATUSLINE_TAP)
+        self.assertFalse([n for n in os.listdir(os.path.dirname(path)) if ".acm-bak-" in n])
 
     def test_no_statusline_installs_bare_and_uninstall_removes(self):
         path = self.settings()
@@ -488,9 +502,7 @@ class StatuslineInstall(AcmCase):
 
     @unittest.skipUnless(shutil.which("jq"), "jq 가 없다")
     def test_wrapper_runs_its_argument_not_the_legacy_file(self):
-        os.makedirs(self.acm.STATE_DIR, exist_ok=True)
-        with open(self.acm.LEGACY_STATUSLINE_INNER, "w") as f:
-            f.write("echo planted")
+        self.planted()
         env = dict(os.environ, ACM_ACCOUNT="cl1", ACM_LABEL="t")
 
         def run(command):
@@ -526,6 +538,12 @@ class PublisherScope(AcmCase):
         link = os.path.join(self.home, "work/report/innocent.html")
         os.symlink(os.path.join(self.home, ".ssh/key.html"), link)
         self.assertIn("~/.ssh", self.acm.stage_problem(link))
+        # 프로젝트 안 깊은 곳의 숨은 폴더와, 비밀 파일에 건 하드 링크도 받지 않는다
+        self.assertIn(".secrets", self.acm.stage_problem(self.write("work/app/.secrets/sa.json", "{}")))
+        hard = os.path.join(self.home, "work/report/key.txt")
+        os.link(self.write(".ssh/id_rsa.txt", "KEY"), hard)
+        self.assertIn("하드 링크", self.acm.stage_problem(hard))
+        self.assertIn("하드 링크", self.acm.copy_staged(hard, os.path.join(self.tmp, "out.txt")))
 
     def test_stage_keeps_relative_layout(self):
         page = self.write("work/report/page.html")
@@ -614,6 +632,11 @@ class PublisherScope(AcmCase):
         self.assertIsNotNone(self.guard("Artifact", file_path=page, files={"c.json": {"from": secret}}))
         self.assertIsNotNone(self.guard("Artifact", url="u", asset=True, file_paths=[secret]))
         self.assertIsNotNone(self.guard("Artifact", file_path="credentials.json", root=os.path.dirname(secret)))
+        # files 는 아는 모양만 받는다. 모르는 모양은 로컬 경로가 들었을 수 있어 막는다
+        self.assertIsNone(self.guard("Artifact", file_path=page, files={"old.js": None}))
+        self.assertIsNone(self.guard("Artifact", file_path=page, files=[{"path": js}]))
+        for files in ([secret], {"c.json": {"path": secret}}, {"c.json": [secret]}, secret, [{"from": secret}]):
+            self.assertIsNotNone(self.guard("Artifact", file_path=page, files=files), files)
         self.assertIsNone(self.guard("Artifact", action="read", url="u"))
         self.assertIsNotNone(self.guard("Artifact", action="read", url="u", out_dir=self.home))
         for action in ("delete", "pin", "unpin"):
@@ -980,6 +1003,14 @@ class StatusBeforeFirstRead(AcmCase):
         with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()):
             self.acm.cmd_add(data, ["cl2"])
         self.assertIn("acm setup", out.getvalue())
+
+    def test_add_rejects_ids_that_leave_their_folder(self):
+        # id 는 ~/.acm/run/<id> 같은 경로에 들어간다. .. 이면 ~/.acm 의 파일을 지울 수 있다
+        for bad in ("..", "a/b", "x;open -a Calculator", "", "a" * 33):
+            data = self.accounts(["cl1"])
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                self.acm.cmd_add(data, [bad])
+            self.assertNotIn(bad, data["accounts"])
 
 
 class Processes(AcmCase):

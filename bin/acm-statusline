@@ -20,7 +20,8 @@ if [ -f "$dir/accounts.json" ]; then
 fi
 
 if [ -n "$acc" ]; then
-  mkdir -p "$dir/usage"
+  # 세션이 도는 사이 상태 폴더가 지워졌어도 다시 만들 때 나만 열게 한다
+  (umask 077; mkdir -p "$dir/usage")
   rec="$dir/usage/$acc.json"
   tmp="$dir/usage/.$acc.$$"
   # Claude Code 가 statusline 을 중간에 끊어도 빈 임시 파일이 남지 않게 한다. SIGKILL 은 막지 못한다

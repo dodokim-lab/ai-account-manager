@@ -1669,6 +1669,9 @@ def cmd_add(data, args):
     if len(args) != 1:
         die("사용법: acm add <계정이름> | acm add --codex [계정이름]")
     name = args[0]
+    # id 는 폴더 이름과 ~/.acm 아래 경로에 그대로 들어간다. .. 같은 값이면 ~/.acm 의 파일을 지울 수 있어서 Codex 와 같은 규칙으로 받는다
+    if not ACCOUNT_ID_RE.fullmatch(name):
+        die(f"계정 이름은 영문, 숫자, -, _ 로 32자까지 씁니다: {name}")
     if name in data["accounts"]:
         die(f"{name} 는 이미 있습니다")
     d = os.path.join(HOME, f".claude-{name}")
@@ -1873,14 +1876,12 @@ def cmd_mode(data, args):
 
 
 STATUSLINE_TAP = os.path.join(HOME, ".local", "bin", "acm-statusline")
-# 예전 acm 은 원래 statusline 명령을 이 파일에 따로 두었다. Claude Code 가 보호하지 않는 파일이라 세션이 묻지 않고 고쳐
-# 모든 세션의 statusline 에서 코드를 돌릴 수 있었다. 지금은 settings.json 의 statusLine 명령에 래퍼 인자로 넣는다
-LEGACY_STATUSLINE_INNER = os.path.join(STATE_DIR, "statusline-inner")
 
 
 def statusline_parts(command):
     """statusLine 명령이 acm-statusline 을 거치면 (True, 원래 명령), 아니면 (False, None).
-    원래 명령은 래퍼의 인자로 들어 있다. 인자가 없는 예전 설치는 statusline-inner 파일에서 읽는다."""
+    원래 명령은 래퍼의 인자로만 둔다. acm 이 따로 두는 파일은 Claude Code 가 보호하지 않아서, 세션이 묻지 않고
+    그 파일에 쓴 명령이 다음 설치 때 모든 세션의 statusline 으로 들어갈 수 있다. 인자가 없으면 원래 명령도 없다."""
     if not isinstance(command, str):
         return False, None
     try:
@@ -1892,11 +1893,7 @@ def statusline_parts(command):
     if len(tokens) > 1:
         # 래퍼는 "$*" 를 실행하니 따옴표 없이 여러 낱말로 적혀 있어도 이어 붙인 것과 같다
         return True, " ".join(tokens[1:])
-    try:
-        with open(LEGACY_STATUSLINE_INNER) as f:
-            return True, f.read().strip()
-    except OSError:
-        return True, ""
+    return True, ""
 
 
 def statusline_command(inner):
@@ -1925,44 +1922,49 @@ def with_statusline(text, cur, new):
     return json.dumps(obj, indent=2, ensure_ascii=False) + "\n"
 
 
+def read_statusline_settings(settings):
+    """settings.json 의 글. 막 깐 Claude Code 에는 이 파일이 없을 수 있어서, 없으면 None 을 돌려준다."""
+    try:
+        with open(settings) as f:
+            return f.read()
+    except FileNotFoundError:
+        return None
+
+
 def write_statusline_settings(settings, text, new_text):
-    backup = f"{settings}.acm-bak-{time.strftime('%Y%m%d%H%M%S')}"
-    with open(backup, "w") as f:
-        f.write(text)
+    """바꾼 settings.json 을 쓰고 백업 경로를 돌려준다. 원래 파일이 없었으면 백업도 없다."""
+    backup = None
+    if text is not None:
+        backup = f"{settings}.acm-bak-{time.strftime('%Y%m%d%H%M%S')}"
+        with open(backup, "w") as f:
+            f.write(text)
+    os.makedirs(os.path.dirname(settings), exist_ok=True)
     with open(settings, "w") as f:
         f.write(new_text)
-    try:
-        os.remove(LEGACY_STATUSLINE_INNER)
-    except OSError:
-        pass
     return backup
 
 
 def cmd_install_statusline(data, args):
     settings = os.path.join(SHARED, "settings.json")
-    with open(settings) as f:
-        text = f.read()
-    cur = (json.loads(text).get("statusLine") or {}).get("command")
+    text = read_statusline_settings(settings)
+    cur = (json.loads(text or "{}").get("statusLine") or {}).get("command")
     wrapped, inner = statusline_parts(cur)
     if not wrapped:
         inner = cur or ""
     new = statusline_command(inner)
     if cur == new:
-        if os.path.exists(LEGACY_STATUSLINE_INNER):
-            os.remove(LEGACY_STATUSLINE_INNER)
         print("이미 설치돼 있습니다")
         return
-    new_text = with_statusline(text, cur, new)
+    new_text = with_statusline(text or "{}\n", cur, new)
     if (json.loads(new_text).get("statusLine") or {}).get("command") != new:
         die("settings.json 수정에 실패했습니다")
     backup = write_statusline_settings(settings, text, new_text)
-    if wrapped and len(shlex.split(cur)) == 1:
-        print("statusLine 의 원래 명령을 statusline-inner 파일에서 settings.json 의 래퍼 인자로 옮겼습니다")
-    elif wrapped:
+    if wrapped:
         print("statusLine 의 래퍼 인자를 따옴표 하나로 감싸 정리했습니다")
     else:
         print("statusLine 을 acm-statusline 으로 감쌌습니다. 원래 명령은 래퍼 인자로 남아 그대로 실행됩니다")
-    print(f"백업: {backup}")
+    if backup:
+        print(f"백업: {backup}")
 
 
 # ---------- 발행 세션 ----------
@@ -2033,7 +2035,7 @@ def set_publisher(data, **kw):
 
 
 def publisher_running():
-    return subprocess.run(["tmux", "has-session", "-t", PUBLISHER_SESSION],
+    return subprocess.run(["tmux", "has-session", "-t", "=" + PUBLISHER_SESSION],
                           capture_output=True).returncode == 0
 
 
@@ -2139,7 +2141,7 @@ def watch_publisher(data):
         limit = PUBLISHER_IDLE if worked else PUBLISHER_IDLE_MAX
         if since is not None and time.time() - since >= limit:
             print(f"{datetime.now():%m/%d %H:%M:%S} {'일을 마치고' if worked else '일 없이'} {limit:.0f}초가 지나 발행 세션을 끈다", flush=True)
-            subprocess.run(["tmux", "kill-session", "-t", PUBLISHER_SESSION])
+            subprocess.run(["tmux", "kill-session", "-t", "=" + PUBLISHER_SESSION])
             return
         time.sleep(5)
 
@@ -2169,7 +2171,8 @@ def home_top(real):
 
 def stage_problem(path):
     """inbox 에 올리면 안 되는 파일이면 이유를 돌려준다.
-    홈 바로 아래 숨은 폴더(~/.ssh, ~/.aws, ~/.claude, ~/.acm 등)와 ~/Library 에는 토큰과 설정이 들어서 받지 않는다."""
+    홈 바로 아래 숨은 폴더(~/.ssh, ~/.aws, ~/.claude, ~/.acm 등)와 ~/Library 에는 토큰과 설정이 들어서 받지 않는다.
+    프로젝트 안의 .secrets, .git 처럼 더 깊은 숨은 폴더도 받지 않는다. 하드 링크는 이름만 보고는 원본을 알 수 없어 받지 않는다."""
     real = os.path.realpath(path)
     if not os.path.isfile(real):
         return "파일이 없다"
@@ -2182,6 +2185,11 @@ def stage_problem(path):
     top = home_top(real)
     if top is not None and (top.startswith(".") or top.lower() == "library"):
         return f"~/{top} 아래 파일은 받지 않는다"
+    hidden = next((part for part in os.path.dirname(real).split(os.sep) if part.startswith(".")), None)
+    if hidden:
+        return f"숨은 폴더 {hidden} 아래 파일은 받지 않는다"
+    if os.stat(real).st_nlink > 1:
+        return "하드 링크가 걸린 파일은 받지 않는다"
     if os.path.getsize(real) > STAGE_MAX_BYTES:
         return f"{STAGE_MAX_BYTES // (1024 * 1024)}MB 를 넘는다"
     return None
@@ -2212,6 +2220,8 @@ def copy_staged(path, target):
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
             return "일반 파일이 아니다"
+        if st.st_nlink > 1:
+            return "하드 링크가 걸린 파일은 받지 않는다"
         actual = fd_path(fd)
         if actual is None:
             return "실제 경로를 확인하지 못했다"
@@ -2293,6 +2303,10 @@ def stage_files(paths):
         if any(r == rel for _, r in staged):
             continue
         target = os.path.join(dest, rel)
+        # 검사 뒤에 경로가 링크로 바뀌면 rel 이 ../ 로 시작해 inbox 밖에 쓸 수 있다
+        if not under(os.path.normpath(target), dest):
+            shutil.rmtree(dest, ignore_errors=True)
+            die(f"발행할 파일을 올리지 않았습니다.\n  {p}: 첫 파일 폴더 밖으로 바뀌었다")
         os.makedirs(os.path.dirname(target), mode=0o700, exist_ok=True)
         why = copy_staged(p, target)
         if why:
@@ -2370,15 +2384,27 @@ def publisher_guard_problem(event):
     paths = [inp["file_path"]] if inp.get("file_path") else []
     paths += list(inp.get("file_paths") or [])
     files = inp.get("files")
+    # 허용 목록이라 모르는 모양은 로컬 경로가 들었을 수 있다고 보고 막는다
+    unknown = "Artifact files 의 모르는 모양은 발행하지 않는다"
     if isinstance(files, dict):
         for src in files.values():
-            # {artifact, path} 는 서버에서 복사하고 null 은 지우는 것이라 로컬 파일을 읽지 않는다
+            if src is None:
+                continue  # 지우는 것이라 로컬 파일을 읽지 않는다
             if isinstance(src, str):
                 paths.append(src)
             elif isinstance(src, dict) and "from" in src:
                 paths.append(src["from"])
+            elif isinstance(src, dict) and "artifact" in src:
+                continue  # {artifact, path} 는 서버에서 복사해서 로컬 파일을 읽지 않는다
+            else:
+                return unknown
     elif isinstance(files, list):
-        paths += [f.get("path") for f in files if isinstance(f, dict)]
+        for f in files:
+            if not (isinstance(f, dict) and "path" in f):
+                return unknown
+            paths.append(f["path"])
+    elif files is not None:
+        return unknown
     bad = [str(p) for p in paths if not allowed(p, bases)]
     return f"inbox 밖 파일은 발행하지 않는다: {', '.join(bad)}" if bad else None
 
@@ -2418,13 +2444,13 @@ def cmd_publisher(data, args):
     elif sub == "off":
         set_publisher(data, enabled=False, account=name)
         if publisher_running():
-            subprocess.run(["tmux", "kill-session", "-t", PUBLISHER_SESSION])
+            subprocess.run(["tmux", "kill-session", "-t", "=" + PUBLISHER_SESSION])
         print("발행 세션을 끄고, 각 세션이 자기 계정으로 발행하게 되돌렸습니다")
     elif sub == "start":
         start_publisher(data)
     elif sub == "stop":
         if publisher_running():
-            subprocess.run(["tmux", "kill-session", "-t", PUBLISHER_SESSION])
+            subprocess.run(["tmux", "kill-session", "-t", "=" + PUBLISHER_SESSION])
         print("발행 세션을 껐습니다")
     elif sub == "account" and len(args) == 2:
         new = resolve(data, args[1], "claude")
@@ -2607,9 +2633,8 @@ def cmd_rm(data, args):
 
 def cmd_uninstall_statusline(data, args):
     settings = os.path.join(SHARED, "settings.json")
-    with open(settings) as f:
-        text = f.read()
-    cur = (json.loads(text).get("statusLine") or {}).get("command")
+    text = read_statusline_settings(settings)
+    cur = (json.loads(text or "{}").get("statusLine") or {}).get("command")
     wrapped, inner = statusline_parts(cur)
     if not wrapped:
         print("acm statusline 래퍼가 설치돼 있지 않습니다")
@@ -3481,7 +3506,7 @@ def doctor_statusline(run, data, sessions):
         run.left("statusLine 이 acm-statusline 이 아닙니다. 세션이 떠 있는 계정의 사용량이 늦게 갱신된다 (acm install-statusline)")
         return
     if command != statusline_command(inner):
-        run.left("statusLine 의 원래 명령이 예전처럼 ~/.acm/statusline-inner 에 있다. 래퍼가 이 파일을 읽지 않아 원래 statusline 이 안 보인다 (acm install-statusline)")
+        run.left("statusLine 의 래퍼 인자가 따옴표 하나로 감싸여 있지 않다 (acm install-statusline)")
         return
     run.ok("statusLine 이 acm-statusline 을 거침")
     now = time.time()

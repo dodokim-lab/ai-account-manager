@@ -44,7 +44,9 @@ done
 echo "CLI: $BIN/acm"
 
 STATE="${ACM_HOME:-$HOME/.acm}"
+# 상태 폴더에는 이메일과 사용량이 든다. 같은 Mac 의 다른 사용자가 읽지 못하게 처음부터 나만 연다
 mkdir -p "$STATE"
+chmod 700 "$STATE"
 commit=$(git -C "$DIR" rev-parse --short HEAD 2>/dev/null || true)
 dirty=false
 if [ -n "$commit" ] && [ -n "$(git -C "$DIR" status --porcelain 2>/dev/null)" ]; then dirty=true; fi
