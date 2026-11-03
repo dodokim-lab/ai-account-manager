@@ -1,8 +1,8 @@
 import AppKit
 import SwiftUI
 
-// 도구 로고. 상표 이미지를 저장소에 두지 않고, 이 Mac 에 깔린 그 도구의 앱 아이콘을 빌려 쓴다.
-// 앱이 없으면 도구 색 바탕에 기호를 둔다
+// Tool logo. Trademarked images are not kept in the repo. It borrows the icon of the tool's app installed on this Mac.
+// Without the app, it shows a symbol on the tool color
 struct ToolLogo: View {
     let tool: String
     var size: CGFloat = 16
@@ -22,10 +22,10 @@ struct ToolLogo: View {
 }
 
 enum ToolIcon {
-    // Claude 는 데스크톱 앱, Codex 는 Codex 앱이나 ChatGPT 앱의 아이콘
+    // The Claude desktop app icon for Claude, and the Codex app or ChatGPT app icon for Codex
     private static let bundles = ["claude": ["com.anthropic.claudefordesktop"],
                                   "codex": ["com.openai.codex", "com.openai.chat"]]
-    // 창이 그려질 때마다 앱을 찾지 않게 한 번 찾은 결과를 둔다. 메인 스레드에서만 부른다
+    // Keep the first lookup so the app is not searched on every redraw. Call only from the main thread
     nonisolated(unsafe) private static var cache: [String: NSImage?] = [:]
 
     static func image(_ tool: String) -> NSImage? {
@@ -39,10 +39,10 @@ enum ToolIcon {
     }
 }
 
-// 메뉴바 아이콘. acm 로고의 표시와 막대만 템플릿 이미지로 그려서, 메뉴바가 밝든 어둡든 시스템이 색을 맞춘다
+// Menu bar icon. Only the mark and bars of the acm logo are drawn as a template image, so the system sets the color for a light or dark menu bar
 enum MenuIcon {
     static let image: NSImage = {
-        // 로고의 그림 부분은 512 칸 중 x 72~440, y 148~352 다
+        // The drawn part of the logo spans x 72 to 440 and y 148 to 352 of 512
         let size = NSSize(width: 22, height: 16)
         let image = NSImage(size: size, flipped: true) { _ in
             let k: CGFloat = 20 / 368
@@ -70,7 +70,7 @@ enum MenuIcon {
     }()
 }
 
-// acm 로고. docs/logo.svg 와 같은 그림이다: 다음 배정 표시와 사용량 막대 두 개
+// acm logo. Same drawing as docs/logo.svg: the next-pick mark and two usage bars
 struct AppLogo: View {
     var size: CGFloat = 22
 

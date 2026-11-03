@@ -1,4 +1,4 @@
-"""acm 테스트. 가짜 홈 폴더에서 돌아서 실제 계정과 ~/.acm 은 건드리지 않는다.
+"""acm tests. They run in a fake home folder and never touch real accounts or ~/.acm.
 
     python3 -m unittest discover -s tests
 """
@@ -46,7 +46,7 @@ def seoul(*args):
 
 
 class AcmCase(unittest.TestCase):
-    """가짜 HOME 과 ACM_HOME 으로 acm 을 새로 읽는다."""
+    """Reload acm with a fake HOME and ACM_HOME."""
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="acm-test-")
@@ -77,7 +77,7 @@ class AcmCase(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def login(self, name, email):
-        """계정을 로그인한 상태로 만든다."""
+        """Put the account in a signed-in state."""
         if name == "cl1":
             path = os.path.join(self.home, ".claude.json")
         else:
@@ -129,7 +129,7 @@ class ParseUsageText(AcmCase):
         now = seoul(2026, 11, 2, 12, 0)
         self.assertEqual(self.acm.parse_reset("Nov 8, 7:59am (Asia/Seoul)", now), seoul(2026, 11, 8, 7, 59))
         self.assertEqual(self.acm.parse_reset("Nov 8 at 7:59\u202fAM (Asia/Seoul)", now), seoul(2026, 11, 8, 7, 59))
-        # 시각만 있으면 오늘, 이미 지났으면 내일
+        # With only a time, it is today, or tomorrow if that time has passed
         self.assertEqual(self.acm.parse_reset("3:59pm (Asia/Seoul)", now), seoul(2026, 11, 2, 15, 59))
         self.assertEqual(self.acm.parse_reset("9am (Asia/Seoul)", now), seoul(2026, 11, 3, 9, 0))
         self.assertIsNone(self.acm.parse_reset("soon", now))
@@ -142,7 +142,7 @@ class ParseUsageText(AcmCase):
 class AccountUsage(AcmCase):
     def test_five_hour_dropped_after_reset_is_zero_not_ultra(self):
         now = time.time()
-        # 창이 리셋돼 statusline 입력에서 빠져도 래퍼는 지난 창을 그대로 둔다
+        # Even when a reset drops the window from the statusline input, the wrapper keeps the last window as is
         self.statusline("cl1", five_hour={"used_percentage": 80, "resets_at": now - 60, "at": now - 600},
                         seven_day={"used_percentage": 20, "resets_at": now + 86400, "at": now})
         u = self.acm.account_usage("cl1", now)
@@ -154,7 +154,7 @@ class AccountUsage(AcmCase):
         now = time.time()
         self.statusline("cl1", seven_day={"used_percentage": 20, "resets_at": now + 86400})
         self.assertIsNone(self.acm.account_usage("cl1", now)["five"])
-        # 예전 래퍼는 빠진 창을 null 로 적었다
+        # Older wrappers wrote a dropped window as null
         self.statusline("cl1", five_hour=None, seven_day={"used_percentage": 20, "resets_at": now + 86400})
         self.assertIsNone(self.acm.account_usage("cl1", now)["five"])
 
@@ -180,7 +180,7 @@ class StatuslineWrapper(AcmCase):
         subprocess.run(["sh", STATUSLINE], input=json.dumps(payload), text=True, env=env, capture_output=True, check=True)
         return self.acm.read_json(os.path.join(self.acm.USAGE_DIR, "cl1.json"))
 
-    @unittest.skipUnless(shutil.which("jq"), "jq 가 없다")
+    @unittest.skipUnless(shutil.which("jq"), "jq is not installed")
     def test_keeps_dropped_window_with_its_time(self):
         first = self.run_statusline({"model": {"id": "claude-fable-5-1"}, "rate_limits": {
             "five_hour": {"used_percentage": 40, "resets_at": 1000},
@@ -190,9 +190,9 @@ class StatuslineWrapper(AcmCase):
         self.assertEqual(second["seven_day"]["used_percentage"], 13)
         self.assertEqual(second["model"], "claude-fable-5-1")
 
-    @unittest.skipUnless(shutil.which("jq"), "jq 가 없다")
+    @unittest.skipUnless(shutil.which("jq"), "jq is not installed")
     def test_unknown_account_falls_back_to_config_dir(self):
-        # 계정을 새로 세팅하기 전에 띄운 세션은 목록에 없는 옛 id 를 들고 있다
+        # A session started before the accounts were set up again still carries an old id that is not in the list
         self.accounts(["cl1", "cl2"])
         env = dict(os.environ, ACM_ACCOUNT="acc1", ACM_LABEL="t")
         env.pop("CLAUDE_CONFIG_DIR", None)
@@ -204,7 +204,7 @@ class StatuslineWrapper(AcmCase):
         subprocess.run(["sh", STATUSLINE], input=payload, text=True, env=env, capture_output=True, check=True)
         self.assertTrue(os.path.exists(os.path.join(self.acm.USAGE_DIR, "cl2.json")))
 
-    @unittest.skipUnless(shutil.which("jq"), "jq 가 없다")
+    @unittest.skipUnless(shutil.which("jq"), "jq is not installed")
     def test_drops_legacy_null_and_ignores_empty_input(self):
         self.statusline("cl1", five_hour=None, seven_day={"used_percentage": 5})
         rec = self.run_statusline({"rate_limits": {"seven_day": {"used_percentage": 6, "resets_at": 5}}})
@@ -262,15 +262,15 @@ class Pick(AcmCase):
         os.makedirs(self.acm.PUBLISHER_DIR, exist_ok=True)
         self.polled("cl1", seven_day={"used_percentage": 84, "resets_at": now + 3 * 86400})
         self.polled("cl2", seven_day={"used_percentage": 90, "resets_at": now + 3 * 86400})
-        # 예비 기준 85% 아래면 대표 계정도 똑같이 견준다
+        # Below the 85% reserve threshold, the primary account is compared like any other
         self.assertEqual(self.acm.pick(data, "usage")[0], "cl1")
         self.polled("cl1", seven_day={"used_percentage": 86, "resets_at": now + 3 * 86400})
         self.assertEqual(self.acm.pick(data, "usage")[0], "cl2")
-        # 둘 다 막히면 대표 계정이 아닌 쪽을 쓴다
+        # When both are blocked, use the one that is not the primary account
         self.polled("cl2", seven_day={"used_percentage": 99, "resets_at": now + 3 * 86400})
         name, why = self.acm.pick(data, "usage")
         self.assertEqual(name, "cl2")
-        self.assertIn("한도 근처", why)
+        self.assertIn("near their limit", why)
 
 
 class SessionModel(AcmCase):
@@ -315,18 +315,18 @@ class Flags(AcmCase):
         os.chmod(path, 0o755)
         os.chmod(loose, 0o755)
         self.assertTrue(self.acm.bundled_claude(path))
-        # 확장 폴더 밖의 실행 파일은 프롬프트로 넘긴 경로일 수 있어 실행하지 않는다
+        # An executable outside the extension folder may be a path passed as a prompt, so it is not run
         self.assertFalse(self.acm.bundled_claude(loose))
         self.assertFalse(self.acm.bundled_claude("claude"))
         self.assertFalse(self.acm.bundled_claude("-c"))
 
 
 class VSCodeSettings(AcmCase):
-    JSONC = """// 사용자 설정 {
+    JSONC = """// user settings {
 {
-    "editor.fontSize": 13, // 글자 크기
-    /* 여러 줄
-       주석 */
+    "editor.fontSize": 13, // font size
+    /* multi-line
+       comment */
     "url": "https://example.com/*not-a-comment*/",
     "list": [1, 2,],
 }
@@ -335,7 +335,7 @@ class VSCodeSettings(AcmCase):
     def test_jsonc_load(self):
         got = self.acm.jsonc_load(self.JSONC)
         self.assertEqual(got, {"editor.fontSize": 13, "url": "https://example.com/*not-a-comment*/", "list": [1, 2]})
-        self.assertEqual(self.acm.jsonc_load("  // 비어 있음\n"), {})
+        self.assertEqual(self.acm.jsonc_load("  // empty\n"), {})
 
     def test_write_and_remove_keep_original_text(self):
         for original in (self.JSONC, "{}", "{\n}\n", '{"a":1}'):
@@ -372,7 +372,7 @@ class VSCodeSettings(AcmCase):
 
 class Poll(AcmCase):
     def fake_claude(self, usage_text):
-        """/usage 에는 usage_text 를 답하고, 토큰 갱신 요청은 calls 에 적는 가짜 claude."""
+        """Fake claude that answers /usage with usage_text and records token refresh requests in calls."""
         bindir = os.path.join(self.tmp, "bin")
         os.makedirs(bindir, exist_ok=True)
         self.calls = os.path.join(self.tmp, "calls")
@@ -400,7 +400,7 @@ fi
         with open(self.calls) as f:
             lines = f.read().split("\n")
         self.assertIn(f"{os.path.join(self.home, '.claude-cl2')} poll /usage", lines)
-        # 다음 조회 때까지는 다시 맡지 않는다
+        # Not claimed again until the next poll
         self.assertEqual(self.acm.run_poll(data), [])
 
     def test_failure_starts_token_refresh_once(self):
@@ -408,7 +408,7 @@ fi
         data = self.accounts(["cl1"])
         self.acm.run_poll(data)
         state = self.acm.read_json(os.path.join(self.acm.POLL_DIR, "cl1.json"))
-        self.assertIn("토큰 갱신을 띄움", state["note"])
+        self.assertIn("started a token refresh", state["note"])
         self.acm.run_poll(data, force=True)
         state = self.acm.read_json(os.path.join(self.acm.POLL_DIR, "cl1.json"))
         self.assertIn("auth login", state["note"])
@@ -434,12 +434,12 @@ class SharedFolders(AcmCase):
         self.assertTrue(os.path.islink(projects))
         self.assertEqual(os.path.realpath(projects), os.path.realpath(os.path.join(self.acm.STORE_DIR, "projects")))
         self.assertTrue(os.path.isdir(os.path.join(self.acm.STORE_DIR, "projects", "p")))
-        self.assertTrue(any("옮기고 링크했습니다" in p for p in problems))
+        self.assertTrue(any("and linked it" in p for p in problems))
         self.assertEqual(self.acm.relocate_shared(), [])
 
 
 class StatuslineInstall(AcmCase):
-    """원래 statusline 명령은 settings.json 의 래퍼 인자로 두고, 보호받지 않는 파일에 따로 두지 않는다."""
+    """The original statusline command stays as the wrapper argument in settings.json, never in a separate unprotected file."""
 
     ORIGINAL = "bash '/Users/x/.claude/statusline command.sh' --짧게"
 
@@ -467,7 +467,7 @@ class StatuslineInstall(AcmCase):
             self.assertEqual(f.read(), before)
 
     def planted(self, text="echo planted"):
-        """세션이 묻지 않고 쓸 수 있는 ~/.acm 에 statusline 명령을 심어 둔 경우."""
+        """A statusline command planted in ~/.acm, which a session can write without asking."""
         os.makedirs(self.acm.STATE_DIR, exist_ok=True)
         path = os.path.join(self.acm.STATE_DIR, "statusline-inner")
         with open(path, "w") as f:
@@ -500,7 +500,7 @@ class StatuslineInstall(AcmCase):
         self.acm.cmd_uninstall_statusline({}, [])
         self.assertNotIn("statusLine", self.acm.read_json(path))
 
-    @unittest.skipUnless(shutil.which("jq"), "jq 가 없다")
+    @unittest.skipUnless(shutil.which("jq"), "jq is not installed")
     def test_wrapper_runs_its_argument_not_the_legacy_file(self):
         self.planted()
         env = dict(os.environ, ACM_ACCOUNT="cl1", ACM_LABEL="t")
@@ -513,7 +513,7 @@ class StatuslineInstall(AcmCase):
 
 
 class PublisherScope(AcmCase):
-    """발행 세션은 inbox 와 자기 scratchpad 아래 파일만 다룬다."""
+    """The publisher session handles only files under inbox and its own scratchpad."""
 
     def write(self, rel, text="<!doctype html><p>x</p>"):
         path = os.path.join(self.home, rel)
@@ -532,24 +532,24 @@ class PublisherScope(AcmCase):
         self.assertIn("~/.ssh", self.acm.stage_problem(self.write(".ssh/key.html")))
         self.assertIn("~/.acm", self.acm.stage_problem(self.write(".acm/accounts.json", "{}")))
         self.assertIn("~/Library", self.acm.stage_problem(self.write("Library/App/state.json", "{}")))
-        self.assertIn("숨은 파일", self.acm.stage_problem(self.write("work/report/.env", "TOKEN=1")))
+        self.assertIn("hidden files", self.acm.stage_problem(self.write("work/report/.env", "TOKEN=1")))
         self.assertIn(".pem", self.acm.stage_problem(self.write("work/report/cert.pem", "-----")))
-        self.assertIn("파일이 없다", self.acm.stage_problem(os.path.join(self.home, "work/none.html")))
+        self.assertIn("does not exist", self.acm.stage_problem(os.path.join(self.home, "work/none.html")))
         link = os.path.join(self.home, "work/report/innocent.html")
         os.symlink(os.path.join(self.home, ".ssh/key.html"), link)
         self.assertIn("~/.ssh", self.acm.stage_problem(link))
-        # 프로젝트 안 깊은 곳의 숨은 폴더와, 비밀 파일에 건 하드 링크도 받지 않는다
+        # Hidden folders deep inside a project, and hard links to secret files, are refused too
         self.assertIn(".secrets", self.acm.stage_problem(self.write("work/app/.secrets/sa.json", "{}")))
         hard = os.path.join(self.home, "work/report/key.txt")
         os.link(self.write(".ssh/id_rsa.txt", "KEY"), hard)
-        self.assertIn("하드 링크", self.acm.stage_problem(hard))
-        self.assertIn("하드 링크", self.acm.copy_staged(hard, os.path.join(self.tmp, "out.txt")))
+        self.assertIn("hard links", self.acm.stage_problem(hard))
+        self.assertIn("hard links", self.acm.copy_staged(hard, os.path.join(self.tmp, "out.txt")))
 
     def test_stage_keeps_relative_layout(self):
         page = self.write("work/report/page.html")
         js = self.write("work/report/assets/app.js", "1")
         outside = self.write("work/other/x.css", "a{}")
-        self.assertTrue(any("같은 폴더 아래" in p for p in self.acm.stage_problems([page, outside])))
+        self.assertTrue(any("same folder as the first file" in p for p in self.acm.stage_problems([page, outside])))
         staged = self.acm.stage_files([page, js])
         self.assertEqual([rel for _, rel in staged], ["page.html", os.path.join("assets", "app.js")])
         root = os.path.dirname(staged[0][0])
@@ -573,7 +573,7 @@ class PublisherScope(AcmCase):
         self.assertIsNone(self.guard("Read", file_path=staged))
         self.assertIsNotNone(self.guard("Read", file_path=self.write(".ssh/id_rsa", "k")))
         self.assertIsNotNone(self.guard("Read", file_path=os.path.join(self.acm.PUBLISHER_INBOX, "..", "ROLE.md")))
-        # inbox 안의 링크가 밖을 가리키면 막는다
+        # A link inside inbox that points outside is blocked
         link = os.path.join(self.acm.PUBLISHER_INBOX, "link.html")
         os.symlink(self.write(".ssh/key.html"), link)
         self.assertIsNotNone(self.guard("Read", file_path=link))
@@ -588,7 +588,7 @@ class PublisherScope(AcmCase):
         self.assertIsNone(self.guard("ListAgents"))
 
     def test_guard_reads_own_live_copy_for_update(self):
-        # 갱신 전 Artifact read 는 라이브 판을 기록 파일 옆 <세션 ID>/tool-results/artifact-* 에 저장한다
+        # Before an update, Artifact read saves the live version to <session ID>/tool-results/artifact-* next to the transcript file
         projects = os.path.join(self.home, ".claude", "projects", "-proj")
 
         def guard(tool, transcript=os.path.join(projects, "sess-1.jsonl"), **tool_input):
@@ -603,18 +603,18 @@ class PublisherScope(AcmCase):
         self.assertIsNotNone(guard("Read", transcript=None, file_path=mine))
         self.assertIsNotNone(guard("Read", transcript="-proj/sess-1.jsonl", file_path=mine))
         self.assertIsNotNone(guard("Read", transcript=os.path.join(projects, "sess-1"), file_path=mine))
-        # 다른 세션의 사본, artifact- 가 아닌 결과 파일, 하위 폴더는 막는다
+        # Another session's copy, a result file not named artifact-, and subfolders are blocked
         self.assertIsNotNone(guard("Read", file_path=self.write(".claude/projects/-proj/sess-2/tool-results/artifact-a.html")))
         self.assertIsNotNone(guard("Read", file_path=self.write(".claude/projects/-proj/sess-1/tool-results/toolu_01.txt", "k")))
         self.assertIsNotNone(guard("Read", file_path=self.write(".claude/projects/-proj/sess-1/tool-results/x/artifact-a.html")))
         self.assertIsNotNone(guard("Read", file_path=os.path.join(projects, "sess-1.jsonl")))
-        # 자기 폴더로 돌아오는 경로라도 .. 는 받지 않는다
+        # .. is refused even if the path leads back into its own folder
         self.assertIsNotNone(guard("Read", file_path=os.path.join(results, "..", "tool-results", os.path.basename(mine))))
-        # 이름만 artifact- 인 링크가 밖을 가리키면 막는다
+        # A link named artifact- that points outside is blocked
         link = os.path.join(results, "artifact-link.html")
         os.symlink(self.write(".ssh/key.html"), link)
         self.assertIsNotNone(guard("Read", file_path=link))
-        # 사본은 읽기만 하고 발행 경로로는 받지 않는다
+        # The copy is only readable and is not accepted as a publish path
         self.assertIsNotNone(guard("Artifact", file_path=mine, url="u"))
         staged = self.acm.stage_files([self.write("work/page.html")])[0][0]
         self.assertIsNotNone(guard("Artifact", file_path=staged, url="u", files={"live.html": mine}))
@@ -632,7 +632,7 @@ class PublisherScope(AcmCase):
         self.assertIsNotNone(self.guard("Artifact", file_path=page, files={"c.json": {"from": secret}}))
         self.assertIsNotNone(self.guard("Artifact", url="u", asset=True, file_paths=[secret]))
         self.assertIsNotNone(self.guard("Artifact", file_path="credentials.json", root=os.path.dirname(secret)))
-        # files 는 아는 모양만 받는다. 모르는 모양은 로컬 경로가 들었을 수 있어 막는다
+        # files accepts only known shapes. An unknown shape may hold a local path, so it is blocked
         self.assertIsNone(self.guard("Artifact", file_path=page, files={"old.js": None}))
         self.assertIsNone(self.guard("Artifact", file_path=page, files=[{"path": js}]))
         for files in ([secret], {"c.json": {"path": secret}}, {"c.json": [secret]}, secret, [{"from": secret}]):
@@ -654,7 +654,7 @@ class PublisherScope(AcmCase):
                 tried += 1
                 self.assertIsNotNone(self.acm.stage_problem(v), v)
         if not tried:
-            self.skipTest("대소문자를 가리는 파일 시스템이라 다른 경로로 닿지 않는다")
+            self.skipTest("case-sensitive file system, so another path cannot reach the same file")
 
     def test_guard_allows_only_listed_tools_and_actions(self):
         staged = self.acm.stage_files([self.write("work/page.html")])[0][0]
@@ -672,7 +672,7 @@ class PublisherScope(AcmCase):
         root = os.path.dirname(staged)
         nested = os.path.join(root, "a", "b")
         os.makedirs(nested)
-        # root 기준으로는 inbox 안이지만 작업 폴더 기준으로는 홈으로 올라가는 경로
+        # A path inside inbox relative to root, but climbing up to home relative to the working folder
         self.assertIsNotNone(self.guard("Artifact", root=nested, file_path="../../page.html"))
         self.assertIsNotNone(self.guard("Artifact", file_path=os.path.join(root, "..", os.path.basename(root), "page.html")))
         self.assertIsNotNone(self.guard("Artifact", root=root, file_path="page.html"))
@@ -688,7 +688,7 @@ class PublisherScope(AcmCase):
         self.assertTrue(os.listdir(moved))
 
     def test_stage_refuses_path_swapped_after_check(self):
-        # 검사를 통과한 뒤 경로가 비밀 파일을 가리키게 바뀐 경우를, 검사를 건너뛰는 것으로 흉내 낸다
+        # Simulate a path switched to a secret file after passing the check, by skipping the check
         secret = self.write(".ssh/key.html", "SECRET")
         link = os.path.join(self.home, "work", "page.html")
         os.makedirs(os.path.dirname(link), exist_ok=True)
@@ -717,7 +717,7 @@ class PublisherScope(AcmCase):
         secret = self.write(".ssh/id_rsa", "k")
         blocked = run(json.dumps({"tool_name": "Read", "tool_input": {"file_path": secret}, "session_id": "s"}))
         self.assertEqual(blocked.returncode, 2)
-        self.assertIn("inbox 밖", blocked.stderr)
+        self.assertIn("outside inbox", blocked.stderr)
         self.assertEqual(run("not json").returncode, 2)
         staged = self.acm.stage_files([self.write("work/page.html")])[0][0]
         self.assertEqual(run(json.dumps({"tool_name": "Read", "tool_input": {"file_path": staged}})).returncode, 0)
@@ -737,12 +737,12 @@ class PublisherScope(AcmCase):
             return subprocess.run(["sh", "-c", command], input=event, text=True, capture_output=True,
                                   env=dict(os.environ, **env)).returncode
         self.assertEqual(run(), 0)
-        # acm 이 import 단계에서 죽어도 막는다
+        # Blocks even if acm dies at import
         self.assertEqual(run(ACM_USAGE_BAND="x"), 2)
 
 
 class Resume(AcmCase):
-    """한도에 걸린 세션을 다른 계정으로 이어 가되, 대표 계정은 예비 기준 아래에서만 쓴다."""
+    """Continue a session stopped at its limit on another account, using the primary account only below its reserve threshold."""
 
     SID = "0b9f3c2e-1111-4222-8333-944455556666"
     WEEK = 2000000000
@@ -799,7 +799,7 @@ class Resume(AcmCase):
         self.acm.cmd_resume(self.data, [])
         argv, reason, cwd = self.launched[0]
         self.assertEqual(argv, ["-a", "cl1", "--resume", self.SID])
-        self.assertIn("이어 가기", reason)
+        self.assertIn("continuing", reason)
         self.assertEqual(os.path.realpath(cwd), os.path.realpath(self.project))
         self.assertEqual(self.acm.limited_sessions(), [])
 
@@ -809,7 +809,7 @@ class Resume(AcmCase):
         with self.assertRaises(SystemExit):
             self.acm.cmd_resume(self.data, [])
         self.assertEqual(self.launched, [])
-        # 기록은 남겨서 리셋 뒤나 직접 지정할 때 다시 쓴다
+        # The record stays, so it can be used again after the reset or with an explicit account
         self.assertEqual(len(self.acm.limited_sessions()), 1)
         self.acm.cmd_resume(self.data, ["-a", "cl1"])
         self.assertEqual(self.launched[0][0][:2], ["-a", "cl1"])
@@ -824,7 +824,7 @@ class Resume(AcmCase):
         now = int(time.time())
         path = os.path.join(self.acm.POLL_DIR, f"{name}.json")
         state = self.acm.read_json(path)
-        state.update(ok_at=now - 3600, refresh_at=now - 120, fail_at=now - 60, note="/usage 를 읽지 못함")
+        state.update(ok_at=now - 3600, refresh_at=now - 120, fail_at=now - 60, note="could not read /usage")
         self.acm.save_json(path, state)
         login = self.acm.claude_json_path(self.data["accounts"][name])
         os.utime(login, (now - 3600, now - 3600))
@@ -840,7 +840,7 @@ class Resume(AcmCase):
         name, why = self.acm.pick(self.data, "usage", exclude={"cl1"}, strict=True)
         self.assertIsNone(name)
         self.assertIn("acm -a cl2 auth login", why)
-        # 새 세션 배정은 그대로 둔다. 로그인 화면이 떠서 그 자리에서 다시 로그인할 수 있다
+        # New session picks stay as they are. The login screen appears, so the user can sign in again right there
         self.assertEqual(self.acm.pick(self.data, "usage")[0], "cl2")
 
     def test_login_is_trusted_again_after_relogin(self):
@@ -849,7 +849,7 @@ class Resume(AcmCase):
         self.assertTrue(self.acm.login_broken(self.data, "cl2"))
         snap = self.acm.status_snapshot(self.data)
         self.assertTrue(next(a for a in snap["accounts"] if a["id"] == "cl2")["login_broken"])
-        # 다시 로그인하면 .claude.json 이 바뀐다. 다음 조회 전에도 풀렸다고 보지 않는다
+        # Signing in again changes .claude.json. Even before the next poll, the login is not treated as broken
         os.utime(login, None)
         self.assertFalse(self.acm.login_broken(self.data, "cl2"))
 
@@ -859,7 +859,7 @@ class Resume(AcmCase):
         self.hit(account="cl1")
         name, why = self.acm.pick(self.data, "usage", exclude={"cl1"}, strict=True)
         self.assertIsNone(name)
-        self.assertIn("같은 Claude 계정", why)
+        self.assertIn("same Claude account", why)
         with self.assertRaises(SystemExit):
             self.acm.cmd_resume(self.data, [])
         self.assertEqual(self.launched, [])
@@ -899,7 +899,7 @@ class Resume(AcmCase):
 
 
 class SameLogin(AcmCase):
-    """브라우저가 이미 로그인한 계정으로 승인해 두 acm 계정이 같은 Claude 계정이 된 경우."""
+    """The browser approved with an account already signed in, so two acm accounts became the same Claude account."""
 
     def setUp(self):
         super().setUp()
@@ -910,7 +910,7 @@ class SameLogin(AcmCase):
 
     def test_duplicate_is_left_out_of_assignment_and_reserve_holds(self):
         self.assertEqual(self.acm.same_login(self.data), {"cl2": "cl1"})
-        # 대표 계정이 예비 기준을 넘어도 같은 계정의 다른 이름으로 새지 않는다
+        # Even if the primary account is over its reserve threshold, picks do not leak to another name of the same account
         self.polled("cl1", seven_day={"used_percentage": 90, "resets_at": 2000000000})
         self.polled("cl2", seven_day={"used_percentage": 10, "resets_at": 2000000000})
         self.assertEqual(self.acm.pick(self.data, "usage")[0], "cl1")
@@ -922,7 +922,7 @@ class SameLogin(AcmCase):
         run = self.acm.SetupRun("check")
         with contextlib.redirect_stdout(io.StringIO()) as out:
             self.acm.setup_accounts(run)
-        self.assertIn("같은 Claude 계정", out.getvalue())
+        self.assertIn("same Claude account", out.getvalue())
         self.assertTrue(any("acm -a cl2 auth login" in t for t in run.todo))
 
     def test_account_uuid_wins_over_email(self):
@@ -934,7 +934,7 @@ class SameLogin(AcmCase):
 
 
 class SameOrg(AcmCase):
-    """서로 다른 Claude 계정이 한 조직에 묶이면 알리기만 하고 배정은 그대로 둔다."""
+    """Different Claude accounts tied to one organization are only reported, and picks stay as they are."""
 
     def org_login(self, name, uuid, org):
         path = self.acm.claude_json_path(self.data["accounts"][name])
@@ -955,7 +955,7 @@ class SameOrg(AcmCase):
         self.assertEqual({a["id"]: a["same_org"] for a in snap["accounts"]}, {"cl1": ["cl2"], "cl2": ["cl1"], "cl3": []})
         with contextlib.redirect_stdout(io.StringIO()) as out:
             self.acm.cmd_status(self.data, [])
-        self.assertIn("같은 조직 Corp", out.getvalue())
+        self.assertIn("same organization Corp", out.getvalue())
 
     def test_same_login_is_not_an_org_match(self):
         self.org_login("cl1", "u1", "org-a")
@@ -964,7 +964,7 @@ class SameOrg(AcmCase):
 
 
 class StatusBeforeFirstRead(AcmCase):
-    """사용량을 아직 한 번도 읽지 못한 계정을 5h 한도가 없는 Ultra 계정으로 단정하지 않는다."""
+    """An account whose usage has never been read is not assumed to be an Ultra account with no 5h limit."""
 
     def setUp(self):
         super().setUp()
@@ -978,23 +978,23 @@ class StatusBeforeFirstRead(AcmCase):
 
     def test_no_reads_make_no_ultra_claim(self):
         self.assertNotIn("Ultra", self.status())
-        # 한 계정만 읽었으면 다른 계정이 5h 창을 가질 수 있어서 열을 뺀 까닭도 단정하지 않는다
+        # With only one account read, another account may have a 5h window, so the reason for hiding the column is not assumed either
         self.polled("cl1", seven_day={"used_percentage": 10, "resets_at": 2000000000})
-        self.assertNotIn("5H 열을 뺐다", self.status())
+        self.assertNotIn("5H column is hidden", self.status())
         self.polled("cl2", seven_day={"used_percentage": 20, "resets_at": 2000000000})
-        self.assertIn("5H 열을 뺐다", self.status())
+        self.assertIn("5H column is hidden", self.status())
 
     def test_unread_row_is_blank_not_unlimited(self):
         self.polled("cl1", five_hour={"used_percentage": 30, "resets_at": 2000000000},
                     seven_day={"used_percentage": 10, "resets_at": 2000000000})
         out = self.status()
         row = next(line for line in out.splitlines() if line.startswith("cl2 "))
-        self.assertNotIn("없음", row)
+        self.assertNotIn("none", row)
         self.assertNotIn("Ultra", out)
 
     def test_new_id_counts_after_existing_accounts(self):
         self.assertEqual(self.acm.next_account_id(self.accounts(["cl1"])), "cl2")
-        # 0.2.0 에서 올린 설치는 acc id 를 그대로 쓴다. 세 번째 계정은 cl3 이다
+        # Installs upgraded from 0.2.0 keep their acc ids. The third account is cl3
         legacy = {"order": ["acc1", "acc2"], "accounts": {"acc1": {"dir": None}, "acc2": {"dir": "/x"}}}
         self.assertEqual(self.acm.next_account_id(legacy), "cl3")
 
@@ -1005,7 +1005,7 @@ class StatusBeforeFirstRead(AcmCase):
         self.assertIn("acm setup", out.getvalue())
 
     def test_add_rejects_ids_that_leave_their_folder(self):
-        # id 는 ~/.acm/run/<id> 같은 경로에 들어간다. .. 이면 ~/.acm 의 파일을 지울 수 있다
+        # The id goes into paths like ~/.acm/run/<id>. With .., it could delete files in ~/.acm
         for bad in ("..", "a/b", "x;open -a Calculator", "", "a" * 33):
             data = self.accounts(["cl1"])
             with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
@@ -1014,11 +1014,11 @@ class StatusBeforeFirstRead(AcmCase):
 
 
 class Processes(AcmCase):
-    """세션 계정은 ps 문자열이 아니라 커널이 나눠 준 환경변수로 가르고, 다른 사용자의 claude 는 세지 않는다."""
+    """Session accounts are told apart by the environment the kernel hands out, not ps strings, and other users' claude is not counted."""
 
     def test_proc_env_separates_arguments_from_environment(self):
         env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "ACM_TEST_MARK": "a b"}
-        # /bin 과 /usr/bin 의 시스템 바이너리는 커널이 환경변수를 주지 않아서 파이썬을 자식으로 띄운다
+        # The kernel gives no environment for system binaries in /bin and /usr/bin, so start Python as the child
         child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)",
                                   "CLAUDE_CONFIG_DIR=/wrong", "ACM_ROLE=poll"], env=env)
         try:
@@ -1057,7 +1057,7 @@ class Processes(AcmCase):
                 return "".join(f"{r[0]} {r[2]} {r[4]}\n" for r in rows)
             return "".join(" ".join(map(str, r)) + "\n" for r in rows)
         mod.quick_run = quick_run
-        # 400 은 내 프로세스지만 환경변수를 읽지 못했다. 기본 계정으로 세지 않는다
+        # 400 is my process, but its environment could not be read. It is not counted as the default account
         envs = {100: {"CLAUDE_CONFIG_DIR": data["accounts"]["cl2"]["dir"], "ACM_ACCOUNT": "cl1"},
                 300: {"ACM_ROLE": "poll"}}
         mod.proc_info = lambda pid: ([], envs[pid]) if pid in envs else None
@@ -1076,7 +1076,7 @@ class Processes(AcmCase):
                 (502, 1, me, "01:00", "codex"), (503, 1, me, "00:05", "codex"), (504, 1, me, "00:01", "codex"),
                 (600, 1, me, "00:30", "claude")]
         mod.quick_run = lambda cmd, timeout=10: "".join(" ".join(map(str, r)) + "\n" for r in rows) if cmd[:2] == ["ps", "-axo"] else ""
-        # 502 는 codex 가 띄워 둔 app-server 데몬, 504 는 acm 의 사용량 조회라 세션이 아니다
+        # 502 is an app-server daemon codex left running, and 504 is acm's usage poll, so neither is a session
         infos = {500: (["codex"], {}), 502: (["codex", "app-server", "--listen"], {}),
                  503: (["codex", "resume"], {"CODEX_HOME": cx2, "ACM_CODEX_ACCOUNT": "cx2"}),
                  504: (["codex", "app-server"], {"ACM_ROLE": "poll"}), 600: (["claude"], {})}
@@ -1086,11 +1086,11 @@ class Processes(AcmCase):
 
 
 class AccountsFile(AcmCase):
-    """accounts.json 을 고치는 곳은 파일을 다시 읽어 자기 몫만 고친다."""
+    """Code that edits accounts.json re-reads the file and changes only its own part."""
 
     def test_remember_emails_keeps_changes_made_meanwhile(self):
         stale = self.accounts(["cl1", "cl2"])
-        # 다른 acm 이 그사이 last 와 mode 를 바꿨다
+        # Another acm changed last and mode in the meantime
         self.acm.update_accounts(lambda d: d.update(last="cl2", mode="rr"))
         self.login("cl2", "new@example.com")
         self.acm.remember_emails(stale)
@@ -1109,14 +1109,14 @@ class AccountsFile(AcmCase):
 
 
 class Resilience(AcmCase):
-    """acm 의 결함이나 이상한 입력 때문에 claude 를 못 띄우는 일이 없게 한다."""
+    """A defect in acm or odd input must never keep claude from starting."""
 
     def test_removed_publisher_account_falls_back(self):
         data = self.accounts(["cl1", "cl2"], publisher="cl2")
         self.acm.cmd_rm(data, ["cl2"])
         data = self.acm.load_accounts()
         self.assertNotIn("account", data["publisher"])
-        # 예전 acm 이 남긴 없는 대표 계정도 첫 계정으로 본다
+        # A missing primary account left by an older acm also falls back to the first account
         data["publisher"]["account"] = "gone"
         self.assertEqual(self.acm.publisher_conf(data), (True, "cl1"))
         self.assertIn("cl1", self.acm.session_rules(data, "cl1", True, False))
@@ -1131,7 +1131,7 @@ class Resilience(AcmCase):
             acc.pop("email", None)
         name, why = self.acm.pick(data, "usage")
         self.assertEqual(name, "cl1")
-        self.assertIn("로그인된 계정이 없어", why)
+        self.assertIn("no signed-in account", why)
 
     def test_unreadable_claude_json_is_left_alone(self):
         data = self.accounts(["cl1", "cl2"])
@@ -1181,7 +1181,7 @@ def free_limits(reset=2000000000, allowed=False):
 FREE_ACCOUNT = {"account": {"type": "chatgpt", "email": "me@example.com", "planType": "free"},
                 "requiresOpenaiAuth": True, "workspaceRouting": {"chatgptAccountId": "acct-1"}}
 
-# account/read 와 account/rateLimits/read 에 답하는 가짜 codex. CODEX_HOME 폴더 이름을 이메일 앞부분으로 돌려준다
+# Fake codex that answers account/read and account/rateLimits/read. Returns the CODEX_HOME folder name as the email local part
 FAKE_CODEX = r"""#!%(python)s
 import json, os, sys
 home = os.path.basename(os.environ.get("CODEX_HOME", "root"))
@@ -1205,7 +1205,7 @@ for line in sys.stdin:
                   "primary": {"usedPercent": 40, "windowDurationMins": 300, "resetsAt": 2000000000},
                   "secondary": {"usedPercent": 20, "windowDurationMins": 10080, "resetsAt": 2000000000},
                   "planType": "plus"}}
-    # 응답 앞에 알림을 하나 끼워서 id 로 응답을 가르는지 본다
+    # Put a notification before each response to check that responses are matched by id
     sys.stdout.write(json.dumps({"method": "account/updated", "params": {}}) + "\n")
     sys.stdout.write(json.dumps({"id": msg["id"], "result": result}) + "\n")
     sys.stdout.flush()
@@ -1213,7 +1213,7 @@ for line in sys.stdin:
 
 
 class Codex(AcmCase):
-    """Codex 계정은 Codex 끼리만 배정하고, 사용량은 codex app-server 로 읽는다."""
+    """Codex accounts are picked only among Codex accounts, and usage is read with codex app-server."""
 
     def setUp(self):
         super().setUp()
@@ -1262,7 +1262,7 @@ class Codex(AcmCase):
         u = self.acm.codex_usage(rec, now)
         self.assertEqual((u["five"], u["seven"], u["seven_name"]), (40, 20, "Week"))
         self.assertEqual(self.acm.fmt_u(u), "5h 40% · Week 20%")
-        # 막혔다고 알린 뒤 창이 모두 리셋됐으면 다시 쓸 수 있다
+        # After a block is reported, the account is usable again once all windows have reset
         u = self.acm.codex_usage(rec, now + 2 * 86400)
         self.assertEqual((u["five"], u["seven"], u["denied"]), (0.0, 0.0, False))
 
@@ -1277,7 +1277,7 @@ class Codex(AcmCase):
         name, why = self.acm.pick(data, "usage", tool="codex")
         self.assertEqual(name, "cx2")
         self.assertIn("Week 50%", why)
-        # rr 도 도구마다 직전 계정을 따로 기억한다
+        # rr also remembers the last account separately for each tool
         self.acm.set_last_pick(data, "codex", "cx2")
         self.assertEqual(self.acm.pick(data, "rr", tool="codex")[0], "cx1")
         self.assertIsNone(self.acm.load_accounts()["last"])
@@ -1299,7 +1299,7 @@ class Codex(AcmCase):
         with contextlib.redirect_stdout(io.StringIO()) as out:
             self.acm.cmd_status(data, [])
         self.assertRegex(out.getvalue(), r"cl1 .*me@example.com +Ultra")
-        # 로그아웃하면 요금제도 지운다
+        # Signing out also clears the plan
         with open(path, "w") as f:
             json.dump({}, f)
         self.acm.remember_emails(data)
@@ -1322,7 +1322,7 @@ class Codex(AcmCase):
             self.assertEqual(os.readlink(os.path.join(d, name)), os.path.join(self.root, name))
         for name in ("auth.json", "state_5.sqlite-wal", "app-server-daemon", "tmp"):
             self.assertFalse(os.path.lexists(os.path.join(d, name)), name)
-        # 먼저 쓰던 폴더의 DB 를 옮길 때는 아직 합치지 않은 WAL 도 함께 옮긴다
+        # When moving the DB of a folder in use, the WAL that is not merged yet moves along
         old = {"tool": "codex", "dir": os.path.join(self.home, ".codex-old")}
         os.makedirs(old["dir"])
         for name in ("state_5.sqlite", "state_5.sqlite-wal"):
@@ -1345,7 +1345,7 @@ class Codex(AcmCase):
         data = self.codex_accounts(codex=("cx1", "cx2", "cx3"))
         for n, email in (("cx1", "a@team.test"), ("cx2", "b@team.test"), ("cx3", "a@team.test")):
             data["accounts"][n].update(email=email, account_id="ws-1")
-        # 같은 팀 워크스페이스의 다른 사람은 같은 로그인이 아니다
+        # Another person in the same team workspace is not the same login
         self.assertEqual(self.acm.same_login(data), {"cx3": "cx1"})
 
     def test_logout_clears_codex_identity(self):
@@ -1379,7 +1379,7 @@ class Codex(AcmCase):
         data = self.accounts(["cl1"])
         work = os.path.join(self.home, ".codex-work")
         os.makedirs(work)
-        # 로그인하지 않은 폴더는 계정으로 삼지 않는다
+        # A folder that is not signed in is not taken as an account
         os.makedirs(os.path.join(self.home, ".codex-backup"))
         for name in ("auth.json", "history.jsonl"):
             with open(os.path.join(work, name), "w") as f:
@@ -1390,14 +1390,14 @@ class Codex(AcmCase):
         self.assertEqual(data["accounts"]["cx1"], {"tool": "codex", "dir": None})
         self.assertEqual(data["accounts"]["work"], {"tool": "codex", "dir": work})
         self.assertNotIn("backup", data["accounts"])
-        # Codex 가 만든 history.jsonl 은 옮겨 두고 ~/.codex 쪽을 링크한다. 로그인 정보는 그대로다
+        # history.jsonl that Codex made is moved aside, and the ~/.codex side is linked. Login data stays as is
         self.assertTrue(os.path.islink(os.path.join(work, "history.jsonl")))
         self.assertEqual(len(os.listdir(os.path.join(work, ".acm-drift"))), 1)
         with open(os.path.join(work, "auth.json")) as f:
             self.assertEqual(f.read(), "work")
         with contextlib.redirect_stdout(io.StringIO()):
             self.acm.cmd_add(data, ["--codex"])
-        # cx1 과 work 다음이라 세 번째 Codex 계정은 cx3 이다
+        # After cx1 and work, the third Codex account is cx3
         self.assertEqual(self.acm.load_accounts()["accounts"]["cx3"]["dir"], os.path.join(self.home, ".codex-cx3"))
 
     def test_hook_trust_is_mirrored_once_into_extra_accounts(self):
@@ -1417,20 +1417,20 @@ class Codex(AcmCase):
         with contextlib.redirect_stderr(io.StringIO()) as err:
             self.assertEqual(self.acm.sync_codex_links("cx2", cx2), [])
             self.acm.sync_codex_links("cx3", cx3)
-        self.assertIn("신뢰한 것으로", err.getvalue())
+        self.assertIn("as trusted for this account", err.getvalue())
         with open(conf) as f:
             text = f.read()
         mine2 = os.path.join(cx2["dir"], "hooks.json")
         self.assertIn(f'[hooks.state."{mine2}:session_start:0:0"]\ntrusted_hash = "sha256:aa"\nenabled = true\n', text)
         self.assertIn(f'[hooks.state."{mine2}:session_end:0:0"]\ntrusted_hash = "sha256:bb"\n', text)
-        # 이미 있던 계정 기록은 해시가 달라도 그대로 두고, 없는 것만 더한다
+        # Existing account records stay as they are even with a different hash. Only missing ones are added
         self.assertEqual(text.count(f'"{mine3}:session_start:0:0"'), 1)
         self.assertIn('trusted_hash = "sha256:old"', text)
         self.assertIn(f'[hooks.state."{mine3}:session_end:0:0"]', text)
         self.assertEqual(stat.S_IMODE(os.stat(conf).st_mode), 0o600)
         self.assertTrue(os.path.islink(os.path.join(cx2["dir"], "config.toml")))
         self.assertFalse(self.acm.mirror_hook_trust(cx2))
-        # config.toml 을 계정마다 따로 두면 root 파일에 적지 않는다
+        # If config.toml is kept per account, nothing is written to the root file
         cx4 = {"tool": "codex", "dir": os.path.join(self.home, ".codex-cx4")}
         os.makedirs(cx4["dir"])
         open(os.path.join(cx4["dir"], "config.toml"), "w").close()
@@ -1448,7 +1448,7 @@ class Codex(AcmCase):
         conf = os.path.join(self.root, "config.toml")
         os.unlink(conf)
         os.symlink(real_conf, conf)
-        # 들여 쓴 다음 표, 여러 줄 값이 든 기록, 해시 없는 기록, 줄바꿈 없이 끝나는 마지막 기록
+        # An indented next table, a record with a multi-line value, a record without a hash, and a last record that ends without a newline
         with open(real_conf, "w") as f:
             f.write(f'[hooks.state."{root_hooks}:a:0:0"]\ntrusted_hash = "sha256:aa"\n\n'
                     '  [projects."/work"]\n  trust_level = "trusted"\n\n'
@@ -1459,7 +1459,7 @@ class Codex(AcmCase):
         open(os.path.join(self.root, ".acm-config.1.toml"), "w").close()
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(self.acm.sync_codex_links("cx2", cx2), [])
-        # 링크는 그대로 두고 가리키는 파일에 쓴다. 임시 파일은 계정 폴더로 링크하지 않는다
+        # The link stays, and the write goes to the file it points to. Temp files are not linked into account folders
         self.assertTrue(os.path.islink(conf))
         self.assertFalse(os.path.lexists(os.path.join(cx2["dir"], ".acm-config.1.toml")))
         with open(real_conf) as f:
@@ -1485,7 +1485,7 @@ class Codex(AcmCase):
         calls = []
 
         def fake_poll(name, acc):
-            # API 키 로그인처럼 읽기는 됐는데 이메일이 없다
+            # Reading worked, but there is no email, as with API key login
             calls.append(name)
             self.acm.save_json(os.path.join(self.acm.POLL_DIR, f"{name}.json"),
                                {"next_at": time.time() - 1, "ok_at": int(time.time()) + 1})
@@ -1493,7 +1493,7 @@ class Codex(AcmCase):
         self.acm.status_snapshot(data)
         self.acm.status_snapshot(data)
         self.assertEqual(calls, ["cx2"])
-        # 다시 로그인하면 한 번 더 기다린다
+        # After signing in again, it waits once more
         auth = os.path.join(self.home, ".codex-cx2", "auth.json")
         later = time.time() + 10
         os.utime(auth, (later, later))
@@ -1524,7 +1524,7 @@ class Codex(AcmCase):
                          (".codex@example.com", "plus", "id-.codex"))
         u = self.acm.account_usage("cx1", time.time())
         self.assertEqual((u["five"], u["seven"], u["source"]), (40, 20, "app-server"))
-        self.assertIn("로그인 안 됨", self.acm.poll_note("cx2"))
+        self.assertIn("not signed in", self.acm.poll_note("cx2"))
 
     def test_status_waits_for_new_codex_login(self):
         data = self.codex_accounts()
@@ -1540,7 +1540,7 @@ class Codex(AcmCase):
         snap = self.acm.status_snapshot(data)
         cx2 = next(a for a in snap["accounts"] if a["id"] == "cx2")
         self.assertEqual((calls, cx2["email"], cx2["plan"]), (["cx2"], "new@chatgpt.test", "free"))
-        # 이메일을 알고 나면 다시 기다리지 않는다
+        # Once the email is known, it does not wait again
         self.acm.status_snapshot(data)
         self.assertEqual(calls, ["cx2"])
 
@@ -1556,7 +1556,7 @@ class Codex(AcmCase):
         with contextlib.redirect_stdout(io.StringIO()) as out:
             self.acm.cmd_status(data, [])
         text = out.getvalue()
-        for part in ("[Claude]", "[Codex]", "30d 100%", "다음 배정 Codex:", "쓸 수 없다고 알려"):
+        for part in ("[Claude]", "[Codex]", "30d 100%", "Next pick for Codex:", "cannot be used now"):
             self.assertIn(part, text)
 
     def test_launch_codex_sets_codex_home(self):
@@ -1609,7 +1609,7 @@ class Codex(AcmCase):
         self.assertIn('acm codex "$@"', self.acm.SHELL_INIT)
         self.assertIn('acm claude "$@"', self.acm.SHELL_INIT)
 
-    @unittest.skipUnless(shutil.which("jq"), "jq 가 없다")
+    @unittest.skipUnless(shutil.which("jq"), "jq is not installed")
     def test_statusline_never_maps_to_codex_root(self):
         data = {"mode": "usage", "order": ["cx1", "cl1"], "last": None,
                 "accounts": {"cx1": {"tool": "codex", "dir": None}, "cl1": {"dir": None}}}

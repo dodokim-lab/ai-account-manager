@@ -1,16 +1,16 @@
 import Foundation
 import SwiftUI
 
-// `acm status --json` 출력과 같은 모양
+// Same shape as the `acm status --json` output
 struct Snapshot: Decodable {
     struct Window: Decodable {
         let pct: Double
         let resetsAt: Double?
-        // 창 이름. Claude 는 Week, Codex 는 요금제에 따라 Week 나 30d. 예전 acm 은 내지 않는다
+        // Window name. Week for Claude. Week or 30d for Codex, depending on the plan. Older acm versions do not send it
         var name: String? = nil
     }
 
-    // Codex 처럼 긴 창이 여럿인 계정의 나머지 창. 배정에도 견준다
+    // The other windows of an account with several long windows, like Codex. Picks count them too
     struct Extra: Decodable, Identifiable {
         let name: String
         let pct: Double
@@ -20,7 +20,7 @@ struct Snapshot: Decodable {
         var window: Window { Window(pct: pct, resetsAt: resetsAt, name: name) }
     }
 
-    // 모델별 주간 한도 (Fable, Sonnet only 같은 것). applies 는 이번 배정에 견주는 모델의 한도인지
+    // Per-model weekly limits (such as Fable or Sonnet only). applies tells whether the limit is for the model this pick counts
     struct Scoped: Decodable, Identifiable {
         let name: String
         let short: String
@@ -34,25 +34,25 @@ struct Snapshot: Decodable {
 
     struct Account: Decodable, Identifiable {
         let id: String
-        // claude 나 codex. 예전 acm 은 내지 않아서 nil 이면 claude 다
+        // claude or codex. Older acm versions do not send it, so nil means claude
         let tool: String?
         let label: String
         let email: String?
         let plan: String?
-        // 5시간 한도가 없는 계정(Ultra 인증 계정)은 nil
+        // nil for an account with no 5-hour limit (a verified Ultra account)
         let fiveHour: Window?
         let sevenDay: Window
-        // 예전 acm 은 이 필드를 내지 않는다
+        // Older acm versions do not send this field
         let scoped: [Scoped]?
         let exhausted: Bool
         let updatedAt: Double?
         let source: String?
         let pollNote: String?
         let sessions: Int
-        // 대표 계정이면 true. 예비 기준을 넘어 자동 배정에서 빠졌으면 reserveHeld 도 true
+        // true for the primary account. reserveHeld is also true when it passed the reserve threshold and was left out of automatic picks
         let reserved: Bool?
         let reserveHeld: Bool?
-        // Codex 가 지금은 쓸 수 없다고 알린 계정
+        // An account that Codex reported as unavailable for now
         let denied: Bool?
         let extra: [Extra]?
 
@@ -61,7 +61,7 @@ struct Snapshot: Decodable {
         var loggedIn: Bool { email != nil }
         var isReserved: Bool { reserved ?? false }
         var isHeld: Bool { reserveHeld ?? false }
-        // 둘 중 더 빡빡한 창이 실제 한도를 정한다
+        // The tighter of the two windows sets the real limit
         var binding: Double { max(fiveHour?.pct ?? 0, sevenDay.pct) }
     }
 
@@ -85,11 +85,11 @@ struct Snapshot: Decodable {
 
     let generatedAt: Double
     let mode: String
-    // Claude 의 다음 배정. 도구마다의 다음 배정은 nextByTool 에 있다
+    // The next pick for Claude. The next pick for each tool is in nextByTool
     let next: Next?
     let accounts: [Account]
     let sessions: [Session]
-    // 계정이 있는 도구. 예전 acm 은 내지 않는다
+    // Tools that have accounts. Older acm versions do not send it
     let tools: [String]?
     let nextByTool: [String: Next?]?
 
@@ -102,25 +102,25 @@ struct Snapshot: Decodable {
         return tool == "claude" ? next : nil
     }
 
-    // 위젯이 보일 도구. 메뉴바 창과 같은 순서이고, 고른 도구가 모두 없어졌으면 첫 도구를 보인다
+    // Tools the widget shows, in menu bar window order. If all chosen tools are gone, show the first tool
     func widgetList(_ chosen: Set<String>) -> [String] {
         let list = toolList.filter(chosen.contains)
         return list.isEmpty ? [toolList.first ?? "claude"] : list
     }
 
-    // 그 도구의 로그인한 계정 중 하나라도 5시간 한도가 있으면 5h 를 보인다. 모두 없으면(전부 Ultra 인증 계정) 5h 열을 뺀다
+    // Show 5h if any signed-in account of the tool has a 5-hour limit. If none has one (all verified Ultra accounts), drop the 5h column
     func showsFiveHour(of tool: String) -> Bool { accounts(of: tool).contains { $0.loggedIn && $0.fiveHour != nil } }
 
-    // 위젯에 열로 세울 모델별 주간 한도. 로그인한 계정 중 하나라도 가진 한도를 처음 나온 순서대로 모은다
+    // Per-model weekly limits to show as widget columns. Collect each limit any signed-in account has, in order of first appearance
     func scopeColumns(of tool: String) -> [Scoped] {
         var seen = Set<String>()
         return accounts(of: tool).filter(\.loggedIn).flatMap { $0.scoped ?? [] }.filter { seen.insert($0.name).inserted }
     }
 
-    // 긴 창 열의 이름. 계정마다 창 길이가 다르면(Codex 무료와 유료) 한도라고 쓴다
+    // Name of the long window column. If window lengths differ across accounts (Codex free and paid), use Limit
     func longWindowName(of tool: String) -> String {
         let names = Set(accounts(of: tool).filter(\.loggedIn).compactMap { $0.sevenDay.name })
-        return names.count == 1 ? names.first! : names.isEmpty ? Windows.week : "한도"
+        return names.count == 1 ? names.first! : names.isEmpty ? Windows.week : "Limit"
     }
 }
 
@@ -129,7 +129,7 @@ enum Tools {
         ["claude": "Claude", "codex": "Codex"][tool] ?? tool.capitalized
     }
 
-    // 메뉴바 창에서 도구 묶음의 테두리 색. Claude 는 acm 로고와 같은 주황이다
+    // Border color of a tool group in the menu bar window. Claude uses the same orange as the acm logo
     static func color(_ tool: String) -> Color {
         tool == "codex" ? Color(red: 0.29, green: 0.53, blue: 0.96) : Color(red: 0xD9 / 255, green: 0x77 / 255, blue: 0x57 / 255)
     }
@@ -141,19 +141,19 @@ enum Tools {
 
 @MainActor
 final class Store: ObservableObject {
-    // 메뉴바 창과 떠 있는 위젯이 같은 데이터를 본다
+    // The menu bar window and the floating widget share the same data
     static let shared = Store()
 
     @Published var snapshot: Snapshot?
     @Published var error: String?
     @Published var loading = false
-    // 떠 있는 위젯에 보일 도구. 처음에는 예전 판에서 위젯에 보이던 도구(shownTool) 하나다
+    // Tools shown in the floating widget. At first, the one tool (shownTool) the widget showed in older versions
     @Published var widgetTools = Set(UserDefaults.standard.stringArray(forKey: "widgetTools")
                                      ?? [UserDefaults.standard.string(forKey: "shownTool") ?? "claude"]) {
         didSet { UserDefaults.standard.set(widgetTools.sorted(), forKey: "widgetTools") }
     }
 
-    // 위젯에서 도구를 켜고 끈다. 위젯이 비지 않게 마지막 하나는 끄지 않는다. 위젯을 통째로 숨기려면 "떠 있는 위젯" 을 끈다
+    // Turn a tool on or off in the widget. The last one stays on so the widget is never empty. To hide the whole widget, turn off "Floating widget"
     func setWidget(_ tool: String, _ on: Bool, in snap: Snapshot) {
         var tools = Set(snap.widgetList(widgetTools))
         if on { tools.insert(tool) } else { tools.remove(tool) }
@@ -185,7 +185,7 @@ final class Store: ObservableObject {
                         self.snapshot = try decoder.decode(Snapshot.self, from: data)
                         self.error = nil
                     } catch {
-                        self.error = "acm 출력 해석 실패: \(error.localizedDescription)"
+                        self.error = "Could not parse acm output: \(error.localizedDescription)"
                     }
                 case .failure(let message):
                     self.error = message.text
@@ -203,7 +203,7 @@ final class Store: ObservableObject {
 
     struct Failure: Error { let text: String }
 
-    // 시간 초과로 끊었는지. 타이머 스레드가 쓰고 run 이 읽는다
+    // Whether the process was stopped on timeout. The timer thread writes it and run reads it
     final class TimeoutFlag: @unchecked Sendable {
         private let lock = NSLock()
         private var value = false
@@ -216,7 +216,7 @@ final class Store: ObservableObject {
         process.executableURL = URL(fileURLWithPath: acmPath)
         process.arguments = args
         var env = ProcessInfo.processInfo.environment
-        // 메뉴바 앱은 셸 PATH 를 물려받지 않는다
+        // The menu bar app does not inherit the shell PATH
         env["PATH"] = "\(NSHomeDirectory())/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
         env.removeValue(forKey: "CLAUDE_CONFIG_DIR")
         process.environment = env
@@ -226,9 +226,9 @@ final class Store: ObservableObject {
         do {
             try process.run()
         } catch {
-            return .failure(Failure(text: "acm 을 실행하지 못했습니다: \(acmPath)"))
+            return .failure(Failure(text: "Could not run acm: \(acmPath)"))
         }
-        // acm 이 멈추면 loading 이 풀리지 않아 다음 새로고침이 영영 오지 않는다. 시간이 지나면 끊는다
+        // If acm hangs, loading never clears and the next refresh never comes. Stop it after the timeout
         let timedOut = TimeoutFlag()
         DispatchQueue.global().asyncAfter(deadline: .now() + timeout) {
             if process.isRunning {
@@ -240,18 +240,18 @@ final class Store: ObservableObject {
         let errData = err.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
         if timedOut.isSet {
-            return .failure(Failure(text: "acm \(args.joined(separator: " ")) 가 \(Int(timeout))초 안에 끝나지 않아 끊었습니다"))
+            return .failure(Failure(text: "acm \(args.joined(separator: " ")) did not finish within \(Int(timeout))s and was stopped"))
         }
         if process.terminationStatus != 0 {
             let text = String(data: errData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            return .failure(Failure(text: text.isEmpty ? "acm 종료 코드 \(process.terminationStatus)" : text))
+            return .failure(Failure(text: text.isEmpty ? "acm exited with code \(process.terminationStatus)" : text))
         }
         return .success(data)
     }
 }
 
 enum Fmt {
-    // 사용량 파일이 깨져 아주 큰 값이 들어와도 Int 변환에서 앱이 죽지 않게 범위를 묶는다
+    // Clamp the range so a huge value from a corrupt usage file cannot crash the app in the Int conversion
     static func whole(_ x: Double, limit: Double = 1e9) -> Int {
         x.isFinite ? Int(min(max(x.rounded(), -limit), limit)) : 0
     }
@@ -259,18 +259,18 @@ enum Fmt {
     static func duration(_ seconds: Double) -> String {
         let s = max(0, whole(seconds))
         let d = s / 86400, h = (s % 86400) / 3600, m = (s % 3600) / 60
-        if d > 0 { return "\(d)일 \(h)시간" }
-        if h > 0 { return "\(h)시간 \(m)분" }
-        return "\(m)분"
+        if d > 0 { return "\(d)d \(h)h" }
+        if h > 0 { return "\(h)h \(m)m" }
+        return "\(m)m"
     }
 
     static func resetIn(_ ts: Double?) -> String {
         guard let ts else { return "" }
         let left = ts - Date().timeIntervalSince1970
-        return left <= 0 ? "리셋됨" : "\(duration(left)) 후 리셋"
+        return left <= 0 ? "Already reset" : "Resets in \(duration(left))"
     }
 
-    // Claude 는 "Ultra" 처럼, Codex 는 "plus" 처럼 소문자로 와서 첫 글자만 대문자로 맞춘다
+    // Claude sends names like "Ultra" and Codex sends lowercase ones like "plus", so capitalize only the first letter
     static func plan(_ plan: String) -> String {
         plan.prefix(1).uppercased() + plan.dropFirst()
     }

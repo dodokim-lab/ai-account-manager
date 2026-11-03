@@ -1,6 +1,6 @@
 import SwiftUI
 
-// 사용량만큼 차오르는 게이지. 처음 나타날 때와 값이 바뀔 때 채워지는 애니메이션을 한다.
+// A gauge that fills up to the usage. The fill animates when it first appears and when the value changes.
 struct GaugeBar: View {
     let pct: Double
     var height: CGFloat = 6

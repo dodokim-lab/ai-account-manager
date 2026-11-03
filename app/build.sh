@@ -1,5 +1,5 @@
 #!/bin/sh
-# ACM 메뉴바 앱을 빌드해서 /Applications/ACM.app 에 설치한다.
+# Build the ACM menu bar app and install it to /Applications/ACM.app.
 set -eu
 cd "$(dirname "$0")"
 
@@ -20,4 +20,4 @@ osascript -e 'tell application "ACM" to quit' >/dev/null 2>&1 || true
 sleep 1
 rm -rf "$DEST"
 cp -R "$APP" "$DEST"
-echo "설치: $DEST"
+echo "Installed: $DEST"

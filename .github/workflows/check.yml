@@ -3,7 +3,7 @@ on: [push, pull_request]
 permissions:
   contents: read
 jobs:
-  # acm 은 지금 macOS 에서만 돈다. Linux 를 지원하면 ubuntu 잡을 더한다
+  # acm runs only on macOS for now. Add an ubuntu job once Linux is supported
   macos:
     runs-on: macos-latest
     timeout-minutes: 20
@@ -11,17 +11,17 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: 셸 스크립트 문법
+      - name: Shell script syntax
         run: |
           sh -n install.sh
           sh -n bin/acm-statusline
           sh -n app/build.sh
-      - name: 파이썬 문법
+      - name: Python syntax
         run: python3 -m py_compile bin/acm
-      - name: 단위 테스트
+      - name: Unit tests
         run: python3 -m unittest discover -s tests
-      # build.sh 는 /Applications 에 설치까지 해서, CI 에서는 컴파일만 확인한다
-      - name: 메뉴바 앱 컴파일
+      # build.sh also installs into /Applications, so CI only checks that the app compiles
+      - name: Compile the menu bar app
         run: |
           swiftc -parse-as-library -swift-version 5 \
             -target arm64-apple-macos14.0 \

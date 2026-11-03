@@ -21,6 +21,6 @@
 	<key>LSUIElement</key>
 	<true/>
 	<key>NSAppleEventsUsageDescription</key>
-	<string>새 세션을 iTerm 창에서 열 때 사용합니다.</string>
+	<string>Used to open a new session in an iTerm window.</string>
 </dict>
 </plist>

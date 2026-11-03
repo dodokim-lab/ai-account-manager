@@ -14,7 +14,7 @@ struct PanelView: View {
                 Text(error).font(.caption).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
             }
             if let snap = store.snapshot {
-                // 도구마다 색이 다른 테두리로 묶는다. 위젯 체크박스는 도구가 여럿일 때만 둔다
+                // Group each tool in a border of its own color. The widget checkbox appears only when there is more than one tool
                 let widgetTools = snap.widgetList(store.widgetTools)
                 ForEach(snap.toolList, id: \.self) { tool in
                     ToolGroup(tool: tool, next: snap.next(for: tool),
@@ -48,13 +48,13 @@ struct PanelView: View {
                 Image(systemName: store.loading ? "hourglass" : "arrow.clockwise")
             }
             .buttonStyle(.borderless)
-            .help("새로고침")
+            .help("Refresh")
         }
     }
 
     private func sessions(_ snap: Snapshot) -> some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text("실행 중인 세션 \(snap.sessions.count)개").font(.subheadline.bold())
+            Text("\(snap.sessions.count) running session\(snap.sessions.count == 1 ? "" : "s")").font(.subheadline.bold())
             ScrollView {
                 VStack(alignment: .leading, spacing: Self.sessionSpacing) {
                     ForEach(snap.sessions) { s in
@@ -69,16 +69,16 @@ struct PanelView: View {
                                 .background(RoundedRectangle(cornerRadius: 3).fill(.quaternary))
                             Text(Fmt.folder(s.cwd)).font(.caption).lineLimit(1).truncationMode(.middle)
                             Spacer()
-                            // via 는 acm 으로 띄웠으면 acm, 아니면 claude 나 codex 다
+                            // via is acm if the session was started through acm, otherwise claude or codex
                             if s.via != "acm" {
-                                Text(s.via).font(.caption2).foregroundStyle(.orange).help("acm 을 거치지 않고 띄운 세션")
+                                Text(s.via).font(.caption2).foregroundStyle(.orange).help("Session started without acm")
                             }
                             Text(Fmt.duration(Double(s.elapsedS))).font(.caption2).foregroundStyle(.secondary)
                         }
                     }
                 }
             }
-            // 메뉴바 창은 내용의 이상적인 크기로 열리는데 ScrollView 는 그 높이가 0 이라 목록이 사라진다. 줄 수로 높이를 정한다
+            // The menu bar window opens at the ideal size of its content, but a ScrollView's ideal height is 0, so the list would vanish. Set the height from the row count
             .frame(height: min(220, CGFloat(snap.sessions.count) * (Self.sessionRow + Self.sessionSpacing)))
         }
     }
@@ -89,58 +89,59 @@ struct PanelView: View {
     private func footer(_ snap: Snapshot) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Text("분배").font(.caption)
+                Text("Mode").font(.caption)
                 Picker("", selection: Binding(get: { snap.mode }, set: { store.setMode($0) })) {
-                    Text("사용량").tag("usage")
-                    Text("라운드로빈").tag("rr")
+                    Text("Usage").tag("usage")
+                    Text("Round robin").tag("rr")
                 }
                 .pickerStyle(.segmented)
                 .labelsHidden()
                 .frame(width: 170)
                 Spacer()
                 if snap.toolList.count > 1 {
-                    Menu("새 세션…") {
+                    Menu("New Session…") {
                         ForEach(snap.toolList, id: \.self) { tool in
-                            Button("\(Tools.name(tool)) 세션…") { NewSession.openInITerm(tool: tool) }
+                            Button("\(Tools.name(tool)) session…") { NewSession.openInITerm(tool: tool) }
                         }
                     }
                     .fixedSize()
                 } else {
-                    Button("새 세션…") { NewSession.openInITerm(tool: snap.toolList.first ?? "claude") }
+                    Button("New Session…") { NewSession.openInITerm(tool: snap.toolList.first ?? "claude") }
                 }
             }
             HStack {
-                Toggle("로그인 시 실행", isOn: $loginItem)
+                Toggle("Launch at login", isOn: $loginItem)
                     .toggleStyle(.checkbox)
                     .font(.caption)
                     .onChange(of: loginItem) { _, on in
                         do {
                             if on { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }
                         } catch {
-                            store.error = "로그인 항목 변경 실패: \(error.localizedDescription)"
+                            store.error = "Could not change the login item: \(error.localizedDescription)"
                             loginItem = SMAppService.mainApp.status == .enabled
                         }
                     }
-                Toggle("떠 있는 위젯", isOn: $widget)
+                Toggle("Floating widget", isOn: $widget)
                     .toggleStyle(.checkbox)
                     .font(.caption)
                     .onChange(of: widget) { _, on in FloatingWidget.shared.isVisible = on }
                 Spacer()
-                Text("갱신 \(Date(timeIntervalSince1970: snap.generatedAt).formatted(date: .omitted, time: .shortened))")
+                Text("Updated \(Date(timeIntervalSince1970: snap.generatedAt).formatted(date: .omitted, time: .shortened))")
                     .font(.caption2).foregroundStyle(.secondary)
-                Button("종료") { NSApp.terminate(nil) }.font(.caption)
+                Button("Quit") { NSApp.terminate(nil) }.font(.caption)
             }
         }
     }
 }
 
-// 도구 묶음. 로고와 이름, 그 도구의 다음 배정, 위젯에 보일지를 머리에 두고 계정 카드를 도구 색 테두리로 감싼다
+// A tool group. The top row has the logo and name, the tool's next pick, and whether it shows in the widget.
+// The account cards sit inside a border in the tool's color
 struct ToolGroup<Content: View>: View {
     let tool: String
     let next: Snapshot.Next?
-    // nil 이면 체크박스를 두지 않는다. 도구가 하나뿐이면 위젯은 늘 그 도구다
+    // nil means no checkbox. With only one tool, the widget always shows that tool
     let widget: Binding<Bool>?
-    // 위젯에 남은 마지막 도구라 끌 수 없다
+    // The last tool left in the widget, so it cannot be turned off
     let lastInWidget: Bool
     @ViewBuilder let content: Content
 
@@ -152,17 +153,17 @@ struct ToolGroup<Content: View>: View {
                 Text(Tools.name(tool)).font(.subheadline.bold())
                 Spacer()
                 if let widget {
-                    Toggle("위젯에 표시", isOn: widget)
+                    Toggle("Show in widget", isOn: widget)
                         .toggleStyle(.checkbox)
                         .font(.caption)
                         .disabled(lastInWidget)
-                        .help(lastInWidget ? "위젯에는 도구가 하나 이상 있어야 한다. 위젯을 숨기려면 아래 떠 있는 위젯을 끈다"
-                                           : "떠 있는 위젯에 \(Tools.name(tool)) 계정을 보인다")
+                        .help(lastInWidget ? "The widget needs at least one tool. To hide the widget, turn off Floating widget below."
+                                           : "Show \(Tools.name(tool)) accounts in the floating widget")
                 }
             }
-            // 체크박스와 한 줄에 두면 좁아서 잘린다. 상자 너비를 다 쓰게 아래 줄에 둔다
+            // On the checkbox row it would be cut off. Put it on the next row so it can use the full box width
             if let next {
-                Text("다음 세션 → \(next.label)  (\(next.why))").font(.caption2).foregroundStyle(.secondary)
+                Text("Next session → \(next.label)  (\(next.why))").font(.caption2).foregroundStyle(.secondary)
                     .lineLimit(2).fixedSize(horizontal: false, vertical: true)
                     .padding(.top, -4)
             }
@@ -176,14 +177,14 @@ struct ToolGroup<Content: View>: View {
 
 struct AccountCard: View {
     let account: Snapshot.Account
-    // 위젯과 같은 규칙. 모든 계정에 5시간 한도가 없으면 5h 줄을 뺀다
+    // Same rule as the widget. If no account has a 5-hour limit, drop the 5h row
     let showsFiveHour: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack {
                 Text(account.label).font(.subheadline.bold())
-                Text(account.email ?? "로그인 안 됨").font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                Text(account.email ?? "Not signed in").font(.caption).foregroundStyle(.secondary).lineLimit(1)
                 if let plan = account.plan {
                     Text(Fmt.plan(plan)).font(.caption2).foregroundStyle(.secondary)
                         .padding(.horizontal, 4).background(Capsule().fill(Color.primary.opacity(0.08)))
@@ -193,18 +194,19 @@ struct AccountCard: View {
                 }
                 Spacer()
                 if account.exhausted {
-                    Text(account.isDenied ? "쓸 수 없음" : "한도 근처").font(.caption2.bold()).foregroundStyle(.white)
+                    Text(account.isDenied ? "Unavailable" : "Near limit").font(.caption2.bold()).foregroundStyle(.white)
                         .padding(.horizontal, 5).background(Capsule().fill(.red))
-                        .help(account.isDenied ? "Codex 가 지금은 쓸 수 없다고 알려 자동 배정에서 뺐다" : "한도 기준을 넘어 자동 배정에서 뺐다")
+                        .help(account.isDenied ? "Codex reported it as unavailable for now, so it is left out of automatic picks"
+                                                : "Over the limit threshold, so it is left out of automatic picks")
                 }
-                Text("세션 \(account.sessions)").font(.caption).foregroundStyle(.secondary)
+                Text("\(account.sessions) session\(account.sessions == 1 ? "" : "s")").font(.caption).foregroundStyle(.secondary)
             }
             if account.loggedIn {
                 if showsFiveHour {
-                    // 사용량을 아직 읽지 못한 계정은 5h 창이 없는 까닭을 알 수 없어서 Ultra 로 단정하지 않는다
+                    // If usage has not been read yet, the reason for a missing 5h window is unknown, so do not assume Ultra
                     UsageBar(title: Windows.fiveHour, window: account.fiveHour,
-                             empty: account.updatedAt == nil ? "아직 읽지 못함"
-                                 : account.toolKey == "codex" ? "이 요금제에는 5시간 창이 없음" : UsageBar.ultra)
+                             empty: account.updatedAt == nil ? "Not read yet"
+                                 : account.toolKey == "codex" ? "No 5-hour window on this plan" : UsageBar.ultra)
                 }
                 UsageBar(title: account.sevenDay.name ?? Windows.week, window: account.sevenDay)
                 ForEach(account.extra ?? []) { extra in
@@ -215,7 +217,7 @@ struct AccountCard: View {
                 }
                 HStack(spacing: 4) {
                     if let at = account.updatedAt {
-                        Text("\(Fmt.duration(Date().timeIntervalSince1970 - at)) 전 · \(account.source ?? "")")
+                        Text("\(Fmt.duration(Date().timeIntervalSince1970 - at)) ago · \(account.source ?? "")")
                     }
                     if let note = account.pollNote {
                         Text("· \(note)").foregroundStyle(.orange)
@@ -233,9 +235,9 @@ struct AccountCard: View {
 }
 
 struct UsageBar: View {
-    static let ultra = "한도 없음 · Ultra 인증 계정"
+    static let ultra = "No limit · verified Ultra account"
     let title: String
-    // nil 이면 그 창의 한도가 없는 계정이다 (Ultra 인증 계정의 5h)
+    // nil means the account has no limit for this window (the 5h of a verified Ultra account)
     let window: Snapshot.Window?
     var empty = UsageBar.ultra
 
@@ -258,24 +260,24 @@ struct UsageBar: View {
 }
 
 enum NewSession {
-    // 폴더를 고르면 iTerm 새 창에서 그 도구로 acm 을 띄운다
+    // Once a folder is picked, start acm with that tool in a new iTerm window
     @MainActor
     static func openInITerm(tool: String) {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
-        panel.prompt = "여기서 세션 열기"
+        panel.prompt = "Open session here"
         panel.directoryURL = URL(fileURLWithPath: NSHomeDirectory() + "/workspace")
         NSApp.activate(ignoringOtherApps: true)
         guard panel.runModal() == .OK, let dir = panel.url?.path else { return }
-        // 경로는 iTerm 에 글자로 입력된다. 제어 문자가 섞이면 따옴표 밖에서 줄이 끝나거나 지워질 수 있어 띄우지 않는다.
-        // fish 는 작은따옴표 안의 \' 를 이스케이프로 읽어서, 역슬래시가 든 경로도 띄우지 않는다
+        // The path is typed into iTerm as text. A control character could end or erase the line outside the quotes,
+        // so no session is started. fish reads \' inside single quotes as an escape, so a path with a backslash is refused too
         if dir.contains("\\") || dir.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }) {
             NSSound.beep()
             return
         }
         let quoted = "'" + dir.replacingOccurrences(of: "'", with: "'\\''") + "'"
-        // 도구 이름은 이 앱이 정한 값만 쓴다. 터미널에 글자로 들어가서다
+        // Use only tool names this app defines, because they are typed into the terminal
         let command = "cd \(quoted) && acm \(tool == "codex" ? "codex" : "claude")"
         let script = """
         tell application "iTerm"

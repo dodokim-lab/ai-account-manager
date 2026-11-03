@@ -16,7 +16,7 @@ struct ACMApp: App {
         MenuBarExtra {
             PanelView(store: store)
         } label: {
-            // 사용량은 창을 열어야 뜻이 있어서 메뉴바에는 로고만 둔다
+            // Usage only makes sense with the window open, so the menu bar shows just the logo
             Image(nsImage: MenuIcon.image).accessibilityLabel("AI Account Manager")
         }
         .menuBarExtraStyle(.window)
