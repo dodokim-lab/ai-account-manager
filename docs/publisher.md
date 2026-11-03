@@ -24,7 +24,9 @@ acm publisher off             # 끄고 각 세션이 자기 계정으로 발행�
 
 ## 발행 세션은 inbox 에 올린 파일만 읽는다
 
-발행 세션은 다른 세션의 요청을 묻지 않고 처리한다. 그래서 프롬프트 인젝션을 당한 세션이 `~/.ssh` 같은 파일을 발행해 달라고 보낼 수 있다. 이를 막으려고 발행 세션이 읽고 발행하는 로컬 파일을 `~/.acm/publisher/inbox` 아래와 그 세션의 scratchpad 아래로 묶는다. scratchpad 에는 Artifact read 로 받아 온 기존 아티팩트가 든다.
+발행 세션은 다른 세션의 요청을 묻지 않고 처리한다. 그래서 프롬프트 인젝션을 당한 세션이 `~/.ssh` 같은 파일을 발행해 달라고 보낼 수 있다. 이를 막으려고 발행 세션이 읽고 발행하는 로컬 파일을 `~/.acm/publisher/inbox` 아래와 그 세션의 scratchpad 아래로 묶는다.
+
+갱신할 때는 Artifact read 가 저장한 라이브 판 사본도 읽는다. Artifact 도구는 라이브 판을 끝까지 읽은 세션에만 갱신을 허용하는데, 발행 세션은 요청마다 새로 떠서 라이브 판을 본 적이 없다. 그래서 이 사본을 읽지 못하면 내용이 바뀐 갱신은 모두 거절된다.[4] 사본을 끝까지 읽은 뒤에는 요청에 온 파일을 그대로 발행한다. 발행 세션에는 파일을 고치는 도구가 없으니 라이브 판과 합치는 일은 요청한 세션이 맡는다.
 
 다른 세션은 `acm publisher check <HTML 파일> [추가 파일...]` 로 파일을 inbox 에 올리고, 출력에 나온 올린 경로를 발행 세션에 보낸다. 올릴 때 아래 파일은 거절한다.
 
@@ -39,6 +41,7 @@ acm publisher off             # 끄고 각 세션이 자기 계정으로 발행�
 
 - 통과하는 도구는 Read 와 Artifact, SendMessage, ListAgents, ToolSearch 뿐이다. ToolSearch 로 불러온 ArtifactData 같은 다른 도구도 막는다.
 - Read 와 Artifact 의 로컬 경로는 inbox 나 그 세션의 scratchpad 안이어야 한다. `..` 가 든 경로는 받지 않고, 상대 경로는 작업 폴더와 `root` 어느 쪽 기준으로 풀어도 범위 안이어야 한다.
+- Read 는 그 세션의 라이브 판 사본도 받는다. 사본 폴더는 훅 입력의 `transcript_path` 옆 `<세션 ID>/tool-results/` 로 정하고, 그 폴더 바로 아래에서 이름이 `artifact-` 로 시작하는 파일만 통과시킨다. 다른 세션의 사본과 하위 폴더, 밖을 가리키는 링크는 막는다. 사본을 발행 경로로 쓰는 것도 막는다.
 - Artifact 는 publish 와 read 만 쓴다. force 와 capabilities, read 의 out_dir 도 막는다.
 - inbox 가 링크로 바뀌어 있으면 아무 파일도 통과시키지 않는다.
 
@@ -83,3 +86,5 @@ Aside Browser 에 로그인되지 않은 사이트는 세션이 비밀번호를 
 [2] 2026-11-02, tmux 3.8. tmux 서버가 없는 상태에서 claude 세션의 Bash 로 `acm publisher check` 를 불렀다. 발행 세션은 자기 세션 ID 와 소켓으로 따로 등록됐지만, 프로세스 환경에는 부른 세션의 `CLAUDE_CODE_SESSION_ID` 와 `CLAUDE_CODE_MESSAGING_SOCKET`, `CLAUDE_CODE_CHILD_SESSION=1`, `CLAUDECODE=1` 이 남아 있었다. 고친 뒤 같은 방법으로 띄우면 `ACM_ACCOUNT` 와 `ACM_LABEL`, `ACM_ROLE` 만 남는다.
 
 [3] 2026-11-02, Claude Code 2.1.316. `--restricted` 로 띄운 haiku 세션은 작업 폴더 밖 파일의 Read 와 Artifact publish 를 모두 막았다. 하지만 세션 기록에 `messagingSocketPath` 가 없어 ListAgents 에 보이지 않았고, SendMessage 도 닿지 않았다. 같은 명령에서 `--restricted` 만 빼면 소켓이 생겼다. 훅을 붙인 발행 세션은 inbox 파일을 읽었고, `~/.acm/accounts.json` 은 범위 밖이라며 호출하지 않았다. 그 세션의 훅 명령에 같은 입력을 넣으면 `accounts.json` 은 종료 코드 2 로 막혔다.
+
+[4] 2026-11-03, Claude Code 2.1.316. 발행 세션이 기존 덱을 갱신하려 하자 Artifact 도구는 라이브 판을 본 적이 없다며 발행을 거절했다. 같은 응답이 라이브 판 전체를 `~/.claude/projects/<작업 폴더>/<세션 ID>/tool-results/artifact-<id>-<판>.html` 에 저장했다고 알렸지만, 훅이 그 파일의 Read 를 inbox 밖이라며 막았다. 같은 판에서 PreToolUse 훅 입력에는 `transcript_path` 가 `<세션 ID>.jsonl` 경로로 들어왔다. 고친 훅에 막혔던 입력을 다시 넣으면 종료 코드 0 으로 통과하고, 다른 세션의 기록 경로를 넣으면 2 로 막힌다.
