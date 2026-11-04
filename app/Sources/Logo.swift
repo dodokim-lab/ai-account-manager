@@ -11,7 +11,7 @@ struct ToolLogo: View {
         if let icon = ToolIcon.image(tool) {
             Image(nsImage: icon).resizable().interpolation(.high).frame(width: size, height: size)
         } else {
-            Text(tool == "codex" ? ">_" : "✳︎")
+            Text(tool == "codex" ? ">_" : tool == "antigravity" ? "A" : "✳︎")
                 .font(.system(size: size * 0.5, weight: .bold, design: .monospaced))
                 .foregroundStyle(.white)
                 .frame(width: size, height: size)

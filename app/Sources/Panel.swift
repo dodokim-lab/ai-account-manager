@@ -24,6 +24,11 @@ struct PanelView: View {
                         ForEach(snap.accounts(of: tool)) { AccountCard(account: $0, showsFiveHour: snap.showsFiveHour(of: tool)) }
                     }
                 }
+                if let agy = snap.antigravity, !agy.groups.isEmpty {
+                    ToolGroup(tool: "antigravity", next: nil, widget: nil, lastInWidget: false) {
+                        AntigravityCard(usage: agy)
+                    }
+                }
                 Divider()
                 sessions(snap)
                 Divider()
@@ -234,16 +239,43 @@ struct AccountCard: View {
     }
 }
 
+// Antigravity usage. agy holds one account, so there is no email, session count, or pick
+struct AntigravityCard: View {
+    let usage: Snapshot.Antigravity
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Usage only · acm does not start or pick it").font(.caption).foregroundStyle(.secondary)
+            ForEach(usage.groups) { group in
+                UsageBar(title: group.name, window: group.window, titleWidth: 92)
+            }
+            HStack(spacing: 4) {
+                if let at = usage.updatedAt {
+                    Text("\(Fmt.duration(Date().timeIntervalSince1970 - at)) ago · agy")
+                }
+                if let note = usage.pollNote {
+                    Text("· \(note)").foregroundStyle(.orange)
+                }
+            }
+            .font(.caption2).foregroundStyle(.secondary)
+        }
+        .padding(8)
+        .background(RoundedRectangle(cornerRadius: 8).fill(.quaternary.opacity(0.5)))
+    }
+}
+
 struct UsageBar: View {
     static let ultra = "No limit · verified Ultra account"
     let title: String
     // nil means the account has no limit for this window (the 5h of a verified Ultra account)
     let window: Snapshot.Window?
     var empty = UsageBar.ultra
+    // Antigravity group names such as "Claude and GPT" need more room than 5h or Week
+    var titleWidth: CGFloat = 42
 
     var body: some View {
         HStack(spacing: 6) {
-            Text(title).font(.caption).lineLimit(1).frame(width: 42, alignment: .leading)
+            Text(title).font(.caption).lineLimit(1).frame(width: titleWidth, alignment: .leading)
             if let window {
                 GaugeBar(pct: window.pct, height: 8)
                 Text("\(Fmt.whole(window.pct, limit: 999))%")

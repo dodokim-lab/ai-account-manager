@@ -13,6 +13,7 @@ import glob
 import json
 import os
 import re
+import selectors
 import shlex
 import shutil
 import signal
@@ -606,21 +607,24 @@ def due_accounts(data, now, names=None, force=False):
 
 
 def run_poll(data, names=None, force=False):
-    """Claim the accounts due for a poll and read them with /usage. Waits until done and returns the claimed accounts."""
+    """Claim the accounts due for a poll and read them with /usage. Waits until done and returns the claimed accounts.
+    Without names, Antigravity usage is read too when it is due."""
     os.makedirs(POLL_DIR, exist_ok=True)
     now = time.time()
     with open(LOCK_FILE, "w") as lock:
         # Claim the share first so concurrent acm runs do not poll the same account twice
         fcntl.flock(lock, fcntl.LOCK_EX)
         due = due_accounts(data, now, names, force)
-        for name in due:
-            path = os.path.join(POLL_DIR, f"{name}.json")
+        paths = [os.path.join(POLL_DIR, f"{name}.json") for name in due]
+        agy = names is None and agy_due(now, force)
+        for path in paths + ([AGY_POLL] if agy else []):
             state = read_json(path) or {}
             state["next_at"] = now + POLL_CLAIM
             save_json(path, state)
-    if due:
-        with ThreadPoolExecutor(max_workers=len(due)) as pool:
-            list(pool.map(lambda n: poll_account(n, data["accounts"][n]), due))
+    jobs = [lambda n=n: poll_account(n, data["accounts"][n]) for n in due] + ([poll_agy] if agy else [])
+    if jobs:
+        with ThreadPoolExecutor(max_workers=len(jobs)) as pool:
+            list(pool.map(lambda job: job(), jobs))
     return due
 
 
@@ -629,7 +633,8 @@ def refresh_usage(data, wait=False, names=None):
     Accounts without a session do not gain usage, so a pick at launch may use values a few minutes old."""
     if wait:
         return run_poll(data, names)
-    if not due_accounts(data, time.time(), names):
+    now = time.time()
+    if not due_accounts(data, now, names) and not (names is None and agy_due(now)):
         return []
     try:
         subprocess.Popen([sys.executable, os.path.abspath(__file__), "poll", "--quiet"], cwd=STATE_DIR,
@@ -654,10 +659,18 @@ def poll_note(name):
 def cmd_poll(data, args):
     """Read the accounts due for a poll with /usage now. --force reads all of them regardless of timing."""
     remember_emails(data)
+    started = time.time()
     done = run_poll(data, force="--force" in args)
     if "--quiet" in args:
         return
     data = load_accounts()
+    agy = read_json(AGY_POLL) or {}
+    agy_done = max(number(agy.get("ok_at")) or 0, number(agy.get("fail_at")) or 0) >= int(started)
+    if agy_done:
+        snap = agy_snapshot(time.time())
+        print("Antigravity: " + (agy.get("note") or " · ".join(f"{g['name']} {g['pct']:.0f}%" for g in (snap or {}).get("groups", []))))
+    if not done and agy_done:
+        return
     if not done:
         print(f"No account is due for a poll (polled every {POLL_INTERVAL:.0f}s. To poll all now: acm poll --force)")
         return
@@ -687,6 +700,21 @@ def codex_bin():
         if os.access(cand, os.X_OK):
             return cand
     return "codex"
+
+
+def stop_group(p):
+    """End a process started with start_new_session and every child it started. The group id is the pid.
+    A process that already exited is still waited for, so it does not stay behind as a zombie."""
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(p.pid, sig)
+        except OSError:
+            pass
+        try:
+            p.wait(5)
+            break
+        except subprocess.TimeoutExpired:
+            continue
 
 
 def codex_rpc(acc, requests, timeout=CODEX_RPC_TIMEOUT):
@@ -748,17 +776,8 @@ def codex_rpc(acc, requests, timeout=CODEX_RPC_TIMEOUT):
             p.stdin.close()
         except OSError:
             pass
-        # Kill the whole group, including children app-server started (such as git fetching the plugin list). With start_new_session the group id is the pid
-        for sig in (signal.SIGTERM, signal.SIGKILL):
-            try:
-                os.killpg(p.pid, sig)
-            except OSError:
-                break
-            try:
-                p.wait(5)
-                break
-            except subprocess.TimeoutExpired:
-                continue
+        # Kill the whole group, including children app-server started (such as git fetching the plugin list)
+        stop_group(p)
 
 
 def window_name(minutes):
@@ -879,6 +898,155 @@ def codex_session_account(data, env):
         if (home is None and config_dir(acc) is None) or (real and os.path.realpath(codex_home(acc)) == real):
             return name
     return None
+
+
+# ---------- Antigravity usage ----------
+# The Antigravity CLI agy keeps only one account, so acm shows its usage and never starts or picks it.
+# `agy -p /usage --output-format json` lists groups of models that share a weekly limit, each with remaining_fraction and reset_time.
+# No model is called (0 tokens), and it took about 7 seconds on 1.4.12. Signed out, agy prints a sign-in URL, opens it with
+# open or xdg-open found on PATH, and waits. So the poll puts no-op versions of those first on PATH and stops at the sign-in message.
+
+AGY_ARGS = ["-p", "/usage", "--output-format", "json"]
+AGY_POLL = os.path.join(POLL_DIR, "agy.json")
+AGY_SHIM_DIR = os.path.join(STATE_DIR, "agy-shim")
+AGY_SIGN_IN = b"Authentication required"
+AGY_SIGNED_OUT = "agy is signed out. Run agy once to sign in"
+# A signed-out agy stays that way until the user signs in, so try again only every 6 hours
+AGY_SIGNED_OUT_RETRY = 6 * 3600.0
+
+
+def agy_bin():
+    """The agy executable, or None if it is not installed."""
+    found = shutil.which("agy")
+    if found:
+        return found
+    for cand in ("/opt/homebrew/bin/agy", "/usr/local/bin/agy", os.path.join(HOME, ".local", "bin", "agy")):
+        if os.access(cand, os.X_OK):
+            return cand
+    return None
+
+
+def agy_shim():
+    """Folder holding open and xdg-open that do nothing, so a background poll never opens agy's sign-in page in the browser."""
+    os.makedirs(AGY_SHIM_DIR, exist_ok=True)
+    for name in ("open", "xdg-open"):
+        path = os.path.join(AGY_SHIM_DIR, name)
+        if not os.path.exists(path):
+            with open(path, "w") as f:
+                f.write("#!/bin/sh\nexit 0\n")
+            os.chmod(path, 0o755)
+    return AGY_SHIM_DIR
+
+
+def parse_iso(text):
+    """Epoch seconds from an ISO 8601 time such as 2026-11-11T01:28:42Z. None if it cannot be read."""
+    if not isinstance(text, str):
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def agy_group_name(name, window):
+    """Short group name. "Gemini Models" becomes Gemini. A window other than weekly is added to the name."""
+    short = re.sub(r"\s+models$", "", str(name or "?").strip(), flags=re.I) or "?"
+    return short if window in (None, "weekly") else f"{short} {window}"
+
+
+def parse_agy_usage(out, at):
+    """Usage record from the agy /usage JSON. None if it has no bucket with a remaining fraction."""
+    try:
+        data = (json.loads(out).get("command") or {}).get("data") or {}
+    except (ValueError, AttributeError):
+        return None
+    groups = []
+    for g in data.get("groups") or [] if isinstance(data, dict) else []:
+        if not isinstance(g, dict):
+            continue
+        for b in g.get("buckets") or []:
+            left = number(b.get("remaining_fraction")) if isinstance(b, dict) else None
+            if left is None:
+                continue
+            groups.append({"name": agy_group_name(g.get("name"), b.get("window")),
+                           "used_percentage": round((1 - left) * 100, 1), "resets_at": parse_iso(b.get("reset_time")), "at": at})
+    return {"updated_at": at, "groups": groups} if groups else None
+
+
+def run_agy():
+    """(output, failure reason). Runs agy /usage once and stops it as soon as it asks to sign in."""
+    binary = agy_bin()
+    if binary is None:
+        return b"", "agy not found"
+    env = detached_env()
+    env.update(ACM_ROLE="poll", BROWSER="true", PATH=agy_shim() + os.pathsep + env.get("PATH", "/usr/bin:/bin"))
+    try:
+        p = subprocess.Popen([binary] + AGY_ARGS, cwd=STATE_DIR, env=env, stdin=subprocess.DEVNULL,
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
+    except OSError:
+        return b"", "could not start agy"
+    out, why = b"", None
+    deadline = time.time() + POLL_TIMEOUT
+    try:
+        with selectors.DefaultSelector() as sel:
+            sel.register(p.stdout, selectors.EVENT_READ)
+            while True:
+                left = deadline - time.time()
+                if left <= 0:
+                    why = "agy /usage did not respond"
+                    break
+                if not sel.select(left):
+                    continue
+                chunk = os.read(p.stdout.fileno(), 65536)
+                if not chunk:
+                    break
+                out += chunk
+                if AGY_SIGN_IN in out:
+                    why = AGY_SIGNED_OUT
+                    break
+    finally:
+        stop_group(p)
+        p.stdout.close()
+    return out, why
+
+
+def agy_due(now, force=False):
+    """Whether agy is installed and due for a poll."""
+    if agy_bin() is None:
+        return False
+    return force or now >= ((read_json(AGY_POLL) or {}).get("next_at") or 0)
+
+
+def poll_agy():
+    """Read agy usage once and keep the result in the poll state."""
+    state = read_json(AGY_POLL) or {}
+    out, why = run_agy()
+    now = time.time()
+    rec = None if why else parse_agy_usage(out, int(now))
+    if rec is None and not why:
+        first = next((line.strip() for line in out.decode(errors="replace").splitlines() if line.strip()), "") or "no output"
+        why = f"could not read agy /usage: {first[:120]}"
+    if why:
+        backoff = min(POLL_FAIL_MAX, max(POLL_FAIL_MIN, (state.get("backoff") or POLL_INTERVAL) * 1.5))
+        wait = AGY_SIGNED_OUT_RETRY if why == AGY_SIGNED_OUT else backoff
+        state.update(next_at=now + wait, backoff=backoff, note=why, fail_at=int(now))
+    else:
+        state.update(usage=rec, next_at=now + POLL_INTERVAL, backoff=POLL_INTERVAL, note=None, ok_at=int(now))
+        state.pop("fail_at", None)
+    save_json(AGY_POLL, state)
+
+
+def agy_snapshot(now):
+    """Antigravity usage for acm status. None if agy is not installed or its usage was never read."""
+    if agy_bin() is None:
+        return None
+    state = read_json(AGY_POLL) or {}
+    rec = state.get("usage") if isinstance(state.get("usage"), dict) else None
+    if not rec:
+        return None
+    groups = [{"name": g.get("name") or "?", "pct": window_pct(g, now), "resets_at": window_reset(g, now)}
+              for g in rec.get("groups") or [] if isinstance(g, dict)]
+    return {"groups": groups, "updated_at": rec.get("updated_at"), "poll_note": state.get("note")}
 
 
 # ---------- running sessions ----------
@@ -1083,7 +1251,8 @@ def status_snapshot(data):
             next_by_tool[tool] = None
     return {"generated_at": int(now), "mode": data.get("mode", "usage"), "model": model, "tools": tools,
             "next": next_by_tool.get("claude"), "next_by_tool": next_by_tool, "accounts": accounts, "sessions": sessions,
-            "reserve": {"five_hour_cap": RESERVE_FIVE_HOUR_CAP, "seven_day_cap": RESERVE_SEVEN_DAY_CAP}}
+            "reserve": {"five_hour_cap": RESERVE_FIVE_HOUR_CAP, "seven_day_cap": RESERVE_SEVEN_DAY_CAP},
+            "antigravity": agy_snapshot(now)}
 
 
 def pid_alive(pid):
@@ -1750,11 +1919,14 @@ def cmd_status(data, args):
     now = snap["generated_at"]
     groups = [(t, [a for a in snap["accounts"] if a["tool"] == t]) for t in TOOLS]
     groups = [(t, rows) for t, rows in groups if rows]
+    agy = snap["antigravity"]
     notes = []
     for i, (tool, rows) in enumerate(groups):
-        if len(groups) > 1:
+        if len(groups) > 1 or agy:
             print(("\n" if i else "") + f"[{TOOL_NAMES[tool]}]")
         (status_claude if tool == "claude" else status_codex)(data, snap, rows, now, notes)
+    if agy:
+        status_antigravity(agy, now, notes)
     if notes:
         print("\n" + "\n".join(notes))
     unknown = sum(1 for x in snap["sessions"] if not x["account"])
@@ -1775,6 +1947,17 @@ def cmd_status(data, args):
         print(f"\nSelection mode: {snap['mode']}  (next pick: {nxt['label'] + ' · ' + nxt['why'] if nxt else '-'})")
     if snap["model"] and "claude" in picks:
         print(f"Per-model weekly limits are compared for {snap['model']} (guessed from settings or the last session)")
+
+
+def status_antigravity(agy, now, notes):
+    """Antigravity usage. agy holds one account, so there is no account column and no pick."""
+    print("\n[Antigravity] usage only. acm does not start or pick it")
+    print(f"{'GROUP':<20} {'WEEK':>5} {'WEEK RESET':>12}  UPDATED")
+    age = f"{int((now - agy['updated_at']) // 60)}m ago (agy)" if agy["updated_at"] else "-"
+    for i, g in enumerate(agy["groups"]):
+        print(f"{g['name']:<20} {g['pct']:>4.0f}% {fmt_reset(g['resets_at']):>12}  {age if i == 0 else ''}".rstrip())
+    if agy["poll_note"]:
+        notes.append(f"  Antigravity: usage poll: {agy['poll_note']}")
 
 
 def status_age(a, now):
@@ -3538,6 +3721,22 @@ def doctor_usage(run, data):
         u = account_usage(name, now)
         scoped = "".join(f" · {s['short']} {s['pct']:.0f}%" for s in u["scoped"])
         run.ok(f"{label}: read with {'codex app-server' if codex else '/usage'} ({fmt_u(u)}{scoped})")
+    doctor_agy(run)
+
+
+def doctor_agy(run):
+    """Antigravity is only shown, so it is checked only when agy is installed."""
+    if agy_bin() is None:
+        return
+    poll_agy()
+    note = (read_json(AGY_POLL) or {}).get("note")
+    if note == AGY_SIGNED_OUT:
+        run.skip(f"Antigravity: {note}")
+    elif note:
+        run.left(f"Antigravity: {note}. If the format changed, fix parse_agy_usage")
+    else:
+        groups = (agy_snapshot(time.time()) or {}).get("groups", [])
+        run.ok("Antigravity: read with agy -p /usage (" + " · ".join(f"{g['name']} {g['pct']:.0f}%" for g in groups) + ")")
 
 
 def doctor_statusline(run, data, sessions):
@@ -3637,7 +3836,7 @@ def cmd_doctor(data, args):
     sessions = [x for x in running_sessions(data, with_cwd=False) if x.get("tool", "claude") == "claude"]
     ver = claude_version()
     print(f"Checking the Claude Code {ver or '?'} internals acm {VERSION} relies on (last verified version {VERIFIED_CLAUDE})")
-    for title, step in (("Usage polling (claude -p /usage, codex app-server)", lambda: doctor_usage(run, data)),
+    for title, step in (("Usage polling (claude -p /usage, codex app-server, agy -p /usage)", lambda: doctor_usage(run, data)),
                         ("statusline", lambda: doctor_statusline(run, data, sessions)),
                         ("Session list", lambda: doctor_sessions(run, data, sessions)),
                         ("Account folders", lambda: doctor_accounts(run, data)),
@@ -3700,9 +3899,11 @@ Starting sessions
   <account> can be the id (cl2), display name, email, or email local part.
 
 Status
-  acm status [--json]              Plan, 5h, Week, and per-model weekly usage and resets per account, and running session count
+  acm status [--json]              Plan, 5h, Week, and per-model weekly usage and resets per account, and running session count.
+                                   Also Antigravity weekly usage per model group when agy is installed
   acm pick [codex] [--model <model>]  Only show which account a launch would pick now
-  acm poll [--force]               Read usage now. Claude uses claude -p /usage, Codex uses codex app-server (normally every 5 minutes in the background)
+  acm poll [--force]               Read usage now. Claude uses claude -p /usage, Codex uses codex app-server, Antigravity uses agy -p /usage
+                                   (normally every 5 minutes in the background)
 
 Accounts
   acm add <id>                     Add a Claude account (creates ~/.claude-<id>)

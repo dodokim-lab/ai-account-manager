@@ -83,6 +83,22 @@ struct Snapshot: Decodable {
         let why: String
     }
 
+    // Antigravity usage. agy holds one account, so acm only shows it. Each group of models shares a weekly limit
+    struct Antigravity: Decodable {
+        struct Group: Decodable, Identifiable {
+            let name: String
+            let pct: Double
+            let resetsAt: Double?
+
+            var id: String { name }
+            var window: Window { Window(pct: pct, resetsAt: resetsAt) }
+        }
+
+        let groups: [Group]
+        let updatedAt: Double?
+        let pollNote: String?
+    }
+
     let generatedAt: Double
     let mode: String
     // The next pick for Claude. The next pick for each tool is in nextByTool
@@ -92,6 +108,8 @@ struct Snapshot: Decodable {
     // Tools that have accounts. Older acm versions do not send it
     let tools: [String]?
     let nextByTool: [String: Next?]?
+    // nil when agy is not installed or its usage was never read. Older acm versions do not send it
+    let antigravity: Antigravity?
 
     var toolList: [String] { tools ?? ["claude"] }
 
@@ -126,12 +144,16 @@ struct Snapshot: Decodable {
 
 enum Tools {
     static func name(_ tool: String) -> String {
-        ["claude": "Claude", "codex": "Codex"][tool] ?? tool.capitalized
+        ["claude": "Claude", "codex": "Codex", "antigravity": "Antigravity"][tool] ?? tool.capitalized
     }
 
     // Border color of a tool group in the menu bar window. Claude uses the same orange as the acm logo
     static func color(_ tool: String) -> Color {
-        tool == "codex" ? Color(red: 0.29, green: 0.53, blue: 0.96) : Color(red: 0xD9 / 255, green: 0x77 / 255, blue: 0x57 / 255)
+        switch tool {
+        case "codex": Color(red: 0.29, green: 0.53, blue: 0.96)
+        case "antigravity": Color(red: 0.40, green: 0.62, blue: 0.36)
+        default: Color(red: 0xD9 / 255, green: 0x77 / 255, blue: 0x57 / 255)
+        }
     }
 
     static func loginHint(_ account: Snapshot.Account) -> String {

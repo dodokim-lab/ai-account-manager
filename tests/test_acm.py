@@ -67,6 +67,8 @@ class AcmCase(unittest.TestCase):
         self.acm.running_sessions = lambda data, with_cwd=True: self.sessions
         self.acm.registered_pids = lambda name: set()
         self.acm.claude_pids = lambda: []
+        # The real agy may be installed on this machine. Tests that need it put a fake one in place
+        self.acm.agy_bin = lambda: None
         self.cwd = os.getcwd()
         os.chdir(self.home)
 
@@ -1687,6 +1689,131 @@ class Codex(AcmCase):
                        text=True, env=env, capture_output=True, check=True)
         self.assertTrue(os.path.exists(os.path.join(self.acm.USAGE_DIR, "cl1.json")))
         self.assertFalse(os.path.exists(os.path.join(self.acm.USAGE_DIR, "cx1.json")))
+
+
+AGY_USAGE = {"conversation_id": "", "status": "SUCCESS", "response": "", "command": {"name": "usage", "data": {"groups": [
+    {"name": "Gemini Models", "buckets": [
+        {"id": "gemini-weekly", "window": "weekly", "remaining_fraction": 0.75, "reset_time": "2033-05-18T03:33:20Z"}]},
+    {"name": "Claude and GPT models", "buckets": [
+        {"id": "3p-weekly", "window": "weekly", "remaining_fraction": 1, "reset_time": "2033-05-18T03:33:20Z"}]}]}}}
+
+# Fake agy. ~/agy-mode picks what it does: ok prints the usage JSON, signed-out opens a sign-in URL and waits like agy 1.4.12
+FAKE_AGY = r"""#!%(python)s
+import json, os, subprocess, sys, time
+if sys.argv[1:] != ["-p", "/usage", "--output-format", "json"]:
+    sys.exit(2)
+mode = open(os.path.join(os.environ["HOME"], "agy-mode")).read().strip()
+if mode == "ok":
+    print(json.dumps(%(usage)s))
+elif mode == "signed-out":
+    subprocess.run(["open", "https://accounts.example.test/auth"])
+    print("Authentication required. Please visit the URL to log in:", flush=True)
+    time.sleep(30)
+else:
+    print("something else")
+"""
+
+
+class Antigravity(AcmCase):
+    """agy usage is only shown. It is read with agy -p /usage and never touches accounts or picks."""
+
+    def setUp(self):
+        super().setUp()
+        bindir = os.path.join(self.tmp, "bin")
+        os.makedirs(bindir)
+        self.agy = os.path.join(bindir, "agy")
+        with open(self.agy, "w") as f:
+            f.write(FAKE_AGY % {"python": sys.executable, "usage": repr(AGY_USAGE)})
+        os.chmod(self.agy, 0o755)
+        # An open that leaves a mark, found on PATH after the no-op one acm puts first
+        self.opened = os.path.join(self.tmp, "opened")
+        with open(os.path.join(bindir, "open"), "w") as f:
+            f.write(f"#!/bin/sh\necho \"$@\" >> {shlex.quote(self.opened)}\n")
+        os.chmod(os.path.join(bindir, "open"), 0o755)
+        os.environ["PATH"] = bindir + os.pathsep + os.environ.get("PATH", "")
+        self.acm.agy_bin = lambda: self.agy
+        self.acm.refresh_usage = lambda *a, **k: []
+        # Claude accounts are polled in the same run. Keep the real claude out of it
+        self.acm.poll_account = lambda name, acc: None
+
+    def mode(self, mode):
+        with open(os.path.join(self.home, "agy-mode"), "w") as f:
+            f.write(mode)
+
+    def test_parse_groups(self):
+        rec = self.acm.parse_agy_usage(json.dumps(AGY_USAGE).encode(), 100)
+        self.assertEqual(rec["groups"], [
+            {"name": "Gemini", "used_percentage": 25.0, "resets_at": 2000000000.0, "at": 100},
+            {"name": "Claude and GPT", "used_percentage": 0.0, "resets_at": 2000000000.0, "at": 100}])
+        self.assertIsNone(self.acm.parse_agy_usage(b'{"command": {"data": {"groups": []}}}', 100))
+        self.assertIsNone(self.acm.parse_agy_usage(b"not json", 100))
+        self.assertEqual(self.acm.agy_group_name("Gemini Models", "daily"), "Gemini daily")
+
+    def test_poll_shows_in_status(self):
+        self.accounts(["cl1"])
+        self.mode("ok")
+        self.acm.run_poll(self.acm.load_accounts())
+        snap = self.acm.status_snapshot(self.acm.load_accounts())
+        agy = snap["antigravity"]
+        self.assertEqual([(g["name"], g["pct"]) for g in agy["groups"]], [("Gemini", 25.0), ("Claude and GPT", 0.0)])
+        self.assertIsNone(agy["poll_note"])
+        self.assertEqual(snap["tools"], ["claude"])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.acm.cmd_status(self.acm.load_accounts(), [])
+        text = out.getvalue()
+        self.assertIn("[Claude]", text)
+        self.assertIn("[Antigravity] usage only", text)
+        self.assertRegex(text, r"Gemini\s+25%")
+
+    def test_signed_out_stops_early_and_opens_nothing(self):
+        self.mode("signed-out")
+        started = time.time()
+        self.acm.poll_agy()
+        self.assertLess(time.time() - started, 15)
+        self.assertFalse(os.path.exists(self.opened))
+        state = self.acm.read_json(self.acm.AGY_POLL)
+        self.assertEqual(state["note"], self.acm.AGY_SIGNED_OUT)
+        self.assertGreater(state["next_at"], time.time() + 5 * 3600)
+        # Never read, so status shows nothing for Antigravity
+        self.assertIsNone(self.acm.agy_snapshot(time.time()))
+
+    def test_failure_after_success_keeps_values_with_note(self):
+        self.mode("ok")
+        self.acm.poll_agy()
+        self.mode("garbage")
+        self.acm.poll_agy()
+        agy = self.acm.agy_snapshot(time.time())
+        self.assertEqual(agy["groups"][0]["pct"], 25.0)
+        self.assertIn("could not read agy /usage: something else", agy["poll_note"])
+
+    def test_passed_reset_reads_zero(self):
+        self.acm.save_json(self.acm.AGY_POLL, {"usage": {"updated_at": 1, "groups": [
+            {"name": "Gemini", "used_percentage": 80.0, "resets_at": time.time() - 10, "at": 1}]}})
+        g = self.acm.agy_snapshot(time.time())["groups"][0]
+        self.assertEqual((g["pct"], g["resets_at"]), (0.0, None))
+
+    def test_polls_for_named_accounts_skip_agy(self):
+        self.accounts(["cl1"])
+        self.mode("ok")
+        self.acm.run_poll(self.acm.load_accounts(), names=["cl1"], force=True)
+        self.assertIsNone(self.acm.read_json(self.acm.AGY_POLL))
+
+    def test_doctor_reports_agy(self):
+        for mode, mark in (("ok", "Antigravity: read with agy -p /usage (Gemini 25% · Claude and GPT 0%)"),
+                           ("signed-out", "  - Antigravity: agy is signed out"), ("garbage", "fix parse_agy_usage")):
+            self.mode(mode)
+            run = self.acm.SetupRun("check")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.acm.doctor_agy(run)
+            self.assertIn(mark, out.getvalue())
+            self.assertEqual(len(run.todo), 1 if mode == "garbage" else 0)
+
+    def test_missing_agy_is_never_polled(self):
+        self.acm.agy_bin = lambda: None
+        self.assertFalse(self.acm.agy_due(time.time(), force=True))
+        self.assertIsNone(self.acm.agy_snapshot(time.time()))
 
 
 if __name__ == "__main__":
