@@ -33,7 +33,7 @@ except ImportError:  # pragma: no cover - available since Python 3.9
 
 VERSION = "0.3.0"
 # The Claude Code version whose internals acm was last checked against. acm doctor and acm version show it next to the current version
-VERIFIED_CLAUDE = "2.1.316"
+VERIFIED_CLAUDE = "2.1.318"
 
 HOME = os.path.expanduser("~")
 # acm runs on macOS and Linux. Linux reads process details from /proc and keeps app settings under ~/.config
@@ -58,14 +58,19 @@ PER_ACCOUNT = {
     ".claude.json",
     ".credentials.json",
     "backups",  # .claude.json backups
-    "daemon",  # background agent daemon (includes auth)
-    "daemon-auth-cooldown",
-    "daemon-auth-status.json",
-    "daemon.log",
     "jobs",  # background sessions managed by the daemon
     "telemetry",
     "statsig",
 }
+# Each account runs its own background agent daemon, and its files such as daemon.lock and daemon.status.json point to that
+# account's pid and auth. Linking them would make another account's session use that daemon. Claude Code adds new daemon files
+# without notice (2.1.318 added daemon.lock and daemon.status.json), so everything named daemon* stays per account
+PER_ACCOUNT_PREFIXES = (".claude.json", "daemon")
+
+
+def per_account(entry):
+    """Whether an entry of ~/.claude stays a real file in each account folder instead of a link."""
+    return entry in PER_ACCOUNT or entry.startswith(PER_ACCOUNT_PREFIXES)
 
 # Tools acm manages. Each account has a tool, claude if unset. Picks happen only among accounts of the same tool
 TOOLS = ("claude", "codex")
@@ -1630,7 +1635,7 @@ def sync_links(name, acc, fix=False):
     os.makedirs(d, mode=0o700, exist_ok=True)
     problems = []
     for entry in sorted(os.listdir(SHARED)):
-        if entry in PER_ACCOUNT or entry.startswith(".claude.json"):
+        if per_account(entry):
             continue
         src = os.path.join(SHARED, entry)
         dst = os.path.join(d, entry)
@@ -3822,7 +3827,7 @@ def doctor_accounts(run, data):
         entries = os.listdir(SHARED)
     except OSError:
         entries = []
-    suspects = [e for e in entries if e not in PER_ACCOUNT and not e.startswith(".claude.json")
+    suspects = [e for e in entries if not per_account(e)
                 and not os.path.islink(os.path.join(SHARED, e)) and any(h in e.lower() for h in ACCOUNT_HINTS)]
     for e in suspects:
         run.left(f"~/.claude/{e} may need to stay per account. If so, add it to PER_ACCOUNT")

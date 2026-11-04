@@ -445,6 +445,19 @@ class SharedFolders(AcmCase):
         self.assertTrue(any("and linked it" in p for p in problems))
         self.assertEqual(self.acm.relocate_shared(), [])
 
+    def test_daemon_files_stay_per_account(self):
+        # Claude Code 2.1.318 writes daemon.lock and daemon.status.json with the pid of each account's daemon
+        self.accounts(["cl1", "cl2"])
+        shared = os.path.join(self.home, ".claude")
+        for entry in ("daemon.lock", "daemon.status.json", "daemon.json", "settings.json"):
+            with open(os.path.join(shared, entry), "w") as f:
+                f.write("{}")
+        cl2 = {"dir": os.path.join(self.home, ".claude-cl2")}
+        self.assertEqual(self.acm.sync_links("cl2", cl2), [])
+        for entry in ("daemon.lock", "daemon.status.json", "daemon.json"):
+            self.assertFalse(os.path.lexists(os.path.join(cl2["dir"], entry)), entry)
+        self.assertTrue(os.path.islink(os.path.join(cl2["dir"], "settings.json")))
+
 
 class StatuslineInstall(AcmCase):
     """The original statusline command stays as the wrapper argument in settings.json, never in a separate unprotected file."""
