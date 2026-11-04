@@ -3,7 +3,22 @@ on: [push, pull_request]
 permissions:
   contents: read
 jobs:
-  # acm runs only on macOS for now. Add an ubuntu job once Linux is supported
+  # The CLI runs on Linux too. The menu bar app is macOS only, so this job skips its build
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5.1.0
+        with:
+          persist-credentials: false
+      - name: Shell script syntax
+        run: |
+          sh -n install.sh
+          sh -n bin/acm-statusline
+      - name: Python syntax
+        run: python3 -m py_compile bin/acm
+      - name: Unit tests
+        run: python3 -m unittest discover -s tests
   macos:
     runs-on: macos-latest
     timeout-minutes: 20

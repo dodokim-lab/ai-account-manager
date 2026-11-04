@@ -1041,7 +1041,9 @@ class Processes(AcmCase):
         finally:
             child.kill()
             child.wait()
-        if os.getuid() != 0:
+        # pid 1 belongs to root on a normal system. In a container it may be this user's own process
+        owner = subprocess.run(["ps", "-o", "uid=", "-p", "1"], capture_output=True, text=True).stdout.strip()
+        if owner and owner != str(os.getuid()):
             self.assertIsNone(self.acm.proc_env(1))
 
     def fresh_module(self):
@@ -1814,6 +1816,53 @@ class Antigravity(AcmCase):
         self.acm.agy_bin = lambda: None
         self.assertFalse(self.acm.agy_due(time.time(), force=True))
         self.assertIsNone(self.acm.agy_snapshot(time.time()))
+
+
+class Linux(AcmCase):
+    """Linux keeps editor settings under ~/.config, reads a session's folder from /proc, and uses .bashrc for bash."""
+
+    def test_bash_rc_differs_by_system(self):
+        os.environ["SHELL"] = "/bin/bash"
+        self.acm.LINUX = True
+        self.assertEqual(self.acm.shell_rc(), os.path.join(self.home, ".bashrc"))
+        self.acm.LINUX = False
+        self.assertEqual(self.acm.shell_rc(), os.path.join(self.home, ".bash_profile"))
+        os.environ["SHELL"] = "/bin/zsh"
+        self.assertEqual(self.acm.shell_rc(), os.path.join(self.home, ".zshrc"))
+
+    def test_jetbrains_plugins_live_under_local_share(self):
+        config = os.path.join(self.home, ".config", "JetBrains")
+        plugins = os.path.join(self.home, ".local", "share", "JetBrains")
+        self.acm.LINUX = True
+        self.acm.JETBRAINS_DIR, self.acm.JETBRAINS_PLUGINS_DIR = config, plugins
+        for name in ("IntelliJIdea2025.2", "IntelliJIdea2025.3", "PyCharm2025.3"):
+            os.makedirs(os.path.join(config, name, "options"))
+        # PyCharm has a config folder but no plugin, so it does not count
+        for name in ("IntelliJIdea2025.2", "IntelliJIdea2025.3"):
+            os.makedirs(os.path.join(plugins, name, self.acm.JETBRAINS_PLUGIN))
+        self.assertEqual(self.acm.jetbrains_configs(), [
+            ("IntelliJIdea2025.3", os.path.join(config, "IntelliJIdea2025.3", "options", self.acm.JETBRAINS_SETTINGS))])
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "reads /proc")
+    def test_session_folder_comes_from_proc(self):
+        folder = os.path.realpath(self.tmp)
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], cwd=folder)
+        try:
+            self.assertEqual(self.acm.session_cwds([child.pid]), {child.pid: folder})
+        finally:
+            child.kill()
+            child.wait()
+        self.assertEqual(self.acm.session_cwds([999999999]), {})
+
+    def test_settings_folder_follows_the_system(self):
+        if sys.platform.startswith("linux"):
+            expected = os.environ.get("XDG_CONFIG_HOME") or os.path.join(self.home, ".config")
+            self.assertIn("apt install tmux", self.acm.TMUX_INSTALL)
+        else:
+            expected = os.path.join(self.home, "Library", "Application Support")
+            self.assertEqual(self.acm.TMUX_INSTALL, "brew install tmux")
+        self.assertEqual((self.acm.APP_SUPPORT, self.acm.VSCODE_APP_SUPPORT), (expected, expected))
+        self.assertEqual(self.acm.JETBRAINS_DIR, os.path.join(expected, "JetBrains"))
 
 
 if __name__ == "__main__":

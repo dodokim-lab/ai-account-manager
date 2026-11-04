@@ -36,6 +36,13 @@ VERSION = "0.3.0"
 VERIFIED_CLAUDE = "2.1.316"
 
 HOME = os.path.expanduser("~")
+# acm runs on macOS and Linux. Linux reads process details from /proc and keeps app settings under ~/.config
+LINUX = sys.platform.startswith("linux")
+# Where editors keep their user settings. On Linux this follows XDG_CONFIG_HOME
+APP_SUPPORT = (os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config")) if LINUX \
+    else os.path.join(HOME, "Library", "Application Support")
+# How to install tmux, shown when it is missing. Installing system packages on Linux needs root, so acm only names the command
+TMUX_INSTALL = "sudo apt install tmux, or your distribution's package manager" if LINUX else "brew install tmux"
 SHARED = os.path.join(HOME, ".claude")
 DEFAULT_CLAUDE_JSON = os.path.join(HOME, ".claude.json")
 STATE_DIR = os.environ.get("ACM_HOME", os.path.join(HOME, ".acm"))
@@ -455,7 +462,7 @@ def claude_bin():
     if found:
         return found
     for cand in (os.path.join(HOME, ".local", "bin", "claude"), os.path.join(HOME, ".claude", "local", "claude"),
-                 "/opt/homebrew/bin/claude", "/usr/local/bin/claude"):
+                 "/opt/homebrew/bin/claude", "/usr/local/bin/claude", "/usr/bin/claude"):
         if os.access(cand, os.X_OK):
             return cand
     return "claude"
@@ -696,7 +703,7 @@ def codex_bin():
     found = shutil.which("codex")
     if found:
         return found
-    for cand in ("/opt/homebrew/bin/codex", "/usr/local/bin/codex", os.path.join(HOME, ".local", "bin", "codex")):
+    for cand in ("/opt/homebrew/bin/codex", "/usr/local/bin/codex", os.path.join(HOME, ".local", "bin", "codex"), "/usr/bin/codex"):
         if os.access(cand, os.X_OK):
             return cand
     return "codex"
@@ -920,7 +927,7 @@ def agy_bin():
     found = shutil.which("agy")
     if found:
         return found
-    for cand in ("/opt/homebrew/bin/agy", "/usr/local/bin/agy", os.path.join(HOME, ".local", "bin", "agy")):
+    for cand in ("/opt/homebrew/bin/agy", "/usr/local/bin/agy", os.path.join(HOME, ".local", "bin", "agy"), "/usr/bin/agy"):
         if os.access(cand, os.X_OK):
             return cand
     return None
@@ -1116,6 +1123,26 @@ def proc_info(pid):
     return [a.decode(errors="replace") for a in args if a], env
 
 
+def session_cwds(pids):
+    """{pid: working folder}. Linux reads the /proc link. macOS asks lsof, since it has no /proc."""
+    cwds = {}
+    if LINUX:
+        for pid in pids:
+            try:
+                cwds[pid] = os.readlink(f"/proc/{pid}/cwd")
+            except OSError:
+                pass
+        return cwds
+    current = None
+    # -b avoids kernel calls that can hang on unresponsive file systems such as network volumes
+    for line in quick_run(["lsof", "-b", "-a", "-d", "cwd", "-Fpn", "-p", ",".join(map(str, pids))]).splitlines():
+        if line.startswith("p"):
+            current = int(line[1:])
+        elif line.startswith("n") and current:
+            cwds[current] = line[1:]
+    return cwds
+
+
 def running_sessions(data, with_cwd=True):
     """Top-level claude and codex processes running on this Mac, with their account and working folder."""
     out = quick_run(["ps", "-axo", "pid=,ppid=,uid=,etime=,comm="])
@@ -1133,15 +1160,7 @@ def running_sessions(data, with_cwd=True):
     infos = {pid: proc_info(pid) for pid in pids}
     if not pids:
         return []
-    joined = ",".join(map(str, pids))
-    cwds, current = {}, None
-    # -b avoids kernel calls that can hang on unresponsive file systems such as network volumes
-    lsof = ["lsof", "-b", "-a", "-d", "cwd", "-Fpn", "-p", joined] if with_cwd else ["true"]
-    for line in quick_run(lsof).splitlines():
-        if line.startswith("p"):
-            current = int(line[1:])
-        elif line.startswith("n") and current:
-            cwds[current] = line[1:]
+    cwds = session_cwds(pids) if with_cwd else {}
 
     sessions = []
     for pid in sorted(pids, key=lambda p: parse_etime(procs[p][1])):
@@ -2263,7 +2282,7 @@ def publisher_running():
 def publisher_startable():
     """Only checks whether the publisher session can start. What starts it is acm publisher check, right before a publish is handed off."""
     if not shutil.which("tmux"):
-        info("The publisher session runs inside tmux. Install it with brew install tmux")
+        info(f"The publisher session runs inside tmux. Install it with {TMUX_INSTALL}")
         return False
     if not os.path.exists(PUBLISHER_ROLE):
         info(f"The publisher session's role file {PUBLISHER_ROLE} is missing, so it was not started. Run acm setup to write it, or write it yourself following 'The scope lives in ROLE.md' in docs/publisher.md")
@@ -2288,7 +2307,7 @@ def publisher_entry(data):
 
 def start_publisher(data, quiet=False, wait=False):
     if not shutil.which("tmux"):
-        die("The publisher session runs inside tmux. Install it with brew install tmux")
+        die(f"The publisher session runs inside tmux. Install it with {TMUX_INSTALL}")
     if publisher_running():
         if not quiet:
             print(f"The publisher session is already running (tmux attach -t {PUBLISHER_SESSION})")
@@ -3102,17 +3121,19 @@ RC_FUNC_MARK = "# acm: send claude typed in the terminal through acm"
 LEGACY_RC_PATH_MARK = "# acm: acm 명령 위치"
 LEGACY_RC_FUNC_MARK = "# acm: 터미널에서 친 claude 를 acm 으로 보낸다"
 RC_FUNC_LINE = 'if command -v acm >/dev/null 2>&1; then eval "$(acm shell-init)"; fi'
-JETBRAINS_DIR = os.path.join(HOME, "Library", "Application Support", "JetBrains")
+JETBRAINS_DIR = os.path.join(APP_SUPPORT, "JetBrains")
+# Plugins live in each config folder on macOS, and under ~/.local/share on Linux
+JETBRAINS_PLUGINS_DIR = os.path.join(HOME, ".local", "share", "JetBrains") if LINUX else JETBRAINS_DIR
 JETBRAINS_PLUGIN = "claude-code-jetbrains-plugin"
 JETBRAINS_SETTINGS = "claude-code-plugin-settings.xml"
 JETBRAINS_COMPONENT = "ClaudeCodePluginSettings"
 JETBRAINS_LAUNCHERS = ("idea", "pycharm", "webstorm", "goland", "datagrip", "rider", "clion", "phpstorm",
                        "rubymine", "rustrover", "aqua", "dataspell", "studio")
-# VS Code family editors. (name, settings folder under Application Support, extension folder under home)
+# VS Code family editors. (name, settings folder under APP_SUPPORT, extension folder under home)
 VSCODE_EDITORS = (("VS Code", "Code", ".vscode"), ("VS Code Insiders", "Code - Insiders", ".vscode-insiders"),
                   ("Cursor", "Cursor", ".cursor"), ("Windsurf", "Windsurf", ".windsurf"),
                   ("VSCodium", "VSCodium", ".vscode-oss"))
-VSCODE_APP_SUPPORT = os.path.join(HOME, "Library", "Application Support")
+VSCODE_APP_SUPPORT = APP_SUPPORT
 VSCODE_EXTENSION = "anthropic.claude-code-*"
 # Executable the extension uses to start Claude. The bundled claude path is passed as the first argument
 VSCODE_KEY = "claudeCode.claudeProcessWrapper"
@@ -3168,9 +3189,12 @@ class SetupRun:
 
 
 def shell_rc():
-    """The rc file the login shell reads. For bash it is .bash_profile, since macOS Terminal starts a login shell."""
+    """The rc file the shell reads. For bash it is .bash_profile on macOS, since Terminal starts a login shell,
+    and .bashrc on Linux, where terminals start a non-login shell."""
     shell = os.path.basename(os.environ.get("SHELL", "zsh"))
-    return os.path.join(HOME, ".bash_profile" if shell == "bash" else ".zshrc")
+    if shell == "bash":
+        return os.path.join(HOME, ".bashrc" if LINUX else ".bash_profile")
+    return os.path.join(HOME, ".zshrc")
 
 
 def read_text(path):
@@ -3210,7 +3234,7 @@ def setup_tmux(run):
         run.ok("tmux found (used only to run the publisher session in the background. Your terminal does not need to be tmux)")
         return
     if not shutil.which("brew"):
-        run.left("install tmux. Homebrew is missing, so install it yourself")
+        run.left(f"install tmux ({TMUX_INSTALL})" if LINUX else "install tmux. Homebrew is missing, so install it yourself")
         return
     if not run.ask("Install tmux with brew to run the publisher session in the background?"):
         run.left("brew install tmux")
@@ -3223,7 +3247,8 @@ def setup_tmux(run):
 
 def jetbrains_running():
     out = subprocess.run(["ps", "-axo", "comm="], capture_output=True, text=True).stdout
-    return any(".app/Contents/MacOS/" in line and os.path.basename(line.strip()) in JETBRAINS_LAUNCHERS
+    # macOS shows the full path inside the app bundle. Linux shows only the launcher name, such as idea
+    return any((LINUX or ".app/Contents/MacOS/" in line) and os.path.basename(line.strip()) in JETBRAINS_LAUNCHERS
                for line in out.splitlines())
 
 
@@ -3237,7 +3262,8 @@ def jetbrains_configs():
     latest = {}
     for name in names:
         d = os.path.join(JETBRAINS_DIR, name)
-        if not os.path.isdir(os.path.join(d, "plugins", JETBRAINS_PLUGIN)):
+        plugins = os.path.join(JETBRAINS_PLUGINS_DIR, name) if LINUX else os.path.join(d, "plugins")
+        if not os.path.isdir(os.path.join(plugins, JETBRAINS_PLUGIN)):
             continue
         product, version = name.rstrip("0123456789."), name[len(name.rstrip("0123456789.")):]
         key = tuple(int(x) for x in version.split(".") if x.isdigit())
@@ -3823,7 +3849,7 @@ def doctor_publisher(run, data):
     model, effort = publisher_model(data)
     run.ok(f"primary account {account_label(name, data['accounts'][name])} [{name}] · {model} {effort}")
     if not shutil.which("tmux"):
-        run.left("no tmux, so the publisher session cannot start (brew install tmux)")
+        run.left(f"no tmux, so the publisher session cannot start ({TMUX_INSTALL})")
     if not os.path.exists(PUBLISHER_ROLE):
         run.left(f"publisher session scope {PUBLISHER_ROLE.replace(HOME, '~')} is missing (acm setup)")
 
