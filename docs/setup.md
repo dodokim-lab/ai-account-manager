@@ -25,8 +25,8 @@ It needs `python3`, `jq`, and `claude`. If any of them is missing, it tells you 
 
 | Check | If not done |
 |---|---|
-| Terminal | Adds `PATH` and the `claude` and `codex` shell functions to the login shell's rc file. That is `~/.zshrc` for zsh and `~/.bash_profile` for bash |
-| Publisher session runtime | If tmux is missing, installs it with `brew install tmux` |
+| Terminal | Adds `PATH` and the `claude` and `codex` shell functions to the login shell's rc file. That is `~/.zshrc` for zsh. For bash it is `~/.bash_profile` on macOS and `~/.bashrc` on Linux |
+| Publisher session runtime | If tmux is missing, installs it with `brew install tmux`. On Linux it names the package manager command, such as `sudo apt install tmux`, and leaves it to you |
 | IDE | For each JetBrains IDE with the Claude Code plugin, changes the Claude command of the newest version to `~/.local/bin/acm`. For VS Code, Cursor, Windsurf, and VSCodium with the Claude Code extension, adds `claudeCode.claudeProcessWrapper` to the user `settings.json` |
 | Accounts | Signs in Claude accounts that are not signed in. If there is only one account, asks whether to add one. If there are extra accounts, moves `projects`, `skills`, and `hooks` to `~/.acm/shared` |
 | Codex accounts | If `codex` and `~/.codex` exist, asks whether to register the default account `cx1`. Checks sign-in and shared links for each registered Codex account |

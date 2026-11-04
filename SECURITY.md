@@ -26,7 +26,7 @@ In scope:
 
 Out of scope:
 - Claude Code, Codex CLI, and the services behind them. Report those to Anthropic or OpenAI
-- Changes made by someone who already controls your macOS user account, such as editing `~/.acm` or the installed scripts
+- Changes made by someone who already controls your user account on the computer, such as editing `~/.acm` or the installed scripts
 - Whether running several accounts fits a provider's terms. That is up to each user, as the README notes
 
 ## When you will hear back

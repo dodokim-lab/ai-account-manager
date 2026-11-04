@@ -4,14 +4,14 @@ This guide covers installing and using acm, one feature per section, so read onl
 
 ## Install
 
-acm runs on macOS only for now. Linux and Windows are planned in [Platform support plan](docs/platforms.md). Install these tools first.
+acm runs on macOS and Linux. Linux support is new: install, setup, IDE settings, and session tracking were tested in a Debian container, but not yet with real signed-in accounts. Windows is planned in [Platform support plan](docs/platforms.md). Install these tools first.
 
 | Tool | Needed |
 |---|---|
 | `python3`, `jq`, `claude` | Always |
-| `swiftc` | To build the menu bar app. The app runs on Apple silicon with macOS 14 or later. Run `./install.sh --no-app` to skip it |
+| `swiftc` | macOS only, to build the menu bar app. The app runs on Apple silicon with macOS 14 or later. Run `./install.sh --no-app` to skip it. On Linux `install.sh` skips the app, and `acm status` shows the same accounts |
 | `codex` | For Codex accounts |
-| `tmux` | For artifact collection. If it is missing, `acm setup` offers to install it with Homebrew |
+| `tmux` | For artifact collection. If it is missing, `acm setup` offers to install it with Homebrew on macOS. On Linux, install it with your package manager |
 
 If `python3`, `jq`, or `claude` is missing, `install.sh` stops and tells you how to install it. It also stops without `swiftc` when you install the app.
 
@@ -33,7 +33,7 @@ If `python3`, `jq`, or `claude` is missing, `install.sh` stops and tells you how
 ```bash
 acm add cl2                 # creates ~/.claude-cl2
 acm -a cl2 auth login       # sign in with that account
-acm rm cl2                  # removes it from the list, keeps the folder and the keychain entry
+acm rm cl2                  # removes it from the list, keeps the folder and its login data
 ```
 
 Account ids use letters, digits, `-`, and `_`, up to 32 characters.

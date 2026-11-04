@@ -1,6 +1,6 @@
 # Platform support plan
 
-acm runs on macOS only. This doc plans support for Linux, Claude Desktop, and Windows, in that order. For each one it lists what has to change, how to test it, and when it counts as done. None of this work has started. The code locations below were taken from `bin/acm`, `bin/acm-statusline`, and `install.sh` on 2026-11-03.
+This doc plans support for Linux, Claude Desktop, and Windows, in that order. For each one it lists what has to change, how to test it, and when it counts as done. Linux support is in the code and passes in a container, but has not been tried with real signed-in accounts. Claude Desktop and Windows have not started. The code locations below were taken from `bin/acm`, `bin/acm-statusline`, and `install.sh` on 2026-11-03.
 
 ## The order follows cost and what blocks each step
 
@@ -10,45 +10,44 @@ Claude Desktop comes second, but it is blocked upstream. Reports say the Code ta
 
 Windows comes last because it changes the most. The shared folder is built from symbolic links, session lookup reads other processes, the statusline wrapper is a shell script, and the publisher session runs in tmux. Each of these needs a Windows version.
 
-## Linux is mostly a matter of finding things in other places
+## Linux runs in a container and waits for a test with real accounts
 
-### What already works
+### What was there already
 
 - `proc_info` reads a session's environment from `/proc/<pid>/environ`. On macOS it uses `sysctl`, and that branch only runs on macOS.
 - `fd_path` reads the real path of an open file from `/proc/self/fd`. On macOS it uses `F_GETPATH`.
 - Each account's Claude Code keeps `.credentials.json` in its own folder, such as `~/.claude-cl2`. acm never reads it.
-- `bin/acm` needs only Python 3.9 and its standard library.
+- `bin/acm` needs only Python 3.9 and its standard library, and `bin/acm-statusline` uses only POSIX shell and jq.
 
-### What has to change
+### What changed for Linux
 
-| Where | macOS today | Linux plan |
+| Where | macOS | Linux |
 |---|---|---|
-| `running_sessions` | Reads each session's working folder with `lsof -d cwd` | Read the link `/proc/<pid>/cwd`. Keep `lsof` on macOS |
-| `running_sessions`, `claude_pids`, setup's IDE check | `ps -axo pid=,ppid=,uid=,etime=,comm=` | Check that procps `ps` accepts these options. If not, read `/proc/<pid>/stat` and `/proc/<pid>/status` directly. Check that `comm` shows `claude` for a native install, since Linux cuts it to 15 characters |
-| `JETBRAINS_DIR`, `VSCODE_APP_SUPPORT` | `~/Library/Application Support` | `~/.config` for JetBrains, Code, Cursor, and Windsurf. Remote and WSL editors keep settings in `~/.vscode-server` instead, which needs its own check |
-| `shell_rc` | `.zshrc`, or `.bash_profile` for bash because macOS Terminal opens a login shell | `.bashrc` for bash, since most Linux terminals open a non-login shell |
-| claude and codex lookup | Falls back to `/opt/homebrew/bin` and `/usr/local/bin` | Add `~/.local/bin`, where the native installer puts claude, and `/usr/bin` |
-| `setup_tmux`, publisher messages | Offers `brew install tmux` | Name the system package manager, such as `apt install tmux`, and do not run it. Installing system packages needs root |
-| `install.sh` | Builds `/Applications/ACM.app`, quits it with `osascript`, suggests `brew install jq` | Skip the app and `osascript` on Linux as if `--no-app` were given. Suggest the package manager for jq |
-| Setup's closing note | Mentions macOS asking to control iTerm | Show only on macOS |
-| Limit notification | iTerm shows OSC 9 as a notification | Leave as is. Terminals that ignore OSC 9 show nothing, which is the current behavior in other macOS terminals too |
-| `acm rm` help and docs | "keeps the folder and the keychain entry" | Say the token stays in the folder on Linux |
+| `session_cwds` | Reads each session's working folder with `lsof -d cwd` | Reads the link `/proc/<pid>/cwd` |
+| `running_sessions`, `claude_pids`, setup's IDE check | `ps -axo pid=,ppid=,uid=,etime=,comm=` | The same options work with procps `ps`. A shell script named `claude` shows as `claude` in `comm`[2] |
+| `APP_SUPPORT` for VS Code family settings | `~/Library/Application Support` | `$XDG_CONFIG_HOME`, or `~/.config` |
+| `JETBRAINS_DIR`, `JETBRAINS_PLUGINS_DIR` | Config and plugins both in `~/Library/Application Support/JetBrains/<IDE>` | Config in `~/.config/JetBrains/<IDE>`, plugins in `~/.local/share/JetBrains/<IDE>` |
+| `jetbrains_running` | Looks for the launcher inside an `.app` bundle | Looks for the launcher name alone, such as `idea` |
+| `shell_rc` | `.zshrc`, or `.bash_profile` for bash because Terminal opens a login shell | `.zshrc`, or `.bashrc` for bash because most terminals open a non-login shell |
+| claude, codex, and agy lookup | `/opt/homebrew/bin`, `/usr/local/bin`, `~/.local/bin` | `/usr/bin` added for distribution packages |
+| `TMUX_INSTALL`, `setup_tmux` | Offers `brew install tmux` | Names `sudo apt install tmux` or the distribution's package manager, and leaves it to you, since it needs root |
+| `install.sh` | Builds `/Applications/ACM.app`, quits it with `osascript`, suggests `brew install jq` | Skips the app as if `--no-app` were given, never touches `/Applications`, and suggests the package manager for python3 and jq |
 
-The menu bar app is not built for Linux. `acm status` shows the same accounts, and `acm status --json` gives the same data the app reads.
+The menu bar app is not built for Linux. `acm status` shows the same accounts, and `acm status --json` gives the same data the app reads. Limit notifications use OSC 9 as before. Terminals that ignore it show nothing, as other macOS terminals already do.
 
-### How to test
+### What was tested
 
-1. Make the unit tests platform aware. Tests that fake `lsof` or `sysctl` output should fake `/proc` on Linux instead.
-2. Add an `ubuntu-latest` job to `.github/workflows/check.yml`. It runs the syntax check and the unit tests, but not the Swift build. The comment in that file already marks the spot.
-3. Run `install.sh --no-app` and `acm setup` in a fake home on Linux, the same way [AGENTS.md](../AGENTS.md) describes for macOS.
-4. On a real Linux machine or VM, sign in to two Claude accounts and two Codex accounts. Run `acm doctor`, start sessions with `claude` and `codex` through the shell function, check `acm status`, and publish one artifact through the publisher session.
+- The CI `linux` job on `ubuntu-latest` runs the syntax checks and the unit tests. Tests for the Linux branches run on both systems, and the `/proc` one only on Linux.
+- In a Debian container with Python 3.9, procps, jq, git, and tmux, a fake `claude` that only answers `--version` stood in for Claude Code.[2] From an empty home, `install.sh` skipped the app, `acm setup --yes` added the shell function to `~/.bashrc`, and `acm add cl2` made the second account folder.
+- A fake session started with `CLAUDE_CONFIG_DIR=~/.claude-cl2` showed in `acm status` as one session on `cl2`, with its working folder from `/proc`.
+- With a VS Code extension folder and a JetBrains plugin folder in place, setup wrote `~/.config/Code/User/settings.json` and the IntelliJ settings file under `~/.config/JetBrains`. In bash, `claude` went through acm. `acm setup --undo` removed all three.
 
-### Done when
+### Still to check
 
-- The ubuntu CI job passes.
-- Step 4 above works end to end on a real Linux machine, and the result is noted with the date and versions in a footnote.
-- The README and the guide say acm runs on macOS and Linux, and name what to install on Linux.
-- WSL 2 is tried once. If it works, the README and the guide say so. If it does not, this doc records what broke.
+1. On a real Linux machine or VM, sign in to two Claude accounts and two Codex accounts. Run `acm doctor`, start sessions with `claude` and `codex` through the shell function, check `acm status`, and publish one artifact through the publisher session. Note the result with the date and versions in a footnote.
+2. Where Claude Code keeps session scratchpads on Linux. The publisher guard allows reads under `/tmp/claude-<uid>`, the macOS location. If Linux uses another folder, the publisher session cannot read artifacts it fetched there, which fails closed.
+3. A JetBrains IDE on real Linux, since the plugin folder under `~/.local/share` comes from JetBrains' documented layout and was only faked in the container.
+4. WSL 2 once. If it works, the README and the guide say so. If it does not, this doc records what broke. VS Code with the WSL extension keeps settings in `~/.vscode-server`, which setup does not handle yet.
 
 ## Claude Desktop waits until the Code tab follows a config folder
 
@@ -109,3 +108,5 @@ Add a `windows-latest` job to CI that runs the unit tests. Then, on a real Windo
 ## Footnotes
 
 [1] anthropics/claude-code issue #30031 and its comments. It was still open as of the 2026-10-27 comment. https://github.com/anthropics/claude-code/issues/30031
+
+[2] 2026-11-04, Docker image `python:3.9-slim` (Debian) on aarch64 with procps, jq, git, and tmux added. Claude Code itself was not installed, so the session and IDE checks used fake commands and folders.

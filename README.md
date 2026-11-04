@@ -26,13 +26,13 @@ Other tools solve parts of the same problem. The descriptions follow each projec
 
 | Tool | What it does | How acm differs |
 |---|---|---|
-| [claude-swap](https://github.com/realiti4/claude-swap) | Switches the signed-in Claude Code account by swapping its stored credentials, and can rotate automatically when usage passes a threshold. Chat history stays per account unless you opt in. Runs on macOS, Linux, and Windows | acm never moves credentials. Every account stays signed in to its own folder, history is shared from the start, and Codex accounts are covered too. acm runs on macOS only for now |
+| [claude-swap](https://github.com/realiti4/claude-swap) | Switches the signed-in Claude Code account by swapping its stored credentials, and can rotate automatically when usage passes a threshold. Chat history stays per account unless you opt in. Runs on macOS, Linux, and Windows | acm never moves credentials. Every account stays signed in to its own folder, history is shared from the start, and Codex accounts are covered too. acm does not run on Windows yet |
 | [CCS account pools](https://docs.ccs.kaitran.ca/features/pool) | Puts several Claude accounts behind a local proxy and uses one account fully before moving to the next | acm starts each session directly on one account with no proxy, and spreads usage by headroom instead of using accounts in order |
 | [claude-limits](https://github.com/figueiredouc/claude-limits) | Shows Claude Code usage in the macOS menu bar by calling the usage API with Claude Code's token | acm shows every Claude and Codex account in one window and reads usage without touching the token |
 
 ## Quick start
 
-acm runs on macOS only for now. Linux and Windows are planned in [Platform support plan](docs/platforms.md). You need `python3`, `jq`, and `claude`, plus `codex` for Codex accounts. The menu bar app needs `swiftc` and runs on Apple silicon with macOS 14 or later.
+acm runs on macOS and Linux. Linux support is new and has not yet been tried with real signed-in accounts. Windows is planned in [Platform support plan](docs/platforms.md). You need `python3`, `jq`, and `claude`, plus `codex` for Codex accounts. The menu bar app is macOS only. It needs `swiftc` and runs on Apple silicon with macOS 14 or later.
 
 1. Quit JetBrains IDEs and any running claude sessions. If they are running, setup leaves the IDE plugin settings and the shared folder as remaining steps.
 2. Clone the repository and run `install.sh`. It installs the CLI, the statusline wrapper, and the menu bar app, then runs `acm setup`.

@@ -26,13 +26,13 @@ acm 은 로그인 토큰을 읽지도 옮기지도 않는다. 로그인은 계�
 
 | 도구 | 하는 일 | acm 과 다른 점 |
 |---|---|---|
-| [claude-swap](https://github.com/realiti4/claude-swap) | 저장해 둔 인증 정보를 바꿔 끼워 Claude Code 에 로그인한 계정을 바꾼다. 사용량이 기준을 넘으면 자동으로 다음 계정으로 넘긴다. 대화 히스토리는 따로 켜지 않으면 계정마다 따로 둔다. macOS 와 Linux, Windows 에서 돈다 | acm 은 인증 정보를 옮기지 않는다. 모든 계정이 자기 폴더에 로그인한 채로 있다. 히스토리는 처음부터 같이 쓰고 Codex 계정도 다룬다. 다만 acm 은 아직 macOS 에서만 돈다 |
+| [claude-swap](https://github.com/realiti4/claude-swap) | 저장해 둔 인증 정보를 바꿔 끼워 Claude Code 에 로그인한 계정을 바꾼다. 사용량이 기준을 넘으면 자동으로 다음 계정으로 넘긴다. 대화 히스토리는 따로 켜지 않으면 계정마다 따로 둔다. macOS 와 Linux, Windows 에서 돈다 | acm 은 인증 정보를 옮기지 않는다. 모든 계정이 자기 폴더에 로그인한 채로 있다. 히스토리는 처음부터 같이 쓰고 Codex 계정도 다룬다. 다만 acm 은 아직 Windows 에서 돌지 않는다 |
 | [CCS 계정 풀](https://docs.ccs.kaitran.ca/features/pool) | 로컬 프록시 뒤에 Claude 계정 여러 개를 묶어 두고 한 계정을 다 쓴 뒤에 다음 계정으로 넘어간다 | acm 은 프록시 없이 세션을 계정 하나에 바로 띄운다. 계정을 순서대로 쓰지 않고 여유에 따라 나눠 쓴다 |
 | [claude-limits](https://github.com/figueiredouc/claude-limits) | Claude Code 의 토큰으로 사용량 API 를 불러 macOS 메뉴바에 사용량을 보인다 | acm 은 Claude 와 Codex 의 모든 계정을 창 하나에 보인다. 사용량은 토큰을 건드리지 않고 읽는다 |
 
 ## 빠른 시작
 
-지금은 macOS 에서만 돈다. Linux 와 Windows 지원은 [플랫폼 지원 계획](docs/platforms.md) 에 적어 두었다. `python3` 와 `jq`, `claude` 가 있어야 하고 Codex 계정을 쓰려면 `codex` 도 있어야 한다. 메뉴바 앱은 `swiftc` 로 빌드하며 Apple silicon 의 macOS 14 이상에서 돈다.
+macOS 와 Linux 에서 돈다. Linux 지원은 새로 넣은 것이라 실제 로그인한 계정으로는 아직 돌려 보지 않았다. Windows 지원은 [플랫폼 지원 계획](docs/platforms.md) 에 적어 두었다. `python3` 와 `jq`, `claude` 가 있어야 하고 Codex 계정을 쓰려면 `codex` 도 있어야 한다. 메뉴바 앱은 macOS 전용이다. `swiftc` 로 빌드하며 Apple silicon 의 macOS 14 이상에서 돈다.
 
 1. JetBrains IDE 와 떠 있는 claude 세션을 모두 닫는다. 떠 있으면 setup 이 IDE 플러그인 설정과 공유 폴더를 남은 일로 미룬다.
 2. 저장소를 받아 `install.sh` 를 돌린다. CLI 와 statusline 래퍼, 메뉴바 앱을 깐 뒤 `acm setup` 을 부른다.

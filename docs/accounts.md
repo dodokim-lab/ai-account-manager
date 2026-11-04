@@ -33,7 +33,7 @@ After you first add an account, quit all claude sessions and run `acm sync --fix
 
 ## Only Claude Code handles login tokens
 
-Login tokens are stored in the macOS keychain under a different name for each account folder. acm does not read them. acm reads usage by having that account's Claude Code run `claude -p /usage`, so the token is used only inside Claude Code. A poll failure reason shown in the menu bar window is cleared when a session on that account records new usage through the statusline.
+On macOS, login tokens are stored in the keychain under a different name for each account folder. On Linux, Claude Code keeps the token in `.credentials.json` inside each account folder. acm does not read them in either case. acm reads usage by having that account's Claude Code run `claude -p /usage`, so the token is used only inside Claude Code. A poll failure reason shown in the menu bar window is cleared when a session on that account records new usage through the statusline.
 
 On an account with no session, the token expires after about 8 hours. Whether `/usage` refreshes an expired token by itself is unverified. So if `/usage` fails for a reason other than 429, acm starts `claude -p` once in the background on that account. This run turns off hooks, plugins, MCP, and tools, sends haiku one short request, and keeps no session history. The measured cost per run was 2,973 input tokens. Claude Code, not acm, refreshes the token as it normally does. It takes a lock to refresh, so nothing breaks even when a session on the same account is running.
 

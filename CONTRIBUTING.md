@@ -6,7 +6,7 @@ Report security vulnerabilities privately as described in [SECURITY.md](SECURITY
 
 ## Before you open a pull request
 
-Run the same checks CI runs. They need macOS with Xcode command line tools.
+Run the same checks CI runs. The shell and Python checks run on macOS and Linux. The last line compiles the menu bar app and needs macOS with Xcode command line tools.
 
 ```sh
 sh -n install.sh && sh -n bin/acm-statusline && sh -n app/build.sh
