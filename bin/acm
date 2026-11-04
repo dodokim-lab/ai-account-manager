@@ -2083,7 +2083,7 @@ def publisher_startable():
         info("The publisher session runs inside tmux. Install it with brew install tmux")
         return False
     if not os.path.exists(PUBLISHER_ROLE):
-        info(f"The publisher session's role file {PUBLISHER_ROLE} is missing, so it was not started. Write it yourself following the 'Collecting artifacts in one account' section of the README")
+        info(f"The publisher session's role file {PUBLISHER_ROLE} is missing, so it was not started. Run acm setup to write it, or write it yourself following 'The scope lives in ROLE.md' in docs/publisher.md")
         return False
     return True
 
@@ -2111,7 +2111,7 @@ def start_publisher(data, quiet=False, wait=False):
             print(f"The publisher session is already running (tmux attach -t {PUBLISHER_SESSION})")
         return wait_publisher(data) if wait else True
     if not os.path.exists(PUBLISHER_ROLE):
-        info(f"The publisher session's role file {PUBLISHER_ROLE} is missing, so it was not started. Write it yourself following the 'Collecting artifacts in one account' section of the README")
+        info(f"The publisher session's role file {PUBLISHER_ROLE} is missing, so it was not started. Run acm setup to write it, or write it yourself following 'The scope lives in ROLE.md' in docs/publisher.md")
         return False
     _, name = publisher_conf(data)
     acc = data["accounts"][name]
