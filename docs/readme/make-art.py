@@ -243,7 +243,7 @@ def social(path):
            t(72, 338, "and Codex CLI accounts.", 25, INK),
            t(72, 400, "Each session starts on the account", 19, GRAY),
            t(72, 428, "with the most headroom, and every", 19, GRAY),
-           t(72, 456, "account shares one ~/.claude.", 19, GRAY),
+           t(72, 456, "account of a tool shares one folder.", 19, GRAY),
            t(72, 548, "github.com/dodokim-lab/ai-account-manager", 17, GRAY, family=MONO),
            f'<g transform="translate({px:.1f},{py:.1f}) scale({scale})">{psvg}</g>',
            "</svg>"]
