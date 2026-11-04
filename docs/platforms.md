@@ -58,7 +58,7 @@ The Code tab of Claude Desktop runs Claude Code sessions, but reports say it ign
 1. Read issue #30031 and the Claude Desktop release notes for news on config folders or multiple accounts.
 2. Start Claude Desktop with `CLAUDE_CONFIG_DIR` set, for example with `open --env CLAUDE_CONFIG_DIR=$HOME/.claude-cl2 -a Claude`. Start a session in the Code tab and see which account and which `projects` folder it uses.
 
-If neither shows a change, record the date and the Desktop version here and move on to Windows.
+If neither shows a change, record the date and the Desktop version here and move on to Windows. On 2026-11-04, issue #30031 was still open with no comment after 2026-10-27, so the relaunch test was skipped and this step stays blocked. Windows work will be done later on a Windows machine, so Linux is the only platform being worked on for now.
 
 ### If the Code tab follows the variable
 
