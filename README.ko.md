@@ -2,139 +2,68 @@
 
 [English](README.md) | 한국어
 
-<img src="docs/logo.svg" alt="다음 배정 표시와 사용량 막대 두 개를 그린 acm 로고" width="96">
+Claude Code 나 Codex 구독을 여러 개 가져도 계정들은 서로 따로 논다. 세션은 마지막으로 로그인한 계정으로 뜨므로 한 계정이 한도에 닿는 동안 다른 계정은 쓰이지 않고 남는다. 메모리와 히스토리, 설정, 스킬도 계정마다 따로라서 다른 계정으로 옮기면 빈 맥락에서 다시 시작해야 한다.
 
-acm 은 한 사람이 가진 Claude Code 와 Codex CLI 계정 여러 개에 세션을 나눠 띄우는 런처다. 이 문서는 구독 계정을 두 개 이상 가진 개발자가 acm 을 처음 깔고 쓸 때 읽는다. acm 은 세션을 띄울 때마다 그 도구의 계정 가운데 남은 여유가 가장 큰 계정을 골라 붙여서 가진 계정의 사용량이 고르게 줄어든다. 메모리와 히스토리, 설정, 스킬은 도구마다 `~/.claude` 나 `~/.codex` 하나를 모든 계정이 같이 쓴다. 그래서 어느 계정으로 떠도 하던 일의 맥락이 이어진다.
+acm 은 이 계정들을 하나처럼 쓰게 하는 런처다. `claude` 와 `codex` 를 평소대로 치면 acm 이 그 도구의 계정 가운데 남은 여유가 가장 큰 계정으로 세션을 띄운다. 모든 계정이 같은 `~/.claude` 나 `~/.codex` 를 읽어서 어느 계정으로 떠도 하던 일의 맥락이 따라온다.
 
-발행 모으기를 켜면 어느 계정 세션에서 발행한 Claude 아티팩트든 대표 계정 하나에 모인다.
+![왼쪽 터미널에서 claude 와 codex 를 치면 acm 이 고른 계정이 찍힌다. 오른쪽 acm 메뉴바 창에는 Claude 계정 세 개와 Codex 계정 두 개가 5시간과 주간 사용량 게이지로 보인다. 도구마다 고른 계정에는 테두리가 쳐져 있다. 터미널 아래에는 Claude 계정 cl1 과 cl2, cl3 이 ~/.claude 한 곳을 가리킨다. Codex 계정 cx1 과 cx2 는 ~/.codex 한 곳을 가리킨다.](docs/readme/hero.svg)
 
-acm 은 Anthropic 이나 OpenAI 와 관계없는 비공식 도구다. 로그인 토큰은 읽지도 옮기지도 않는다. 로그인은 계정마다 Claude Code 와 Codex 가 자기 로그인 흐름으로 직접 한다. 사용량은 statusline 과 그 계정으로 돌린 `claude -p /usage`, `codex app-server` 에서 읽는다. Anthropic 은 [구독 요금제의 사용 한도가 평범한 개인 사용을 전제한다](https://code.claude.com/docs/en/legal-and-compliance)고 적고 있어서 acm 은 본인이 가진 계정에만 쓴다.
+## acm 이 하는 일
+
+acm 은 세션을 띄울 때마다 계정을 고른다. 5시간 한도의 여유와 주간 한도를 쓰는 속도를 함께 따져서, 리셋 때 쓰지 못하고 사라질 몫이 많은 계정부터 쓴다. 한도에 가까운 계정은 고르지 않는다. 점수가 비슷한 계정끼리는 떠 있는 세션이 적은 쪽을 고른다. 기준은 [계정 배정과 사용량](docs/selection.md) 에 있다.
+
+한 도구의 모든 계정은 맥락 하나를 같이 쓴다. 메모리와 히스토리, 설정, 스킬은 `~/.claude` 나 `~/.codex` 한 곳에 있다. 계정 폴더는 링크로 그곳을 가리킨다. 한도에 걸려 멈춘 Claude 세션은 `acm resume` 으로 다른 계정에서 이어 간다. Codex 세션은 `acm codex resume` 으로 어느 Codex 계정에서든 연다.
+
+메뉴바 창에서 모든 계정의 5시간 사용량과 주간 사용량, 리셋까지 남은 시간을 본다. 떠 있는 위젯은 같은 숫자를 화면에 늘 띄워 둔다. 터미널에서는 `acm status` 가 같은 내용을 보여 준다.
+
+Claude 아티팩트는 대표 계정 하나에 모을 수 있다. 아티팩트는 발행한 계정의 것이라서 고치거나 지우는 일도 그 계정에서만 된다. 아티팩트 모으기를 켜면 다른 계정 세션이 아티팩트를 대표 계정의 발행 세션에 넘기므로 모든 아티팩트를 한 곳에서 관리한다.
+
+acm 은 로그인 토큰을 읽지도 옮기지도 않는다. 로그인은 계정마다 Claude Code 와 Codex 가 자기 로그인 흐름으로 한다. 사용량은 statusline 과, 그 계정으로 돌린 `claude -p /usage` 와 `codex app-server` 에서 읽는다.
+
+## 비슷한 도구와 무엇이 다른가
+
+같은 문제의 일부를 푸는 도구가 이미 있다. 아래 설명은 2026년 11월 기준 각 프로젝트의 문서를 따랐다.
+
+| 도구 | 하는 일 | acm 과 다른 점 |
+|---|---|---|
+| [claude-swap](https://github.com/realiti4/claude-swap) | 저장해 둔 인증 정보를 바꿔 끼워 Claude Code 에 로그인한 계정을 바꾼다. 사용량이 기준을 넘으면 자동으로 다음 계정으로 넘긴다. 대화 히스토리는 따로 켜지 않으면 계정마다 따로 둔다. macOS 와 Linux, Windows 에서 돈다 | acm 은 인증 정보를 옮기지 않는다. 모든 계정이 자기 폴더에 로그인한 채로 있다. 히스토리는 처음부터 같이 쓰고 Codex 계정도 다룬다. 다만 acm 은 아직 macOS 에서만 돈다 |
+| [CCS 계정 풀](https://docs.ccs.kaitran.ca/features/pool) | 로컬 프록시 뒤에 Claude 계정 여러 개를 묶어 두고 한 계정을 다 쓴 뒤에 다음 계정으로 넘어간다 | acm 은 프록시 없이 세션을 계정 하나에 바로 띄운다. 계정을 순서대로 쓰지 않고 여유에 따라 나눠 쓴다 |
+| [claude-limits](https://github.com/figueiredouc/claude-limits) | Claude Code 의 토큰으로 사용량 API 를 불러 macOS 메뉴바에 사용량을 보인다 | acm 은 Claude 와 Codex 의 모든 계정을 창 하나에 보인다. 사용량은 토큰을 건드리지 않고 읽는다 |
 
 ## 빠른 시작
 
-지금은 macOS 에서만 돈다. 설치 전에 아래 도구가 있어야 한다.
+지금은 macOS 에서만 돈다. Linux 와 Windows 지원은 [플랫폼 지원 계획](docs/platforms.md) 에 적어 두었다. `python3` 와 `jq`, `claude` 가 있어야 하고 Codex 계정을 쓰려면 `codex` 도 있어야 한다. 메뉴바 앱은 `swiftc` 로 빌드하며 Apple silicon 의 macOS 14 이상에서 돈다.
 
-| 도구 | 필요한 때 |
-|---|---|
-| `python3`, `jq`, `claude` | 늘 |
-| `swiftc` | 메뉴바 앱을 빌드할 때. 앱은 Apple silicon 의 macOS 14 이상에서 돈다. 앱 없이 깔려면 `./install.sh --no-app` 을 쓴다 |
-| `codex` | Codex 계정을 쓸 때 |
-| `tmux` | 아티팩트 모으기를 켤 때. 없으면 `acm setup` 이 brew 로 설치할지 묻는다 |
-
-`python3` 와 `jq`, `claude` 가 없으면 `install.sh` 가 설치 방법을 알리고 멈춘다. 앱까지 깔 때는 `swiftc` 가 없어도 멈춘다.
-
-1. 저장소를 받는다.
+1. JetBrains IDE 와 떠 있는 claude 세션을 모두 닫는다. 떠 있으면 setup 이 IDE 플러그인 설정과 공유 폴더를 남은 일로 미룬다.
+2. 저장소를 받아 `install.sh` 를 돌린다. CLI 와 statusline 래퍼, 메뉴바 앱을 깐 뒤 `acm setup` 을 부른다.
 
    ```bash
    git clone https://github.com/dodokim-lab/ai-account-manager.git
    cd ai-account-manager
+   ./install.sh
    ```
 
-2. JetBrains IDE 와 떠 있는 claude 세션을 모두 닫는다. 떠 있으면 `acm setup` 이 IDE 플러그인 설정과 공유 폴더를 건드리지 않고 남은 일로 미룬다.
-3. `./install.sh` 를 돌린다. CLI 와 statusline 래퍼, 메뉴바 앱을 깐 뒤 `acm setup` 을 불러 남은 설정을 하나씩 묻는다.
-4. setup 이 계정을 추가할지 물으면 추가하고 그 계정으로 로그인한다. 기본 계정 `cl1` 은 지금 쓰는 `~/.claude` 라서 따로 할 일이 없다.
-5. 새 터미널을 열고 `claude` 를 친다. setup 이 셸 rc 파일에 넣은 함수가 `acm claude` 로 보내서 남은 여유가 가장 큰 Claude 계정으로 뜬다.
-6. `acm status` 로 계정마다 로그인과 사용량을 확인한다.
+3. setup 이 계정을 추가할지 물으면 추가하고 그 계정으로 로그인한다. 지금 쓰는 `~/.claude` 는 그대로 첫 계정 `cl1` 이 된다.
+4. 새 터미널을 열고 `claude` 를 친다. 남은 여유가 가장 큰 Claude 계정으로 뜬다.
+5. `acm status` 로 계정마다 로그인과 사용량을 확인한다.
 
-## 계정을 더하려면
+## 자세히 쓰려면
 
-```bash
-acm add cl2                 # ~/.claude-cl2 를 만든다
-acm -a cl2 auth login       # 그 계정으로 로그인
-acm rm cl2                  # 목록에서 뺀다. 디렉터리와 키체인 항목은 남긴다
-```
-
-`acm add` 로 직접 더했으면 로그인한 뒤 `acm setup` 을 돌린다. 계정이 하나일 때 건너뛴 아티팩트 모으기와 한도 이어 가기를 이때 맞춘다.
-
-## Codex 계정을 붙이려면
-
-처음 `acm add --codex` 를 치면 지금 쓰는 `~/.codex` 를 기본 계정 `cx1` 로 등록한다. 브라우저가 다른 ChatGPT 계정에 로그인돼 있으면 로그인 주소를 시크릿 창에서 연다.
-
-```bash
-acm add --codex cx2              # ~/.codex-cx2 를 만든다
-acm -a cx2 login --device-auth   # 화면의 주소를 열고 코드를 넣는다
-```
-
-## 세션을 띄우려면
-
-```bash
-acm                      # 어느 도구로 열지 묻는다
-acm claude               # 남은 여유가 가장 큰 Claude 계정으로
-acm -c                   # 도구 이름이 없으면 claude 인자로 넘긴다
-acm codex                # 남은 여유가 가장 큰 Codex 계정으로
-acm -a personal          # 계정을 지정. 그 계정의 도구로 뜬다
-acm pick [codex]         # 띄우지 않고 어느 계정이 될지만 본다
-acm resume               # 한도로 멈춘 Claude 세션을 다른 계정에서 이어 간다
-acm codex resume <ID>    # Codex 세션은 어느 Codex 계정에서든 연다
-```
-
-배정은 같은 도구의 계정끼리만 한다. `-a` 와 이번만 라운드로빈으로 고르는 `--rr` 은 맨 앞에 둔다. 계정 자리에는 id 와 표시 이름, 이메일, 이메일 앞부분 중 아무것이나 쓴다. acm 을 거치지 않고 띄우려면 `command claude`, `command codex` 를 친다.
-
-IDE 와 메뉴바 앱에서 띄우는 법은 [설치와 처음 설정](docs/setup.md) 에 있다. 계정을 고르는 점수와 한도에 걸린 세션을 이어 가는 법은 [계정 배정과 사용량](docs/selection.md) 에 있다.
-
-## 아티팩트를 한 계정으로 모으려면
-
-아티팩트는 세션이 붙은 계정 소유로 발행돼서 계정을 옮겨 가며 쓰면 계정마다 흩어진다. 발행 모으기를 켜면 다른 계정 세션은 대표 계정의 발행 전용 세션에 아티팩트를 맡긴다. 계정이 둘 이상이면 `acm setup` 이 승인 범위를 보여 주고 대표 계정을 고르게 한 뒤 켠다.
-
-```bash
-acm publisher on         # 켠다. 발행 세션은 맡길 때 뜬다
-acm publisher status     # 켜짐 여부와 대표 계정, 세션 상태
-acm publisher off        # 끄고 각 세션이 자기 계정으로 발행하게 되돌린다
-```
-
-대표 계정은 브라우저로 claude.ai 에 로그인해 둔 계정이어야 아티팩트를 열어 볼 수 있다. 지금은 Claude 아티팩트만 모은다. Codex 의 Sites 를 모으는 일은 [나중에 할 것](docs/roadmap.md) 에 있다.
-
-## Claude Code 를 올린 뒤 점검하려면
-
-acm 은 `/usage` 출력 형식처럼 문서에 없는 Claude Code 구조에 기댄다. Claude Code 를 올린 뒤 `acm doctor` 를 돌리면 그 구조가 기대대로인지 계정마다 실제로 읽어 보고 알린다. 문제가 있으면 종료 코드 1 로 끝난다.
-
-```bash
-acm doctor              # Claude Code 구조 점검
-acm upgrade             # 설치한 저장소를 git pull 하고 install.sh 를 다시 돌린다
-```
-
-## 되돌리거나 지우려면
-
-```bash
-acm setup --undo           # 넣은 셸 줄과 IDE 플러그인 설정을 되돌린다
-./install.sh --uninstall   # 위에 더해 statusline 을 되돌리고 CLI 와 앱을 지운다
-```
-
-둘 다 계정 디렉터리와 `~/.acm` 은 남긴다. 로그인 정보가 들어 있어서 지우는 것은 사람이 판단해야 하기 때문이다.
-
-## 문제 해결
-
-설치하고 처음 쓸 때 자주 막히는 곳과 푸는 법이다.
-
-| 증상 | 해결 |
-|---|---|
-| `acm setup` 이 IDE 플러그인 설정을 남은 일로 미뤘다 | JetBrains IDE 를 닫고 `acm setup` 을 다시 돌린다 |
-| 공유 폴더를 `~/.acm/shared` 로 옮기지 못했다고 나온다 | claude 세션을 모두 닫고 `acm sync --fix` 를 돌린다 |
-| `claude` 나 `codex` 를 쳐도 acm 을 거치지 않는다 | setup 전에 열어 둔 터미널이다. 새 터미널을 열거나 `exec zsh -l` 을 친다 |
-| 메뉴바 앱의 "New Session…" 이 창을 열지 않는다 | 처음 누를 때 macOS 가 ACM 의 iTerm 제어를 묻는다. 허용해야 창이 열린다 |
-
-## 더 읽을 문서
+[사용 안내](GUIDE.md) 에 Claude 와 Codex 계정 더하기, 세션 띄우기, 아티팩트 모으기, Claude Code 업데이트 뒤 점검, 제거, 문제 해결을 절마다 하나씩 적었다. 사용 안내와 아래 문서는 영어로 쓰여 있다.
 
 | 문서 | 다루는 것 |
 |---|---|
 | [설치와 처음 설정](docs/setup.md) | `acm setup` 이 바꾸는 것, 셸 함수, IDE 에서 띄우기 |
-| [계정 관리](docs/accounts.md) | 계정 디렉터리 구성, 공유 폴더, 로그인 토큰 갱신, Codex 계정 |
+| [계정 관리](docs/accounts.md) | 계정 폴더 구성, 공유 폴더, 로그인 토큰 갱신, Codex 계정 |
 | [계정 배정과 사용량](docs/selection.md) | 배정 기준과 환경변수, 사용량 수집, Ultra 계정, Codex 사용량 |
 | [아티팩트 모으기와 화면 제어](docs/publisher.md) | 발행 세션과 승인 범위, 대표 계정 여유, aside |
 | [메뉴바와 위젯](docs/app.md) | 메뉴바 창의 도구별 계정 카드, 떠 있는 위젯 |
+| [플랫폼 지원 계획](docs/platforms.md) | Linux 와 Claude Desktop, Windows 를 이 순서로 지원하는 데 필요한 일 |
 | [나중에 할 것](docs/roadmap.md) | 미뤄 둔 기능과 그 이유 |
 
-## 파일 구성
+## 본인 계정에만 쓴다
 
-| 경로 | 내용 |
-|---|---|
-| `bin/acm` | CLI. Python 3.9 표준 라이브러리만 쓴다 |
-| `bin/acm-statusline` | statusline 래퍼. 사용량을 적고 원래 statusline 을 실행한다 |
-| `app/` | 메뉴바 앱 SwiftUI 소스와 `build.sh`. Apple silicon 의 macOS 14 이상용으로 빌드한다. ad-hoc 서명이라 빌드한 Mac 에서만 돈다 |
-| `docs/` | 기능별 자세한 설명과 로고 `logo.svg` |
-| `tests/` | 가짜 홈 폴더에서 도는 테스트. `python3 -m unittest discover -s tests` |
-| `install.sh` | 설치와 제거 |
-| `~/.acm/` | 상태. `accounts.json` 과 계정별 사용량, 조회와 세션 기록, 발행 세션 폴더. 소유자만 여는 0700 으로 맞춘다 |
+acm 은 Anthropic 이나 OpenAI 와 관계없는 비공식 도구다. Anthropic 은 [구독 요금제의 사용 한도가 평범한 개인 사용을 전제한다](https://code.claude.com/docs/en/legal-and-compliance)고 적고 있다. acm 은 구독을 여러 개 가진 한 사람이 쓰려고 만든 도구라서 여러 사람이 계정을 나눠 쓰는 데는 쓰지 않는다.
 
 ## 기여하거나 취약점을 알리려면
 

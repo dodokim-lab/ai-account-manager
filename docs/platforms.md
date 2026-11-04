@@ -47,8 +47,8 @@ The menu bar app is not built for Linux. `acm status` shows the same accounts, a
 
 - The ubuntu CI job passes.
 - Step 4 above works end to end on a real Linux machine, and the result is noted with the date and versions in a footnote.
-- The README says acm runs on macOS and Linux, and the Quick start names what to install on Linux.
-- WSL 2 is tried once. If it works, the README says so. If it does not, this doc records what broke.
+- The README and the guide say acm runs on macOS and Linux, and name what to install on Linux.
+- WSL 2 is tried once. If it works, the README and the guide say so. If it does not, this doc records what broke.
 
 ## Claude Desktop waits until the Code tab follows a config folder
 
@@ -104,7 +104,7 @@ Add a `windows-latest` job to CI that runs the unit tests. Then, on a real Windo
 ### Done when
 
 - On native Windows, `claude` and `codex` typed in PowerShell start on the picked account, the accounts share one `~/.claude` or `~/.codex`, and `acm status` shows usage.
-- The README says which features native Windows lacks and that WSL 2 has them.
+- The README and the guide say which features native Windows lacks and that WSL 2 has them.
 
 ## Footnotes
 

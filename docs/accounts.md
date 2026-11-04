@@ -1,6 +1,6 @@
 # Accounts
 
-This doc covers what each account folder keeps on its own and what it shares, and how acm handles login tokens. Codex accounts have their own section at the end. If you only need the commands to add accounts, the README is enough.
+This doc covers what each account folder keeps on its own and what it shares, and how acm handles login tokens. Codex accounts have their own section at the end. If you only need the commands to add accounts, the [guide](../GUIDE.md) is enough.
 
 ## You add an account, then sign in with it
 
