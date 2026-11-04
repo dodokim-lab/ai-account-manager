@@ -15,6 +15,7 @@ Click the logo to open the window. At the top are the acm logo and the name AI A
 - An account with a per-model weekly limit shows one more gauge named after the model, such as `Fable` or `Sonnet`. Which limit counts toward picks is in [Account selection and usage](selection.md).
 - Codex cards name the long window gauge by its length, such as `30d`. An account that Codex reported as unusable right now gets a red `Unavailable`.
 - An orange `claude` or `codex` mark in the session list means a session started without acm. With more than one tool, each line starts with the tool name.
+- If the Antigravity CLI `agy` is installed and signed in, a green Antigravity box shows the weekly usage of each model group, such as Gemini and Claude and GPT. acm does not start or pick agy, so the box has no account, session count, or next pick. The widget does not show it. See [Account selection and usage](selection.md).
 - At the bottom are switches for the selection mode, launch at login, and the floating widget. If you have a Codex account, "New Session…" becomes a menu for choosing the tool.
 
 A verified Ultra account with no 5-hour limit leaves its 5h spot empty. Mixed with accounts that have a limit, the widget shows `No limit` in the 5h cell, and `acm status` shows `none`. If no signed-in account has a 5h limit, the widget, the account cards, and `acm status` drop the 5h column. An account whose usage has never been read is not assumed to have no limit. The widget and `acm status` put `–` in that cell, and the account card shows `Not read yet`.

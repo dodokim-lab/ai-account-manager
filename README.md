@@ -14,7 +14,7 @@ acm picks an account each time a session starts. It weighs the 5-hour headroom a
 
 All accounts of a tool share one context. Memory, history, settings, and skills live in one `~/.claude` or `~/.codex`, and each account folder links to it. A Claude session stopped by a limit continues on another account with `acm resume`, and `acm codex resume` opens a Codex session from any Codex account.
 
-The menu bar window shows every account's 5-hour and weekly usage with its reset time, and a floating widget keeps the same numbers on screen. In a terminal, `acm status` prints them.
+The menu bar window shows every account's 5-hour and weekly usage with its reset time, and a floating widget keeps the same numbers on screen. In a terminal, `acm status` prints them. If the Antigravity CLI `agy` is installed, its weekly usage shows there too, though acm does not start or pick it.
 
 Claude artifacts can be collected in one account. An artifact belongs to the account that published it, and only that account can edit or delete it. With artifact collection on, sessions on other accounts hand their artifacts to a publisher session on the primary account, so every artifact is managed from one place.
 
@@ -55,7 +55,7 @@ The [guide](GUIDE.md) covers adding Claude and Codex accounts, starting sessions
 |---|---|
 | [Setup](docs/setup.md) | What `acm setup` changes, the shell function, starting from IDEs |
 | [Accounts](docs/accounts.md) | Account folder layout, the shared folder, login token refresh, Codex accounts |
-| [Account selection and usage](docs/selection.md) | Selection rules and environment variables, usage collection, Ultra accounts, Codex usage |
+| [Account selection and usage](docs/selection.md) | Selection rules and environment variables, usage collection, Ultra accounts, Codex usage, Antigravity usage |
 | [Artifact collection and screen control](docs/publisher.md) | The publisher session and its scope, primary account headroom, screen control through Aside Browser |
 | [Menu bar and widget](docs/app.md) | Per-tool account cards in the menu bar window, the floating widget |
 | [Platform support plan](docs/platforms.md) | What Linux, Claude Desktop, and Windows support needs, in that order |

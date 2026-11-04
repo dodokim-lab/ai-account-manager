@@ -97,6 +97,14 @@ Running sessions count top-level `codex` processes started by your macOS user. T
 
 `acm resume` continues only Claude sessions. Codex session history is shared by every account. Close the limited session and type `acm codex resume <session ID>`, and it opens on the account with the most headroom. Whether the earlier reasoning history carries over when continuing on another account is unverified.
 
+## Antigravity usage is shown but never picked
+
+The Antigravity CLI `agy` can hold only one account. It has no environment variable to change its config folder, and it kept using `~/.gemini` even with `GEMINI_DIR` set. Changing `HOME` requires a new sign-in, and the login data goes into a single `antigravity` entry in the macOS keychain.[12] So acm does not start agy, split it into accounts, or pick for it. It only shows agy's usage next to the other tools.
+
+When `agy` is installed, acm reads `agy -p /usage --output-format json` every 5 minutes. The response lists groups of models that share a weekly limit, such as Gemini and Claude and GPT, with the remaining fraction and the reset time of each. acm shows the used percentage per group in the menu bar window and in `acm status`. It does not call a model, and each run took 4 to 7 seconds.[13] Nothing shows until the first read succeeds.
+
+Signed out, agy prints a sign-in URL, opens it in the browser with the `open` command it finds on PATH, and waits.[13] A background poll must not open a browser, so acm puts an `open` and an `xdg-open` that do nothing in `~/.acm/agy-shim` first on PATH. It stops agy as soon as the sign-in message appears and tries again after 6 hours. Run `agy` once yourself to sign in.
+
 ## Footnotes
 
 [1] 2026-11-02, Claude Code 2.1.316. On two accounts, `claude -p "/usage" --output-format json` reported `usage` tokens of 0 and `total_cost_usd` of 0. The output format was checked in the `/usage` code of the same version.
@@ -120,3 +128,7 @@ Running sessions count top-level `codex` processes started by your macOS user. T
 [10] 2026-11-03, codex-cli 0.165.0. On a free plan default account, `initialize` through the `account/rateLimits/read` response took 0.5 to 2.0 seconds. In the response, `primary` had `windowDurationMins` 43200 and `usedPercent` 100, `secondary` was null, and `ordinaryUsageAllowed` was false.
 
 [11] 2026-11-03, codex-cli 0.166.0. On an account upgraded from free to Plus, `acm status` showed 5h and Week. The 5h reset was five hours away, and the Week reset seven days away.
+
+[12] 2026-11-03, agy 1.4.8. Even with `GEMINI_DIR` changed, it read `~/.gemini`. Changing `HOME` to a temp folder made it ask for sign-in again. The keychain entry name was checked, but its contents were not opened. The changelog of 1.4.12, released the same day, also said nothing about accounts or config folders. The `AGY_ACCOUNT` in the executable is a variable that picks the account of a CLI attached as a plugin. It is unrelated to agy sign-in.
+
+[13] 2026-11-04, agy 1.4.12. `/usage` reported 0 input and output tokens and took 4.1 to 7.2 seconds. With `HOME` pointed at an empty folder, agy printed "Authentication required" and the sign-in URL, and a fake `open` placed first on PATH received that URL.

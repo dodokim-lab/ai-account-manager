@@ -111,7 +111,7 @@ Both keep the account folders and `~/.acm`. They hold login data, so deleting th
 |---|---|
 | [Setup](docs/setup.md) | What `acm setup` changes, the shell function, starting from IDEs |
 | [Accounts](docs/accounts.md) | Account folder layout, the shared folder, login token refresh, Codex accounts |
-| [Account selection and usage](docs/selection.md) | Selection rules and environment variables, usage collection, Ultra accounts, Codex usage |
+| [Account selection and usage](docs/selection.md) | Selection rules and environment variables, usage collection, Ultra accounts, Codex usage, Antigravity usage |
 | [Artifact collection and screen control](docs/publisher.md) | The publisher session and its scope, primary account headroom, screen control through Aside Browser |
 | [Menu bar and widget](docs/app.md) | Per-tool account cards in the menu bar window, the floating widget |
 | [Platform support plan](docs/platforms.md) | What Linux, Claude Desktop, and Windows support needs, in that order |
