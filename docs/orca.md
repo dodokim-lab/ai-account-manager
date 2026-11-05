@@ -14,6 +14,7 @@ Everything here was observed on one macOS setup.[1] Orca changes often, so a ste
 | Showing sessions on the phone | Orca | The phone app pairs with the desktop through Orca Relay |
 | Showing every account's usage | acm | The tag in front of each session's statusline |
 | Collecting artifacts in one account | acm | The publisher session, started outside Orca in tmux |
+| Passing work between Claude and Codex | Orca | Orchestration workers. acm picks the account of each worker |
 
 ## Quick start
 
@@ -63,6 +64,30 @@ A session started in another terminal keeps its history in the shared folder, so
 
 Without `-a <account>`, use `acm claude --resume <session id>` and acm picks the account again. The tab belongs to the workspace whose terminal you opened, not to the folder you moved to, so the phone lists it under that workspace.
 
+## To continue a session that hit its limit
+
+The steps are those of [Account selection and usage](selection.md#a-session-that-hits-a-limit-continues-on-another-account-with-acm-resume), typed in the session's own tab. They were tried with a limit record made by hand, not with a real limit.[11]
+
+1. Do not wait for acm's notification. It is a terminal sequence that iTerm2 shows as a desktop notification, and Orca's terminal has no handler for it. The session shows Claude Code's own limit message, and `acm status` reports the stopped session.
+2. Close the session with `/exit`. The tab drops to its shell.
+3. Run `acm resume` there. acm picks another account and reopens the session in the same tab, and Orca lists the tab as a Claude agent again.
+
+## To pass work between Claude and Codex
+
+Orca's orchestration lets one agent start another as a worker and get its report back, such as Claude asking Codex for a review. Agent hibernation is a different feature. It pauses idle sessions and is covered under [Still to check](#still-to-check).
+
+1. Install the two skills that teach an agent the commands. They link into the shared skills folder, so sessions on every account get them.
+
+   ```sh
+   orca skills install --skill orca-cli --skill orchestration --agent claude,codex
+   ```
+
+2. In a session Orca started, ask for the other agent by name and say that you want the result back. The skill tells the session to start the worker with `orca orchestration worker-start --agent codex`. In the test that command was typed by hand.[13]
+3. The worker opens in a new tab. A Codex worker goes through acm like any other Codex session, so it runs on the account acm picks.[13]
+4. Watch for a worker that waits on a prompt. Codex's sandbox blocked the worker's report to Orca, and Codex asked to run that command outside the sandbox. The session that started the worker got a message that the worker was waiting. Approve the prompt in the worker's tab.[13]
+
+The worker runs in the workspace that the starting session's tab belongs to, which is not always the folder that session is in.
+
 ## To reach your sessions from a phone
 
 1. Sign in to an Orca account on the desktop. Without it Orca offers only the desktop's local address, and a phone on mobile data fails with `direct websocket closed 1006`.
@@ -74,7 +99,7 @@ The sessions still run on the desktop, on the account acm picked there.
 ## To use the phone
 
 - Open a workspace to see its session tabs. A tab opens in the terminal view or the chat view. Orca's docs say a long-press on a tab switches that tab between the two.[7]
-- Read every account's usage from the tag at the bottom of a session. It was seen in the terminal view. The chat view was not checked.[6]
+- Read every account's usage from the tag at the bottom of a session. It shows in the terminal view and in the chat view. The chat view cuts a long statusline short, and the tag comes first, so the tag stays and the rest is lost.[6]
 - Do not rely on the phone's usage screen. It lists the accounts Orca manages, which is the default account only.
 - To see the full table, add a Quick Command with the command `acm status`. The list syncs between the desktop and the phone, and running it opens a new tab.[7]
 
@@ -96,16 +121,17 @@ Three ways were tried. The statusline tag is the one that needs nothing opened a
 | Shared history, memory, and skills | Works | Sessions on two accounts in an Orca worktree read the memory folder of the main repository |
 | Usage from the statusline | Works | Orca leaves `statusLine` in the settings as it is. The tag in front of the statusline lists every Claude account's usage, on the desktop and in the phone's terminal view |
 | Collecting artifacts in one account | Works | A session on another account in an Orca tab handed off a publish, and the artifact landed in the primary account. The publisher session drops Orca's variables.[9] See [Artifact collection](publisher.md) |
-| Continuing a session that hit its limit | Not yet tried | The StopFailure hook still runs. Run `acm resume` in a terminal of the same worktree |
+| Continuing a session that hit its limit | Works, without the notification | Tried with a limit record made by hand. See [To continue a session that hit its limit](#to-continue-a-session-that-hit-its-limit) |
 | Menu bar app and widget | Works, with one gap | They count Orca's sessions too. "New Session…" opens iTerm, not Orca |
-| Codex accounts | Not yet tried | Set the Command of Codex to `<home>/.local/bin/acm codex` |
+| Codex accounts | Works | Orca types `codex` into the tab's shell, and the shell function that `acm setup` added sends it through acm. The Command of Codex was left as it is.[12] |
+| Claude and Codex passing work to each other | Works up to the worker's report | The worker ran on the Codex account acm picked. Its report waited on a Codex prompt.[13] |
 
 ## What Orca does not know about acm
 
 Orca treats every session as the default account. It names a config folder first, and acm sets the real one afterwards. Three things follow.
 
 - Orca's status bar and the phone's usage screen show the default account and its usage, whatever account the session runs on. Read usage from the tag in front of each session's statusline, such as `[work · cl1 62% · cl2 66%]`, or with `acm status` or the menu bar app.[6]
-- Orca reads Claude usage by calling the usage API with that account's login token.[2] acm still never reads a token. Orca does it on its own.
+- Orca reads Claude usage by calling the usage API with that account's login token.[2] acm still never reads a token. Orca does it on its own. No setting turns this off for Claude. Orca reads while its window is visible and focused, and when the phone connects.[14]
 - Do not add accounts in Orca's account switcher. Accounts added there live in Orca's data, where acm cannot see them.
 
 ## What Orca changes on your machine
@@ -139,11 +165,14 @@ launchctl setenv NODE_EXTRA_CA_CERTS <bundle.pem>
 
 ## Still to check
 
-- Whether Orca's terminal shows the notification acm sends when a session hits its limit.
-- Codex through `acm codex`. Orca's docs warn that a wrapper which sets `CODEX_HOME` reads a home Orca did not set up.[4] acm links each extra Codex account's `hooks.json` and `config.toml` to those in `~/.codex`, so the hooks should be found.
+- A real limit in an Orca session. Orca's code treats that stop as the end of a failed turn, so Orca may send its own notification to the desktop and the phone. This was not seen.[11]
+- An agent that Orca starts as a chat instead of a terminal. Nothing is typed into a shell then, so the session may skip acm and run on the default account.
+- The Command of Codex set to `<home>/.local/bin/acm codex`, for a shell without acm's function. Orca's docs warn that a wrapper which sets `CODEX_HOME` reads a home Orca did not set up.[4] With the shell function, the hooks were found, because acm links each extra Codex account's `hooks.json` and `config.toml` to those in `~/.codex`.[12]
+- The worker's report after its prompt is approved, a Claude session that starts a worker on its own from the installed skills, and a way for a Codex worker to report with no prompt.
 - Agent hibernation, which is off by default. Orca reopens a paused session with the same launch command and `--resume`.[5] Through acm the pick runs again, so the session may continue on another account.
+- Whether Orca's usage reads make the API answer `429` to acm's `/usage` poll on the default account. Both call the same API, and a menu bar plugin that called it every 2 minutes did that. See footnote 2 of [Account selection and usage](selection.md).
 - A phone on mobile data while the desktop is behind a VPN, and a Relay connection held for a long time.
-- The Quick Command for `acm status`. A tab that ran `acm status` showed on the phone, but the command was not saved as a Quick Command.
+- Quick Commands for `acm status` and `acm resume`. A tab that ran `acm status` showed on the phone, but neither command was saved as a Quick Command.
 
 ## Footnotes
 
@@ -157,7 +186,7 @@ launchctl setenv NODE_EXTRA_CA_CERTS <bundle.pem>
 
 [5] Agent hibernation in the Orca docs. It says Orca relaunches the agent CLI with resume flags such as `claude --resume <id>`, and "Resume also reuses the launch command, arguments, and private environment captured when Orca first opened the agent." https://github.com/stablyai/orca/blob/main/docs/site/content/docs/agents/hibernation.mdx
 
-[6] 2026-11-05, Orca 1.4.249 and its phone app, Claude Code 2.1.318. The statusline of a session showed on the phone in the terminal view. The phone's usage screen listed one account. How the tag is built is in [Account selection and usage](selection.md#the-statusline-tag-lists-every-claude-accounts-usage).
+[6] 2026-11-05, Orca 1.4.249 and its phone app, Claude Code 2.1.318. The statusline of a session showed on the phone in the terminal view. In the chat view the tag showed, and a statusline with several more items after it was cut off. The phone's usage screen listed one account. How the tag is built is in [Account selection and usage](selection.md#the-statusline-tag-lists-every-claude-accounts-usage).
 
 [7] Terminal and Mobile in the Orca docs. Quick Commands are created under Settings → Quick Commands, run from the tab bar, and "sync both ways" with the phone. https://github.com/stablyai/orca/blob/main/docs/site/content/docs/mobile.mdx
 
@@ -166,3 +195,11 @@ launchctl setenv NODE_EXTRA_CA_CERTS <bundle.pem>
 [9] 2026-11-05, Orca 1.4.249, Claude Code 2.1.318, tmux 3.8. A session started with `acm -a` on the second Claude account in an Orca terminal tab wrote an HTML file, staged it with `acm publisher check`, and sent the staged path to the publisher session. `check` started the publisher session, which returned a URL, and the artifact was listed under the primary account. The requesting claude process carried 25 `ORCA_*` variables. The publisher session's process carried none, and no `CLAUDE_CODE_PLUGIN_DIRS`.
 
 [10] 2026-11-05, Orca 1.4.249, macOS 15.7.1. With the variable set by `launchctl setenv`, Orca was quit and started again with `open` from an empty environment, without `--env`. The new main process had launchd as its parent and carried the variable. The Dock icon itself was not clicked. A test app that only records its environment gave the same result. The sessions running in Orca's terminals kept running through the restart.
+
+[11] 2026-11-05, Orca 1.4.249, Claude Code 2.1.318. No real limit was hit. A session started with `acm -a` on the second Claude account in an Orca tab answered one prompt. acm's `StopFailure` hook was then run by hand in that session's environment with a `rate_limit` event, and it recorded the second account. `acm resume` refused while the session was open. After `/exit`, `acm resume` typed in the same tab picked the first account and reopened the session. Asked there for the word from the first turn, it answered correctly, and `orca worktree ps` listed the tab as a Claude agent in state `done`. The notification sequence (OSC 9) written to the tab's terminal did not change the screen, and the desktop was not watched for a notification. The app's terminal code registers handlers for OSC 0, 1, 2, 4, 7, 8, 10 to 12, 52, 104, 110 to 112, 133, 1337, and 7501, and none for 9. Its hook listener, in `claude-events.js`, gives a `StopFailure` event the outcome `failure` at the end of a turn. The same event sent to Orca's hook by hand was not taken, so Orca's reaction was not seen.
+
+[12] 2026-11-05, Orca 1.4.249, codex-cli 0.166.0. `orca agent launch --agent codex --surface terminal` started a session whose parent process was the tab's login shell. acm printed the account it picked, `acm status --json` listed the session under the second Codex account with `"via": "acm"`, and the process carried that account's `CODEX_HOME`. `orca worktree ps` listed the tab as a Codex agent in state `done` with its last message, so Orca's status hooks ran in that account's home.
+
+[13] 2026-11-05, Orca 1.4.249, Claude Code 2.1.318, codex-cli 0.166.0, with Orca's agent permissions not set to Yolo. Neither skill was installed yet, so a Claude session on the first Claude account ran `orca orchestration worker-start --agent codex --worktree current --spec ...` by hand. The worker opened in a terminal on the second Codex account with `"via": "acm"`, read a file, and finished the task. Its `orca orchestration send --type worker_done` failed with `runtime_access_denied: The Codex sandbox blocked this command from connecting to Orca (EPERM)`, and Codex asked to run the command again outside the sandbox. Orca typed "You have 1 orchestration message" into the starting session, and `orca orchestration check` returned an escalation with the stop reason `needs-input`. The prompt was not answered during the test, so the report reaching the starting session was not seen. The install afterwards added two folders under `~/.agents/skills` and two links in the shared skills folder, and a Claude session that was already running listed both skills.
+
+[14] 2026-11-05, Orca 1.4.249. Orca's docs list display choices only, which are the status bar items and percent used or remaining.[2] In the app's main code the usage service starts with the window and has no switch for Claude. It skips the Claude read only while a retry time from the API is in effect, and only the Antigravity read depends on its status bar item. `shouldBackgroundPoll` is true when the window is visible, not minimized, and focused. Orca's docs name more triggers, among them the phone connecting.[2]

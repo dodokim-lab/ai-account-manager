@@ -22,6 +22,7 @@ acm relies on behavior that is not documented, such as the output of `/usage`, t
 - After a Claude Code update, run `acm doctor`. If it passes, raise `VERIFIED_CLAUDE` in `bin/acm` to that version.
 - The publisher session's model is pinned in `PUBLISHER_MODEL`. Change it when the model is retired or a newer one of the same family comes out.
 - When a doc states observed behavior, add a footnote with the date and the Claude Code or Codex version, like the footnotes already in `docs/`.
+- Orca is watched the same way, though no code in acm depends on it. [docs/orca.md](docs/orca.md) describes one Orca version. After an Orca update, go through its "What works under Orca" table and "Still to check" list again, and put the new version in the footnotes you checked. Orca starts Codex by typing `codex` into a shell, adds hooks to the shared settings, and reads usage on its own, so a change in any of these can change what acm sees.
 
 ## The publisher session is a security boundary
 
