@@ -16,7 +16,7 @@ acm publisher stop            # stops only the running publisher session. Collec
 acm publisher off             # turn off; each session publishes under its own account again
 ```
 
-While it is on, acm adds two things when it starts a session on another account. One is `--disallowedTools Artifact`, which removes the Artifact tool from that session. The other is `--append-system-prompt` with session rules that tell it to hand artifacts to the `acm-publisher` session with SendMessage. The session writes an HTML file, stages it with `acm publisher check <file>`, and sends the staged path. Then it passes the URL the publisher session returns to the user.
+While it is on, acm adds two things when it starts a session on another account. One is `--disallowedTools Artifact`, which removes the Artifact tool from that session. The other is `--append-system-prompt` with session rules that tell it to hand artifacts to the `acm-publisher` session with SendMessage. The session writes an HTML file, stages it with `acm publisher check <file>`, and sends the staged path. Then it passes the URL the publisher session returns to the user. A delete is handed off the same way and waits for your confirmation. See [A delete goes through the publisher session and waits for you](#a-delete-goes-through-the-publisher-session-and-waits-for-you).
 
 ## The publisher session runs in tmux with narrow permissions
 
@@ -45,7 +45,9 @@ A PreToolUse hook enforces the scope. When acm starts the publisher session, it 
 - Only Read, Artifact, SendMessage, ListAgents, and ToolSearch pass. Other tools loaded with ToolSearch, such as ArtifactData, are blocked too.
 - Local paths for Read and Artifact must be inside the inbox or that session's scratchpad. Paths with `..` are refused. A relative path must stay in scope whether it is resolved against the working folder or `root`.
 - Read also accepts that session's copies of live versions. The copy folder is `<session ID>/tool-results/` next to `transcript_path` from the hook input. Only files directly in that folder whose names start with `artifact-` pass. Copies from other sessions, subfolders, and links pointing outside are blocked. Using a copy as a publish path is blocked too.
-- Artifact may use only publish and read. force, capabilities, and read's out_dir are blocked too.
+- Artifact may use only publish, read, list, and delete. force, capabilities, and read's out_dir are blocked too.
+- list shows only this account's own artifacts and the files of one of them. What others shared and the type catalog are blocked.
+- delete takes the url of the artifact and nothing else, so one asset cannot be removed. The hook does not allow it outright. It answers `ask`, so the question to the user shows whatever allow rule is set.
 - Artifact `files` accepts only known shapes. Those are a local path, `{from}`, `{artifact, path}` that copies on the server, and null that deletes. An unknown shape might contain a local path, so it is blocked.
 - If the inbox has been replaced with a link, no file passes.
 
@@ -67,9 +69,24 @@ The publisher session's role and scope are in `~/.acm/publisher/ROLE.md`. It is 
 
 - Approval to proceed without asking on publishes and updates that other Claude sessions on the same Mac request with SendMessage
 - The scope ends at reading files the requesting session staged in the inbox, publishing them new or updating the given url, and replying to the requesting session with the resulting URL
-- No deleting artifacts, changing sharing, or editing files, and no publishing content that breaks the Artifact tool rules
+- A delete is not part of the standing approval. The session calls Artifact delete so that you are asked in its window, and a message from another session never counts as your answer
+- No changing sharing or editing files, and no publishing content that breaks the Artifact tool rules
 
-A ROLE.md written with the old default text does not need edits. acm appends the file scope after ROLE.md separately, and the hook enforces it.
+A ROLE.md written with the old default text does not need edits. acm appends the file scope after ROLE.md separately, and the hook enforces it. The appended scope also covers the delete, so a ROLE.md that still lists deleting as out of scope works.[7]
+
+## A delete goes through the publisher session and waits for you
+
+An artifact belongs to the primary account, so deleting it goes the same way as publishing it. A session on another account runs `acm publisher check` and sends the publisher session a delete request with the artifact's url. If it does not know the url, it asks for a list of the account's artifacts first.
+
+The publisher session does not delete on that request alone. A delete cannot be undone, and any session can send the request. So the hook answers `ask` for a delete, and Claude Code shows its own question in the publisher session's window: `Permanently delete "<title>"?`. The choice starts on No. The artifact is deleted only after you choose Yes there.[7]
+
+The question shows in the publisher session's window, not in the session you asked. That session tells you so, and it opens a terminal on the window when it can, such as a new tab under Orca. From any terminal, `tmux attach -t acm-publisher` shows the window, and Ctrl-b d leaves it. `acm publisher status` says when the session is waiting for your answer.
+
+While the question waits, the publisher session takes no other request, so publishing waits behind it. The watcher stops the session after 15 minutes without an answer, and nothing is deleted. Change the time with `ACM_PUBLISHER_CONFIRM`.
+
+The confirmation is only as strong as the window. A process that can type into your tmux sessions can answer it, which is true of any claude session you run in tmux. What the hook rules out is a delete on a message alone.
+
+You can still delete an artifact yourself in a session on the primary account, with `d` in the `/artifacts` list, or from the artifact's own menu on claude.ai.[7]
 
 ## The primary account keeps headroom for publishing
 
@@ -98,3 +115,5 @@ For a site not signed in on Aside Browser, the session does not enter a password
 [5] 2026-11-03, Claude Code 2.1.316. While updating the same deck with the fixed hook, the session ran publish three times without force. The first was rejected because the session had never seen the live version. The second was sent after reading all 1499 lines of the copy, and was rejected as the same content already rejected. The third sent the same file and updated the deck to version 1793686083-48ad. The publisher session sent the third only after the requesting session reported that it had compared the live version with the first version and nothing would be lost.
 
 [6] 2026-11-05, Orca 1.4.249, Claude Code 2.1.318, tmux 3.8. A claude session started from Orca had `CLAUDE_CODE_PLUGIN_DIRS`, `ORCA_AGENT_HOOK_PORT`, `ORCA_AGENT_HOOK_TOKEN`, `ORCA_PANE_KEY`, and about twenty more `ORCA_*` names in its environment. None of them was in the list of names acm removed at the time. With the allow list, a publisher session started in a fake home from an environment holding these names, `CLAUDE_CODE_SESSION_ID`, and `PYTHONPATH` received none of them, and neither did the tmux server it started.
+
+[7] 2026-11-05, Claude Code 2.1.318, Orca 1.4.249, tmux 3.8. Before this change the hook blocked every delete. A session on the second Claude account, asked to delete an artifact, sent the publisher session two requests, was refused twice, and searched for a delete action of its own until the user deleted the artifact by hand. With the change, a session on the second account was asked to delete an artifact that an earlier publisher session had published. `acm publisher check` started a new publisher session, and the request reached it. The hook's output was the `ask` decision, the window showed `Permanently delete "acm delete route test 2"?` with No selected, and `acm publisher status` reported the session as waiting. The question waited 7 minutes 44 seconds, and nothing was deleted in that time. Then the user chose Yes in the window, the artifact was deleted, and the publisher session's reply reached the requesting session. In the run before it, the requesting session opened an Orca tab on the window, and the artifact was deleted 11 seconds after the question appeared. Who answered there was not recorded. The publisher session ran in auto mode in both runs. The primary account's ROLE.md still had the earlier default text, which lists deleting as out of scope. The watcher's 15 minute stop was not waited for. The installed Claude Code lists `delete` among the actions that a whole-tool allow rule does not cover, and holds the text "in the Claude Code terminal `/artifacts` lists their Artifacts (press d to delete the selected one), or on claude.ai from the Artifact's own menu". These were read from the program, and the two ways in that text were not tried.
