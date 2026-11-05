@@ -1019,14 +1019,51 @@ class Resume(AcmCase):
             self.acm.cmd_resume(self.data, [])
         self.assertEqual(self.launched, [])
 
-    def test_session_that_kept_going_is_not_offered(self):
+    def limited_long_ago(self, entries):
+        """Record a limit hit well past the grace time, with a transcript that was written to just now."""
         self.hit()
         transcript = os.path.join(self.home, "t.jsonl")
-        open(transcript, "w").close()
+        with open(transcript, "w") as f:
+            for entry in entries:
+                f.write(json.dumps(entry) + "\n")
         path = os.path.join(self.acm.LIMITED_DIR, f"{self.SID}.json")
         rec = self.acm.read_json(path)
         rec.update(transcript=transcript, at=int(time.time()) - 3 * self.acm.LIMITED_GRACE)
         self.acm.save_json(path, rec)
+
+    @staticmethod
+    def stamp(ago):
+        return time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(time.time() - ago))
+
+    def answer(self, ago, model="claude-haiku-4-5", **extra):
+        return dict({"type": "assistant", "timestamp": self.stamp(ago), "message": {"model": model}}, **extra)
+
+    def test_session_that_kept_going_is_not_offered(self):
+        self.limited_long_ago([self.answer(ago=1)])
+        self.assertEqual(self.acm.limited_sessions(), [])
+
+    def test_session_closed_late_is_still_offered(self):
+        # What Claude Code leaves when a session stops at its limit and is closed later: an answer from before the limit,
+        # the limit message as an assistant entry, and the entries written on exit, which carry no time
+        grace = self.acm.LIMITED_GRACE
+        self.limited_long_ago([
+            self.answer(ago=4 * grace),
+            self.answer(ago=3 * grace, model="<synthetic>", isApiErrorMessage=True, error="rate_limit"),
+            {"type": "user", "timestamp": self.stamp(1), "message": {"role": "user", "content": "are you there"}},
+            self.answer(ago=1, model="<synthetic>", isApiErrorMessage=True, error="rate_limit"),
+            {"type": "cost-state"}, {"type": "file-history-snapshot"}, {"type": "last-prompt"},
+        ])
+        self.assertEqual([r["session_id"] for r in self.acm.limited_sessions()], [self.SID])
+
+    def test_answer_is_found_past_a_cut_line_and_broken_lines(self):
+        self.limited_long_ago([self.answer(ago=1)])
+        transcript = os.path.join(self.home, "t.jsonl")
+        with open(transcript) as f:
+            answer = f.read()
+        with open(transcript, "w") as f:
+            # The tail starts inside the long first line. Lines that are not JSON or not objects are skipped
+            f.write(json.dumps({"type": "assistant", "pad": "x" * self.acm.LIMITED_TAIL}) + "\n")
+            f.write(answer + 'not json "assistant"\n["assistant"]\n{"type": "last-prompt"}\n')
         self.assertEqual(self.acm.limited_sessions(), [])
 
     def test_setup_adds_hook_beside_existing_and_undo_removes_only_ours(self):

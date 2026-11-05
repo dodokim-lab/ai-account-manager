@@ -2976,8 +2976,41 @@ def session_account(data, env=None):
     return None
 
 
-# If the transcript kept growing longer than this after hitting the limit, the session went on in that account after the reset, so it is not a handoff target
+# If the model answered later than this after the limit, the session went on in that account after the reset, so it is not a handoff target
 LIMITED_GRACE = 120
+# How much of the end of a transcript is read to look for that answer
+LIMITED_TAIL = 256 * 1024
+
+
+def answered_after(transcript, since):
+    """True if the newest model answer in the transcript was written after that time.
+    Closing a session appends entries too, and the limit message itself is an assistant entry with the model <synthetic>,
+    so only an assistant entry from a real model counts."""
+    try:
+        with open(transcript, "rb") as f:
+            size = f.seek(0, os.SEEK_END)
+            f.seek(max(0, size - LIMITED_TAIL))
+            lines = f.read().split(b"\n")
+    except (OSError, TypeError):
+        return False
+    if size > LIMITED_TAIL:
+        lines = lines[1:]  # the first line is cut off
+    for line in reversed(lines):
+        if b'"assistant"' not in line:
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(entry, dict) or entry.get("type") != "assistant" or entry.get("isApiErrorMessage"):
+            continue
+        message = entry.get("message")
+        if not isinstance(message, dict) or message.get("model") in (None, "<synthetic>"):
+            continue
+        at = parse_iso(entry.get("timestamp"))
+        if at is not None:
+            return at > since
+    return False
 
 
 def short_folder(path):
@@ -2996,11 +3029,14 @@ def limited_sessions():
         r = read_json(path)
         if not isinstance(r, dict) or not SESSION_ID_RE.fullmatch(str(r.get("session_id") or "")):
             continue
+        late = (number(r.get("at")) or 0) + LIMITED_GRACE
         try:
-            if os.path.getmtime(r.get("transcript") or "") > (r.get("at") or 0) + LIMITED_GRACE:
-                continue
+            changed = os.path.getmtime(r.get("transcript") or "") > late
         except (OSError, TypeError):
-            pass
+            changed = False
+        # A late change alone is not enough, because closing the session writes to the transcript too
+        if changed and answered_after(r["transcript"], late):
+            continue
         recs.append(r)
     return sorted(recs, key=lambda r: r.get("at") or 0, reverse=True)
 
