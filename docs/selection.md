@@ -62,6 +62,8 @@ One number is the weekly usage. Two numbers are 5h and Week. A `?` after the num
 
 `acm statusline-usage off` leaves only the label, and `acm statusline-usage on` brings the list back.
 
+Claude Code cuts a statusline line that is wider than the terminal, and the tag makes the first line wider. So `acm-statusline` folds a line that does not fit, at its spaces, onto more rows. A narrow terminal, such as one sized to a phone, then shows the whole statusline. A line that fits is left as it is, and a word wider than the row is not split. The fold uses the width Claude Code gives the statusline command. When the terminal changes size, the fold changes at the next statusline update, not at once.[16]
+
 ## A verified Ultra account shows no 5h limit
 
 A verified Ultra account has no 5-hour limit, so acm treats its 5h as no limit, not as 0%. When the Max 20x plan became Ultra on 2026-10-30, Anthropic started verifying Ultra accounts automatically from account and billing history and removed the 5-hour limit for verified accounts.[3] If Settings > Usage and the `/usage` output have no Current session line, the account is verified.[4]
@@ -148,3 +150,5 @@ Signed out, agy prints a sign-in URL, opens it in the browser with the `open` co
 [14] 2026-11-05, Claude Code 2.1.318, jq 1.8.2, macOS 15.7.1. Five runs of the wrapper with two Claude accounts took 1.008 seconds with the list and 0.470 seconds with the wrapper from before it.
 
 [15] 2026-11-05, Claude Code 2.1.318. A session was recorded as limited and closed with `/exit` 137 seconds later. Closing appended `cost-state`, `file-history-snapshot`, and `last-prompt` entries, which carry no time, and changed the file's modified time. Before this fix acm compared only that time, so `acm status` and `acm resume` no longer listed the session. Histories written by 2.1.296 and 2.1.316 hold a limit message as an `assistant` entry with the model `<synthetic>`, `isApiErrorMessage` true, and `error` `rate_limit`. acm reads the last 256 KB of the history and counts only an `assistant` entry from a real model.
+
+[16] 2026-11-05, Claude Code 2.1.318, jq 1.8.2, tmux 3.8, macOS 15.7.1. In a terminal 48 columns wide, a statusline line of 44 characters showed whole, and a line of 45 showed 43 characters and `…`. With `padding` 3 in `statusLine`, a cut line took 38 columns. The statusline command received `COLUMNS=48` and `LINES=24`, and could not open `/dev/tty`. Widening the terminal to 80 columns redrew the same text and did not run the command again. With the fold, a two-line statusline behind the tag showed on four rows at 48 columns with nothing cut, and on its two rows at 140 columns. Thirty runs of the wrapper took 1.456 seconds without `COLUMNS` and 1.511 seconds with a line folded at 48 columns.
