@@ -78,6 +78,10 @@ acm publisher off        # turn off; each session publishes under its own accoun
 
 Pick the account you are signed in to on claude.ai in your browser as the primary account. Otherwise you cannot open the collected artifacts. Only Claude artifacts are collected for now. Collecting Codex Sites is on the [roadmap](docs/roadmap.md).
 
+## Using acm with Orca
+
+In Orca, set the Command of Claude Code to `<home>/.local/bin/acm claude`, and every Claude Code session Orca starts goes through acm's pick. Codex needs no change, because Orca types `codex` into a shell and the shell function from `acm setup` sends it through acm. [Using acm with Orca](docs/orca.md) has the install steps, how to use it from a phone, and what is still to check.
+
 ## Checking after a Claude Code update
 
 acm depends on undocumented Claude Code behavior such as the output format of `/usage`. After you update Claude Code, run `acm doctor`. It reads every account for real and reports whether that behavior still matches. It exits with code 1 when something is off.
@@ -114,7 +118,8 @@ Both keep the account folders and `~/.acm`. They hold login data, so deleting th
 | [Account selection and usage](docs/selection.md) | Selection rules and environment variables, usage collection, Ultra accounts, Codex usage, Antigravity usage |
 | [Artifact collection and screen control](docs/publisher.md) | The publisher session and its scope, primary account headroom, screen control through Aside Browser |
 | [Menu bar and widget](docs/app.md) | Per-tool account cards in the menu bar window, the floating widget |
-| [Using acm with Orca](docs/orca.md) | Starting Orca's sessions through acm, reaching them from a phone, what works and what is still to check |
+| [Using acm with Orca](docs/orca.md) | Starting Orca's sessions through acm, reaching them from a phone, where Orca puts new worktrees, what works and what is still to check |
+| [How acm differs from similar tools](docs/comparison.md) | What sets acm apart, and a comparison with claude-swap, CCS account pools, claude-limits, and Orca's account switcher |
 | [Platform support plan](docs/platforms.md) | What Linux, Claude Desktop, and Windows support needs, in that order |
 | [Roadmap](docs/roadmap.md) | Deferred features and why they were deferred |
 

@@ -4,50 +4,20 @@ English | [한국어](README.ko.md)
 
 If you pay for more than one Claude Code or Codex subscription, the accounts do not work together. A session runs on whichever account you signed in to last, so one account hits its limit while another sits unused. Each account also keeps its own memory, history, settings, and skills, so moving to another account means starting from an empty context.
 
-acm is a launcher that makes those accounts work as one. Keep typing `claude` and `codex` as usual. acm starts each session on the account of that tool with the most headroom left, and every account reads the same `~/.claude` or `~/.codex`, so your context comes along. It never reads or moves a login token. It also runs behind [Orca](https://github.com/stablyai/orca), so the sessions Orca starts on your desktop and shows on your phone get the same pick and the same context.
+acm is a launcher that makes those accounts work as one. Keep typing `claude` and `codex` as usual. acm starts each session on the account of that tool with the most headroom left, and every account reads the same `~/.claude` or `~/.codex`, so your context comes along. It also runs behind [Orca](https://github.com/stablyai/orca), so the sessions Orca starts on your desktop and shows on your phone get the same pick and the same context.
 
 ![On the left, typing claude and codex in a terminal prints the account acm picked. On the right, the acm menu bar window lists three Claude accounts and two Codex accounts with 5-hour and weekly usage gauges, and the picked account of each tool is outlined. Below the terminal, the Claude accounts cl1 to cl3 point to one ~/.claude and the Codex accounts cx1 and cx2 to one ~/.codex.](docs/readme/hero.svg)
 
 ## What sets acm apart
 
-Other tools switch the signed-in account, pool accounts behind a proxy, or show usage. acm differs from them in six ways.
+- The account is picked for each session. A new session starts on the account with the most headroom, with nothing to switch.
+- Every account shares one context. Memory, history, settings, and skills are one `~/.claude` or `~/.codex`.
+- Login tokens are never read or moved. Each account stays signed in through the tool's own login.
+- Claude Code and Codex are handled by one tool, with one status table and one menu bar window.
+- Claude artifacts are collected in one account, so they are edited and deleted from one place.
+- It runs behind Orca. Orca's own account switcher changes the active account when you click it. Behind Orca, acm picks the account for each session, and the accounts share one context.
 
-| What sets acm apart | How |
-|---|---|
-| The account is picked for each session, with nothing to switch | Each new session starts on the account with the most headroom, so usage spreads across accounts and does not fill one first. acm weighs the 5-hour headroom against how fast the weekly limit is being used, so an account that would lose unused quota at its reset goes first. Accounts close to a limit are left out, and among accounts with close scores, the one running fewer sessions wins. The rules are in [Account selection and usage](docs/selection.md) |
-| Every account shares one context | Memory, history, settings, and skills live in one `~/.claude` or `~/.codex`, and each account folder links to it. A Claude session stopped by a limit continues on another account with `acm resume`, and `acm codex resume` opens a Codex session from any Codex account |
-| Login tokens are never read or moved | Each account signs in through Claude Code's or Codex's own login flow and stays signed in to its own folder. Usage comes from the statusline and from `claude -p /usage` and `codex app-server` run under that account. No credential is swapped or copied, and there is no proxy |
-| Claude Code and Codex in one tool | The pick, `acm status`, and the menu bar window cover both tools. Accounts are picked among those of the same tool |
-| Claude artifacts are collected in one account | An artifact belongs to the account that published it, and only that account can edit or delete it. With artifact collection on, sessions on other accounts hand their artifacts to a publisher session on the primary account, so every artifact is managed from one place |
-| It runs behind Orca | [Orca](https://github.com/stablyai/orca) starts sessions in git worktrees and shows them on a phone. Its own account switcher changes the active account when you click it. Behind Orca, acm gives each session the pick and the shared context, and the session's statusline shows every Claude account's usage. See [Using acm with Orca](#using-acm-with-orca) |
-
-The menu bar window shows every account's 5-hour and weekly usage with its reset time, and a floating widget keeps the same numbers on screen. In a terminal, `acm status` prints them. If the Antigravity CLI `agy` is installed, its weekly usage shows there too, though acm does not start or pick it.
-
-## Using acm with Orca
-
-[Orca](https://github.com/stablyai/orca) is a desktop app that runs coding agents in git worktrees and pairs with a phone app. acm works on one machine and cannot show your sessions on another device, and Orca can. Orca in turn leaves the choice of account to you. Its account switcher changes the active account when you click it, and its docs say each extra account runs in an isolated home. With Orca in front of acm, each fills the other's gap. Orca starts and shows the sessions, and acm picks the account for each one and brings the shared context.
-
-The setup is one setting. In Orca, set the Command of Claude Code to `<home>/.local/bin/acm claude`, and every Claude Code session Orca starts goes through acm's pick. Codex needs no change, because Orca types `codex` into a shell and the shell function from `acm setup` sends it through acm.
-
-| With Orca in front | What you get |
-|---|---|
-| Sessions on a phone | The phone app shows the sessions running on the desktop. The tag in front of each statusline lists every Claude account's usage, and acm folds the line to fit the phone's width |
-| A session that hit its limit | After `/exit`, `acm resume` in the same tab reopens it on another account. acm's desktop notification does not show in Orca's terminal |
-| Claude and Codex passing work | Claude starts a Codex worker through Orca's orchestration, and the worker runs on the Codex account acm picks |
-| Artifact collection | A session in an Orca tab still hands its artifacts to the publisher session |
-
-This was tried on one macOS setup with Orca 1.4.249, and the limit case with a limit record made by hand. [Using acm with Orca](docs/orca.md) has the steps, what Orca changes on your machine, and what is still to check.
-
-## How acm differs from similar tools
-
-Other tools solve parts of the same problem. The descriptions follow each project's docs as of November 2026.
-
-| Tool | What it does | How acm differs |
-|---|---|---|
-| [claude-swap](https://github.com/realiti4/claude-swap) | Switches the signed-in Claude Code account by swapping its stored credentials, and can rotate automatically when usage passes a threshold. Chat history stays per account unless you opt in. Runs on macOS, Linux, and Windows | acm never moves credentials. Every account stays signed in to its own folder, history is shared from the start, and Codex accounts are covered too. acm does not run on Windows yet |
-| [CCS account pools](https://docs.ccs.kaitran.ca/features/pool) | Puts several Claude accounts behind a local proxy and uses one account fully before moving to the next | acm starts each session directly on one account with no proxy, and spreads usage by headroom instead of using accounts in order |
-| [claude-limits](https://github.com/figueiredouc/claude-limits) | Shows Claude Code usage in the macOS menu bar by calling the usage API with Claude Code's token | acm shows every Claude and Codex account in one window and reads usage without touching the token |
-| [Orca's account switcher](https://github.com/stablyai/orca/blob/main/docs/site/content/docs/agents/codex-hot-swap.mdx) | Keeps several Claude Code and Codex accounts in the Orca desktop app and makes one of them active with a click. New sessions use the active account, and each extra account runs in an isolated home. Usage is read with each tool's login | acm picks an account for each session by headroom with no click, shares one context between the accounts, and reads usage without the token. acm runs behind Orca, so the two are used together |
+[How acm differs from similar tools](docs/comparison.md) has the details and a comparison with claude-swap, CCS account pools, claude-limits, and Orca's account switcher. [Using acm with Orca](docs/orca.md) has the Orca setup.
 
 ## Quick start
 
@@ -68,18 +38,7 @@ acm runs on macOS and Linux. Linux support is new and has not yet been tried wit
 
 ## Using acm
 
-The [guide](GUIDE.md) covers adding Claude and Codex accounts, starting sessions, collecting artifacts, checking after a Claude Code update, uninstalling, and troubleshooting. Each feature also has a detailed doc.
-
-| Doc | Covers |
-|---|---|
-| [Setup](docs/setup.md) | What `acm setup` changes, the shell function, starting from IDEs |
-| [Accounts](docs/accounts.md) | Account folder layout, the shared folder, login token refresh, Codex accounts |
-| [Account selection and usage](docs/selection.md) | Selection rules and environment variables, usage collection, Ultra accounts, Codex usage, Antigravity usage |
-| [Artifact collection and screen control](docs/publisher.md) | The publisher session and its scope, primary account headroom, screen control through Aside Browser |
-| [Menu bar and widget](docs/app.md) | Per-tool account cards in the menu bar window, the floating widget |
-| [Using acm with Orca](docs/orca.md) | Starting Orca's sessions through acm, reaching them from a phone, where Orca puts new worktrees, what works and what is still to check |
-| [Platform support plan](docs/platforms.md) | What Linux, Claude Desktop, and Windows support needs, in that order |
-| [Roadmap](docs/roadmap.md) | Deferred features and why they were deferred |
+The [guide](GUIDE.md) covers adding Claude and Codex accounts, starting sessions, collecting artifacts, checking after a Claude Code update, uninstalling, and troubleshooting. It ends with the list of detailed docs for each feature.
 
 ## Use it only with accounts you own
 
