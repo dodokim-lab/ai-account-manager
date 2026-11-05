@@ -93,7 +93,7 @@ When you hit the weekly limit, Claude Code asks you to choose one of three optio
 
 If the other account is in a different organization, the continued session cannot use its earlier thinking. Claude Code shows "Claude can't use thinking from another organization". The next response is slower and uses more tokens because it rereads the session. The thinking is not deleted, so reopening on the original account uses it again.[7] The conversation cache is also per account, so it is rebuilt from scratch.[9] Still, you choose when to continue, so the session does not slow down suddenly in the middle.
 
-`acm resume` changes to the folder where the session was opened and starts `claude --resume`. If the same session is still open, it does not start, because the histories would mix. If a session's history kept growing for more than 2 minutes after the limit, acm assumes it continued on that account after the reset and drops it from the list to continue. If there are sessions not yet continued, `acm status` reports how many.
+`acm resume` changes to the folder where the session was opened and starts `claude --resume`. If the same session is still open, it does not start, because the histories would mix. If the model answered in a session more than 2 minutes after the limit, acm assumes it continued on that account after the reset and drops it from the list to continue. A change to the history alone does not count, because closing a session writes to it too, and a limit message is not an answer.[15] So a session closed long after it stopped can still be continued. If there are sessions not yet continued, `acm status` reports how many.
 
 ## Codex picks among Codex accounts with the same score
 
@@ -146,3 +146,5 @@ Signed out, agy prints a sign-in URL, opens it in the browser with the `open` co
 [13] 2026-11-04, agy 1.4.12. `/usage` reported 0 input and output tokens and took 4.1 to 7.2 seconds. With `HOME` pointed at an empty folder, agy printed "Authentication required" and the sign-in URL, and a fake `open` placed first on PATH received that URL.
 
 [14] 2026-11-05, Claude Code 2.1.318, jq 1.8.2, macOS 15.7.1. Five runs of the wrapper with two Claude accounts took 1.008 seconds with the list and 0.470 seconds with the wrapper from before it.
+
+[15] 2026-11-05, Claude Code 2.1.318. A session was recorded as limited and closed with `/exit` 137 seconds later. Closing appended `cost-state`, `file-history-snapshot`, and `last-prompt` entries, which carry no time, and changed the file's modified time. Before this fix acm compared only that time, so `acm status` and `acm resume` no longer listed the session. Histories written by 2.1.296 and 2.1.316 hold a limit message as an `assistant` entry with the model `<synthetic>`, `isApiErrorMessage` true, and `error` `rate_limit`. acm reads the last 256 KB of the history and counts only an `assistant` entry from a real model.
