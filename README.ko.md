@@ -47,6 +47,21 @@ macOS 와 Linux 에서 돈다. Linux 지원은 새로 넣은 것이라 실제 �
 4. 새 터미널을 열고 `claude` 를 친다. 남은 여유가 가장 큰 Claude 계정으로 뜬다.
 5. `acm status` 로 계정마다 로그인과 사용량을 확인한다.
 
+## Orca 와 함께 쓰려면
+
+acm 은 한 기기 안에서 도는 도구라서 다른 기기에서는 세션을 보여 주지 못한다. [Orca](https://github.com/stablyai/orca) 는 git worktree 에서 코딩 에이전트를 돌리고 폰 앱과 짝을 짓는 데스크톱 앱이다. Orca 를 acm 앞에 두면 세션을 띄워 보여 주는 일은 Orca 가 맡는다. 세션마다 계정을 고르는 일은 그대로 acm 이 한다.
+
+바꿀 설정은 한 곳이다. Orca 에서 Claude Code 의 Command 를 `<홈>/.local/bin/acm claude` 로 두면 Orca 가 띄우는 Claude Code 세션이 모두 acm 을 거쳐 계정을 받는다. Codex 는 바꿀 것이 없다. Orca 가 셸에 `codex` 를 쳐서 띄우므로 `acm setup` 이 넣은 셸 함수가 acm 으로 보낸다.
+
+| Orca 를 앞에 두면 | 얻는 것 |
+|---|---|
+| 폰에서 세션 보기 | 데스크톱에서 도는 세션이 폰 앱에 보인다. statusline 앞 태그가 모든 Claude 계정의 사용량을 보여 준다. 줄이 폰 폭보다 넓으면 acm 이 접는다 |
+| 한도에 걸린 세션 | `/exit` 한 뒤 같은 탭에서 `acm resume` 을 치면 다른 계정에서 다시 열린다. acm 의 데스크톱 알림은 Orca 터미널에 뜨지 않는다 |
+| Claude 와 Codex 가 일 주고받기 | Claude 가 Orca 의 orchestration 으로 Codex 워커를 띄운다. 워커는 acm 이 고른 Codex 계정에서 돈다 |
+| 아티팩트 모으기 | Orca 탭의 세션도 아티팩트를 발행 세션에 넘긴다 |
+
+macOS 한 대에서 Orca 1.4.249 로 확인했다. 한도에 걸린 경우는 손으로 만든 한도 기록으로 해 봤다. 단계와 Orca 가 맥에서 바꾸는 것, 아직 확인하지 못한 것은 [Orca 와 함께 쓰기](docs/orca.md) 에 있다.
+
 ## 자세히 쓰려면
 
 [사용 안내](GUIDE.md) 에 Claude 와 Codex 계정 더하기, 세션 띄우기, 아티팩트 모으기, Claude Code 업데이트 뒤 점검, 제거, 문제 해결을 절마다 하나씩 적었다. 사용 안내와 아래 문서는 영어로 쓰여 있다.
@@ -58,7 +73,7 @@ macOS 와 Linux 에서 돈다. Linux 지원은 새로 넣은 것이라 실제 �
 | [계정 배정과 사용량](docs/selection.md) | 배정 기준과 환경변수, 사용량 수집, Ultra 계정, Codex 사용량, Antigravity 사용량 |
 | [아티팩트 모으기와 화면 제어](docs/publisher.md) | 발행 세션과 승인 범위, 대표 계정 여유, aside |
 | [메뉴바와 위젯](docs/app.md) | 메뉴바 창의 도구별 계정 카드, 떠 있는 위젯 |
-| [Orca 와 함께 쓰기](docs/orca.md) | Orca 가 띄우는 세션을 acm 으로 보내기, 폰에서 세션 보기, 되는 것과 아직 확인하지 못한 것 |
+| [Orca 와 함께 쓰기](docs/orca.md) | Orca 가 띄우는 세션을 acm 으로 보내기, 폰에서 세션 보기, Orca 가 새 worktree 를 두는 곳, 되는 것과 아직 확인하지 못한 것 |
 | [플랫폼 지원 계획](docs/platforms.md) | Linux 와 Claude Desktop, Windows 를 이 순서로 지원하는 데 필요한 일 |
 | [나중에 할 것](docs/roadmap.md) | 미뤄 둔 기능과 그 이유 |
 

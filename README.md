@@ -47,6 +47,21 @@ acm runs on macOS and Linux. Linux support is new and has not yet been tried wit
 4. Open a new terminal and type `claude`. It starts on the Claude account with the most headroom.
 5. Run `acm status` to check sign-in and usage for each account.
 
+## Using acm with Orca
+
+acm works on one machine and cannot show your sessions on another device. [Orca](https://github.com/stablyai/orca) is a desktop app that runs coding agents in git worktrees and pairs with a phone app. With Orca in front of acm, Orca starts and shows the sessions, and acm still picks the account for each one.
+
+The setup is one setting. In Orca, set the Command of Claude Code to `<home>/.local/bin/acm claude`, and every Claude Code session Orca starts goes through acm's pick. Codex needs no change, because Orca types `codex` into a shell and the shell function from `acm setup` sends it through acm.
+
+| With Orca in front | What you get |
+|---|---|
+| Sessions on a phone | The phone app shows the sessions running on the desktop. The tag in front of each statusline lists every Claude account's usage, and acm folds the line to fit the phone's width |
+| A session that hit its limit | After `/exit`, `acm resume` in the same tab reopens it on another account. acm's desktop notification does not show in Orca's terminal |
+| Claude and Codex passing work | Claude starts a Codex worker through Orca's orchestration, and the worker runs on the Codex account acm picks |
+| Artifact collection | A session in an Orca tab still hands its artifacts to the publisher session |
+
+This was tried on one macOS setup with Orca 1.4.249, and the limit case with a limit record made by hand. [Using acm with Orca](docs/orca.md) has the steps, what Orca changes on your machine, and what is still to check.
+
 ## Using acm
 
 The [guide](GUIDE.md) covers adding Claude and Codex accounts, starting sessions, collecting artifacts, checking after a Claude Code update, uninstalling, and troubleshooting. Each feature also has a detailed doc.
@@ -58,7 +73,7 @@ The [guide](GUIDE.md) covers adding Claude and Codex accounts, starting sessions
 | [Account selection and usage](docs/selection.md) | Selection rules and environment variables, usage collection, Ultra accounts, Codex usage, Antigravity usage |
 | [Artifact collection and screen control](docs/publisher.md) | The publisher session and its scope, primary account headroom, screen control through Aside Browser |
 | [Menu bar and widget](docs/app.md) | Per-tool account cards in the menu bar window, the floating widget |
-| [Using acm with Orca](docs/orca.md) | Starting Orca's sessions through acm, reaching them from a phone, what works and what is still to check |
+| [Using acm with Orca](docs/orca.md) | Starting Orca's sessions through acm, reaching them from a phone, where Orca puts new worktrees, what works and what is still to check |
 | [Platform support plan](docs/platforms.md) | What Linux, Claude Desktop, and Windows support needs, in that order |
 | [Roadmap](docs/roadmap.md) | Deferred features and why they were deferred |
 
