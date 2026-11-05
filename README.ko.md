@@ -58,6 +58,7 @@ macOS 와 Linux 에서 돈다. Linux 지원은 새로 넣은 것이라 실제 �
 | [계정 배정과 사용량](docs/selection.md) | 배정 기준과 환경변수, 사용량 수집, Ultra 계정, Codex 사용량, Antigravity 사용량 |
 | [아티팩트 모으기와 화면 제어](docs/publisher.md) | 발행 세션과 승인 범위, 대표 계정 여유, aside |
 | [메뉴바와 위젯](docs/app.md) | 메뉴바 창의 도구별 계정 카드, 떠 있는 위젯 |
+| [Orca 와 함께 쓰기](docs/orca.md) | Orca 가 띄우는 세션을 acm 으로 보내기, 폰에서 세션 보기, 되는 것과 아직 확인하지 못한 것 |
 | [플랫폼 지원 계획](docs/platforms.md) | Linux 와 Claude Desktop, Windows 를 이 순서로 지원하는 데 필요한 일 |
 | [나중에 할 것](docs/roadmap.md) | 미뤄 둔 기능과 그 이유 |
 

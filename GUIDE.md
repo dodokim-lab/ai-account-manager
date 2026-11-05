@@ -114,6 +114,7 @@ Both keep the account folders and `~/.acm`. They hold login data, so deleting th
 | [Account selection and usage](docs/selection.md) | Selection rules and environment variables, usage collection, Ultra accounts, Codex usage, Antigravity usage |
 | [Artifact collection and screen control](docs/publisher.md) | The publisher session and its scope, primary account headroom, screen control through Aside Browser |
 | [Menu bar and widget](docs/app.md) | Per-tool account cards in the menu bar window, the floating widget |
+| [Using acm with Orca](docs/orca.md) | Starting Orca's sessions through acm, reaching them from a phone, what works and what is still to check |
 | [Platform support plan](docs/platforms.md) | What Linux, Claude Desktop, and Windows support needs, in that order |
 | [Roadmap](docs/roadmap.md) | Deferred features and why they were deferred |
 
