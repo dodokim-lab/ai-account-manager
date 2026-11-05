@@ -78,6 +78,8 @@ acm publisher off        # turn off; each session publishes under its own accoun
 
 Pick the account you are signed in to on claude.ai in your browser as the primary account. Otherwise you cannot open the collected artifacts. Only Claude artifacts are collected for now. Collecting Codex Sites is on the [roadmap](docs/roadmap.md).
 
+Deleting goes through the publisher session too. Ask the session you are in to delete the artifact, then answer the question that appears in the publisher session's window. `tmux attach -t acm-publisher` shows that window from any terminal.
+
 ## Using acm with Orca
 
 In Orca, set the Command of Claude Code to `<home>/.local/bin/acm claude`, and every Claude Code session Orca starts goes through acm's pick. Codex needs no change, because Orca types `codex` into a shell and the shell function from `acm setup` sends it through acm. [Using acm with Orca](docs/orca.md) has the install steps, how to use it from a phone, and what is still to check.
