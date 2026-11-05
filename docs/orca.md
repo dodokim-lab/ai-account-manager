@@ -64,6 +64,30 @@ A session started in another terminal keeps its history in the shared folder, so
 
 Without `-a <account>`, use `acm claude --resume <session id>` and acm picks the account again. The tab belongs to the workspace whose terminal you opened, not to the folder you moved to, so the phone lists it under that workspace.
 
+## To keep new worktrees under your own folder
+
+A project you add from an existing folder keeps that folder as its main workspace, and a terminal opened there starts in it. A new workspace is a separate git worktree. By default Orca creates it at `~/orca/workspaces/<repository name>/<workspace name>`, outside the folder your repositories are in.[16]
+
+To work in the original folder, open another tab in the project's main workspace and do not make a new workspace. To change where new worktrees go, set a folder for each project.
+
+1. List the projects and copy the `id` of the one to change.
+
+   ```sh
+   orca project setups --json
+   ```
+
+2. Set the folder as an absolute path.
+
+   ```sh
+   orca project setup-update --setup <id> --worktree-base-path <folder>
+   ```
+
+3. Make a new workspace in that project. It is created at `<folder>/<repository name>/<workspace name>`.
+
+The same value is the Worktree Location field in the project's settings, and it comes before the value for all projects. That one is Workspace Directory under Settings → General, and the Orca CLI has no command for it.[16]
+
+Worktrees that already exist stay where they are. Claude Code keeps session records by folder, so a session started in a worktree is listed under the worktree's folder and not under the main folder. `orca worktree rm` deleted a workspace's folder and left its branch.[16]
+
 ## To continue a session that hit its limit
 
 The steps are those of [Account selection and usage](selection.md#a-session-that-hits-a-limit-continues-on-another-account-with-acm-resume), typed in the session's own tab. They were tried with a limit record made by hand, not with a real limit.[11]
@@ -174,6 +198,7 @@ Each session Orca starts carries more than twenty `ORCA_*` variables and `CLAUDE
 | The phone fails to pair with `direct websocket closed 1006` | Sign in to an Orca account on the desktop, then pair again |
 | Sign-in or Relay fails on a network that re-signs HTTPS, with `SELF_SIGNED_CERT_IN_CHAIN` in a Node fetch | Start Orca with the network's CA, as below |
 | A tab you just made does not show on the phone | Open the workspace the tab belongs to. `orca terminal create` makes the tab in the workspace of the folder it was run from |
+| A terminal opens in a folder under `~/orca`, not in your repository's folder | That workspace is a git worktree Orca made. Open a tab in the project's main workspace, or see [To keep new worktrees under your own folder](#to-keep-new-worktrees-under-your-own-folder) |
 
 Orca's main process is Node, and it did not trust a CA that the macOS keychain trusts. Give it a PEM file that holds that CA.
 
@@ -197,6 +222,8 @@ launchctl setenv NODE_EXTRA_CA_CERTS <bundle.pem>
 - Whether Orca's usage reads make the API answer `429` to acm's `/usage` poll on the default account. Both call the same API, and a menu bar plugin that called it every 2 minutes did that. See footnote 2 of [Account selection and usage](selection.md).
 - A phone on mobile data while the desktop is behind a VPN, and a Relay connection held for a long time.
 - Quick Commands for `acm status` and `acm resume`. A tab that ran `acm status` showed on the phone, but neither command was saved as a Quick Command.
+- A session moved between an Orca worktree and the project's main folder. Claude Code keeps session records by folder, so the session may have to be resumed from the folder it started in.
+- Workspace Directory under Settings → General, and a worktree folder given as a relative path or with `~`. Only an absolute path set for one project was tried.[16]
 
 ## Footnotes
 
@@ -229,3 +256,5 @@ launchctl setenv NODE_EXTRA_CA_CERTS <bundle.pem>
 [14] 2026-11-05, Orca 1.4.249. Orca's docs list display choices only, which are the status bar items and percent used or remaining.[2] In the app's main code the usage service starts with the window and has no switch for Claude. It skips the Claude read only while a retry time from the API is in effect, and only the Antigravity read depends on its status bar item. `shouldBackgroundPoll` is true when the window is visible, not minimized, and focused. Orca's docs name more triggers, among them the phone connecting.[2]
 
 [15] 2026-11-05, Orca 1.4.249, codex-cli 0.166.0. The rule file was saved in `~/.codex/rules`, and `acm sync` linked that folder into the second Codex account's home. `codex execpolicy check --rules <file>` matched `orca orchestration send` with the decision `allow`, and matched neither `orca orchestration worker-start` nor `orca terminal send`. A second worker, started the same way as the first, ran on the second Codex account and sent `worker_done` with no prompt. Orca typed "You have 1 orchestration message" into the starting session, and `orca orchestration check` returned the report with the outcome `succeeded`. Without the rule the same command had failed inside the sandbox, so the allowed command ran outside it.
+
+[16] 2026-11-05, Orca 1.4.249, Claude Code 2.1.318. Twelve projects had been added from existing folders. `orca worktree list` gave each project's own folder as its main worktree, and the one workspace made in Orca was at `~/orca/workspaces/<repository name>/<workspace name>`. After `orca project setup-update --worktree-base-path` with an absolute path, `orca repo show` listed that path, and a workspace made with `orca worktree create --name path-check --no-parent --setup skip` was at `<path>/<repository name>/path-check`. The older workspace stayed listed at its old path. `orca worktree rm` removed the new folder and left the branch `path-check` and the empty `<path>/<repository name>` folder. The field names are the app's own strings, read from its settings code, which also says that a relative path resolves from the project's root. The runtime's settings update contract, in `client-settings-params.js`, has no field for the workspace folder. The shared history folder held a project folder named after the older worktree's path, with the records of three sessions started there.
