@@ -50,6 +50,18 @@ Picks do not wait for polls. When you start a session or the menu bar app asks f
 
 If `/usage` fails, acm waits 7 minutes 30 seconds. Each further failure multiplies the wait by 1.5, up to 30 minutes. A failure other than 429 may be an expired token, so acm starts the token refresh described in [Accounts](accounts.md). If another usage tool calls the same usage API often, the two share its request limit and you get 429s. Keep only one such tool on.[2] `/usage` output is text for people, so acm cannot read it if the format changes. Run `acm doctor` after you update Claude Code.
 
+## The statusline tag lists every Claude account's usage
+
+`acm-statusline` puts a tag with the account's label in front of your statusline. With two or more Claude accounts, the tag also lists the usage of each one, so any session shows where the other accounts stand.
+
+```
+[work · cl1 62% · cl2 5/66%] <your statusline>
+```
+
+One number is the weekly usage. Two numbers are 5h and Week. A `?` after the number means the newest record of that account is over an hour old. The numbers follow the same rules as `acm status`: the more recent of the statusline record and the `/usage` poll wins for each window, a window past its reset counts as 0, and a 5h window not seen for a day is left out. Per-model weekly limits and Codex accounts are not in the tag. The list adds about 0.1 seconds to each statusline run.[14]
+
+`acm statusline-usage off` leaves only the label, and `acm statusline-usage on` brings the list back.
+
 ## A verified Ultra account shows no 5h limit
 
 A verified Ultra account has no 5-hour limit, so acm treats its 5h as no limit, not as 0%. When the Max 20x plan became Ultra on 2026-10-30, Anthropic started verifying Ultra accounts automatically from account and billing history and removed the 5-hour limit for verified accounts.[3] If Settings > Usage and the `/usage` output have no Current session line, the account is verified.[4]
@@ -132,3 +144,5 @@ Signed out, agy prints a sign-in URL, opens it in the browser with the `open` co
 [12] 2026-11-03, agy 1.4.8. Even with `GEMINI_DIR` changed, it read `~/.gemini`. Changing `HOME` to a temp folder made it ask for sign-in again. The keychain entry name was checked, but its contents were not opened. The changelog of 1.4.12, released the same day, also said nothing about accounts or config folders. The `AGY_ACCOUNT` in the executable is a variable that picks the account of a CLI attached as a plugin. It is unrelated to agy sign-in.
 
 [13] 2026-11-04, agy 1.4.12. `/usage` reported 0 input and output tokens and took 4.1 to 7.2 seconds. With `HOME` pointed at an empty folder, agy printed "Authentication required" and the sign-in URL, and a fake `open` placed first on PATH received that URL.
+
+[14] 2026-11-05, Claude Code 2.1.318, jq 1.8.2, macOS 15.7.1. Five runs of the wrapper with two Claude accounts took 1.008 seconds with the list and 0.470 seconds with the wrapper from before it.

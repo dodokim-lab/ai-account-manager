@@ -47,7 +47,7 @@ The sessions still run on the desktop, on the account acm picked there.
 |---|---|---|
 | Picking an account per session | Works | Seen for the automatic pick and for `acm -a <account>` |
 | Shared history, memory, and skills | Works | Sessions on two accounts in an Orca worktree read the memory folder of the main repository |
-| Usage from the statusline | Works | Orca leaves `statusLine` in the settings as it is |
+| Usage from the statusline | Works | Orca leaves `statusLine` in the settings as it is. The tag in front of the statusline lists every Claude account's usage, on the desktop and in the phone's terminal view |
 | Collecting artifacts in one account | Starts clean, publish not yet tried | The rule to hand off is attached to sessions on other accounts. The publisher session drops Orca's variables. See [Artifact collection](publisher.md) |
 | Continuing a session that hit its limit | Not yet tried | The StopFailure hook still runs. Run `acm resume` in a terminal of the same worktree |
 | Menu bar app and widget | Works, with one gap | They count Orca's sessions too. "New Session…" opens iTerm, not Orca |
@@ -57,7 +57,7 @@ The sessions still run on the desktop, on the account acm picked there.
 
 Orca treats every session as the default account. It names a config folder first, and acm sets the real one afterwards. Three things follow.
 
-- Orca's status bar and the phone show the default account and its usage, whatever account the session runs on. Read usage with `acm status` or the menu bar app.
+- Orca's status bar and the phone's usage screen show the default account and its usage, whatever account the session runs on. Read usage from the tag in front of each session's statusline, such as `[work · cl1 62% · cl2 66%]`, or with `acm status` or the menu bar app.[6]
 - Orca reads Claude usage by calling the usage API with that account's login token.[2] acm still never reads a token. Orca does it on its own.
 - Do not add accounts in Orca's account switcher. Accounts added there live in Orca's data, where acm cannot see them.
 
@@ -109,3 +109,5 @@ launchctl setenv NODE_EXTRA_CA_CERTS <bundle.pem>
 [4] Codex in the Orca docs, the section "Wrapper scripts that set `CODEX_HOME`". https://github.com/stablyai/orca/blob/main/docs/site/content/docs/agents/codex.mdx
 
 [5] Agent hibernation in the Orca docs. It says Orca relaunches the agent CLI with resume flags such as `claude --resume <id>`, and "Resume also reuses the launch command, arguments, and private environment captured when Orca first opened the agent." https://github.com/stablyai/orca/blob/main/docs/site/content/docs/agents/hibernation.mdx
+
+[6] 2026-11-05, Orca 1.4.249 and its phone app, Claude Code 2.1.318. The statusline of a session showed on the phone in the terminal view. The phone's usage screen listed one account. How the tag is built is in [Account selection and usage](selection.md#the-statusline-tag-lists-every-claude-accounts-usage).
