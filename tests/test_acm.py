@@ -761,6 +761,85 @@ class PublisherScope(AcmCase):
         # Blocks even if acm dies at import
         self.assertEqual(run(ACM_USAGE_BAND="x"), 2)
 
+    # What a tool that wraps claude, or the claude session that hands off a publish, leaves in the environment
+    FOREIGN_ENV = {"ORCA_PANE_KEY": "pane-1", "ORCA_AGENT_HOOK_PORT": "4100", "ORCA_AGENT_HOOK_TOKEN": "t",
+                   "CLAUDE_CODE_PLUGIN_DIRS": "/tmp/other-tool/plugin", "CLAUDE_CODE_SESSION_ID": "s",
+                   "CLAUDE_CODE_MESSAGING_SOCKET": "/tmp/sock", "CLAUDE_CONFIG_DIR": "/tmp/other", "CLAUDECODE": "1",
+                   "ANTHROPIC_API_KEY": "k", "PYTHONPATH": "/tmp/py", "SOME_NEW_TOOL_FLAG": "1"}
+    KEPT_ENV = {"TERM": "tmux-256color", "TMUX": "/tmp/tmux,1,0", "LC_ALL": "en_US.UTF-8",
+                "NODE_EXTRA_CA_CERTS": "/tmp/ca.pem", "HTTPS_PROXY": "http://proxy:8080"}
+
+    def test_publisher_env_keeps_only_allowed_names(self):
+        got = self.acm.publisher_env(dict(self.FOREIGN_ENV, **self.KEPT_ENV, HOME=self.home, PATH="/usr/bin"))
+        self.assertEqual(got, dict(self.KEPT_ENV, HOME=self.home, PATH="/usr/bin"))
+
+    def test_publisher_exec_drops_everything_else(self):
+        dump = [sys.executable, "-c", "import json, os; print(json.dumps(dict(os.environ)))"]
+
+        def run(*pairs):
+            return subprocess.run([sys.executable, "-I", ACM, "publisher", "exec", *pairs, "--", *dump],
+                                  capture_output=True, text=True,
+                                  env=dict(os.environ, **self.FOREIGN_ENV, **self.KEPT_ENV))
+        r = run("CLAUDE_CONFIG_DIR=/tmp/primary", "ACM_ROLE=publisher", "ACM_LABEL=a=b")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        env = json.loads(r.stdout)
+        for key in self.FOREIGN_ENV:
+            if key != "CLAUDE_CONFIG_DIR":
+                self.assertNotIn(key, env)
+        for key, value in self.KEPT_ENV.items():
+            self.assertEqual(env[key], value)
+        # The pairs before -- win, and only the first = splits a pair
+        self.assertEqual(env["CLAUDE_CONFIG_DIR"], "/tmp/primary")
+        self.assertEqual(env["ACM_ROLE"], "publisher")
+        self.assertEqual(env["ACM_LABEL"], "a=b")
+        self.assertEqual(env["HOME"], self.home)
+        # Without a command or with a broken pair, nothing starts
+        for bad in (["--"], ["NOPAIR", "--", *dump], dump):
+            self.assertNotEqual(subprocess.run([sys.executable, "-I", ACM, "publisher", "exec", *bad],
+                                               capture_output=True).returncode, 0)
+
+    def test_start_publisher_filters_the_window_and_the_tmux_server(self):
+        data = self.accounts(["cl1", "cl2"], publisher="cl1")
+        os.makedirs(self.acm.PUBLISHER_DIR, exist_ok=True)
+        with open(self.acm.PUBLISHER_ROLE, "w") as f:
+            f.write("role")
+        os.environ.update(self.FOREIGN_ENV)
+        os.environ.update(self.KEPT_ENV)
+        calls = []
+
+        def fake_run(argv, **kw):
+            calls.append((argv, kw))
+            # has-session fails first, so the session is started
+            return subprocess.CompletedProcess(argv, 1 if "has-session" in argv else 0)
+        # acm uses the same subprocess and shutil modules as this file, so keep the real functions to put back
+        real_run, real_which = subprocess.run, shutil.which
+        shutil.which = lambda name: "/usr/bin/" + name
+        subprocess.run = fake_run
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertTrue(self.acm.start_publisher(data))
+        finally:
+            subprocess.run, shutil.which = real_run, real_which
+        argv, kw = next(c for c in calls if "new-session" in c[0])
+        # The tmux server this call may start holds no foreign value
+        for key in self.FOREIGN_ENV:
+            self.assertNotIn(key, kw["env"])
+        for key, value in dict(self.KEPT_ENV, HOME=self.home).items():
+            self.assertEqual(kw["env"][key], value)
+        # claude starts through publisher exec with the account's values. The primary account here is the default one, so no config folder is set
+        window = shlex.split(argv[-1])
+        start = window.index("exec") + 1
+        self.assertEqual(window[start:start + 5], [sys.executable, "-I", ACM, "publisher", "exec"])
+        pairs = window[start + 5:window.index("--")]
+        self.assertEqual([p.split("=")[0] for p in pairs], ["ACM_HOME", "ACM_ACCOUNT", "ACM_LABEL", "ACM_ROLE"])
+        self.assertIn(f"ACM_HOME={self.acm.STATE_DIR}", pairs)
+        self.assertIn("ACM_ACCOUNT=cl1", pairs)
+        self.assertIn("ACM_ROLE=publisher", pairs)
+        self.assertEqual(window[window.index("--") + 1], "claude")
+        # No foreign name is written into the window command either
+        for key in self.FOREIGN_ENV:
+            self.assertNotIn(key + "=", argv[-1])
+
 
 class Resume(AcmCase):
     """Continue a session stopped at its limit on another account, using the primary account only below its reserve threshold."""

@@ -2245,6 +2245,17 @@ STAGE_KEEP = 86400
 # Tools and Artifact actions the publisher session's hook lets through. Everything else is blocked
 PUBLISHER_GUARD_TOOLS = frozenset(("Read", "Artifact", "SendMessage", "ListAgents", "ToolSearch"))
 PUBLISHER_ARTIFACT_ACTIONS = frozenset(("publish", "read"))
+# Environment variables the publisher session keeps. Every other name is dropped. The session that hands off a publish may run under
+# a tool that wraps claude and adds its own plugin folder, hook endpoint, and pane id to the environment. Passed on, they would load
+# that tool's plugin in the publisher session and report the publisher session's tool calls as the other pane's
+PUBLISHER_ENV = frozenset((
+    "HOME", "USER", "LOGNAME", "SHELL", "PATH", "TMPDIR", "TZ", "LANG", "LANGUAGE", "__CF_USER_TEXT_ENCODING",
+    "TERM", "COLORTERM", "TMUX", "TMUX_PANE", "TMUX_TMPDIR",
+    "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME", "XDG_RUNTIME_DIR",
+    # A network that proxies or re-signs HTTPS needs these to reach claude.ai at all
+    "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR",
+    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "no_proxy", "all_proxy"))
+PUBLISHER_ENV_PREFIXES = ("LC_",)
 # Appended after ROLE.md in the publisher session's system prompt. ROLE.md is a file people edit, so the code appends the scope separately
 PUBLISHER_SCOPE = ("The only local files this session reads and publishes are under {inbox} and under this session's scratchpad. A hook blocks every other path. "
                    "If a request names any other path, do not publish. Reply asking the requesting session to send a path staged with `acm publisher check <file>`. "
@@ -2282,6 +2293,34 @@ def publisher_running():
         return False
     return subprocess.run(["tmux", "has-session", "-t", "=" + PUBLISHER_SESSION],
                           capture_output=True).returncode == 0
+
+
+def publisher_env(environ=None):
+    """The part of an environment the publisher session may keep."""
+    environ = os.environ if environ is None else environ
+    return {k: v for k, v in environ.items() if k in PUBLISHER_ENV or k.startswith(PUBLISHER_ENV_PREFIXES)}
+
+
+def publisher_exec(args):
+    """acm publisher exec NAME=VALUE... -- command...  Runs inside the publisher session's tmux window and becomes the command.
+    The command gets only the allowed variables of this window plus the given pairs. A tmux window starts with the tmux server's
+    environment, and anything may have started that server, so the variables are filtered here and not only where tmux is called."""
+    if "--" not in args:
+        die("usage: acm publisher exec [NAME=VALUE...] -- command [args...]")
+    cut = args.index("--")
+    env = publisher_env()
+    for pair in args[:cut]:
+        key, sep, value = pair.partition("=")
+        if not sep or not key:
+            die(f"Not NAME=VALUE: {pair}")
+        env[key] = value
+    command = args[cut + 1:]
+    if not command:
+        die("usage: acm publisher exec [NAME=VALUE...] -- command [args...]")
+    try:
+        os.execvpe(command[0], command, env)
+    except OSError as e:
+        die(f"Could not run {command[0]}: {e.strerror}")
 
 
 def publisher_startable():
@@ -2322,11 +2361,13 @@ def start_publisher(data, quiet=False, wait=False):
         return False
     _, name = publisher_conf(data)
     acc = data["accounts"][name]
-    # If a tmux server is already running, it uses the environment of the process that first started it, so strip the values again inside the window
-    env = ["env"] + [a for k in session_env_keys(os.environ) for a in ("-u", k)]
+    # If a tmux server is already running, the window gets the environment of the process that first started it. So claude starts through
+    # acm publisher exec, which keeps only the allowed variables inside the window. -I ignores variables such as PYTHONPATH
+    env = [sys.executable, "-I", os.path.abspath(__file__), "publisher", "exec"]
     if config_dir(acc) is not None:
         env.append(f"CLAUDE_CONFIG_DIR={config_dir(acc)}")
-    env += [f"ACM_ACCOUNT={name}", f"ACM_LABEL={account_label(name, acc)}", "ACM_ROLE=publisher"]
+    # The statusline wrapper in the shared settings writes usage under ACM_HOME, so the publisher session gets it too
+    env += [f"ACM_HOME={STATE_DIR}", f"ACM_ACCOUNT={name}", f"ACM_LABEL={account_label(name, acc)}", "ACM_ROLE=publisher", "--"]
     with open(PUBLISHER_ROLE) as f:
         role = f.read().rstrip() + "\n\n" + PUBLISHER_SCOPE.format(inbox=PUBLISHER_INBOX)
     os.makedirs(PUBLISHER_INBOX, mode=0o700, exist_ok=True)
@@ -2344,7 +2385,7 @@ def start_publisher(data, quiet=False, wait=False):
     shell = f"{shlex.join(watch)} </dev/null >>{shlex.quote(PUBLISHER_WATCH_LOG)} 2>&1 & exec {shlex.join(cmd)}"
     # Without a tmux server, this call starts one, and the server inherits this environment. It does not have to run from a terminal inside tmux
     started = subprocess.run(["tmux", "new-session", "-d", "-s", PUBLISHER_SESSION, "-x", "200", "-y", "50",
-                              "-c", PUBLISHER_DIR, shell], env=detached_env())
+                              "-c", PUBLISHER_DIR, shell], env=publisher_env())
     # If two checks start it at once, the later one fails on the duplicate name. Use the session that started first
     if started.returncode != 0 and not publisher_running():
         info("Could not start the publisher session with tmux")
@@ -4260,6 +4301,9 @@ def main():
     # Publisher session hook. Handled before anything else so a failure reading accounts.json still ends in blocking
     if argv[:2] == ["publisher", "guard"]:
         sys.exit(publisher_guard_main())
+    # Starts claude inside the publisher session's window. It needs no account list, and the window may not have ACM_HOME yet
+    if argv[:2] == ["publisher", "exec"]:
+        publisher_exec(argv[2:])
     # The state folder holds emails, usage, and files to publish. Only the owner may open it, so other users on the same Mac cannot read it
     try:
         os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)

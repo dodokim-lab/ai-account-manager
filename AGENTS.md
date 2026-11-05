@@ -27,4 +27,4 @@ acm relies on behavior that is not documented, such as the output of `/usage`, t
 
 Any session can send messages to the publisher session, so its limits are enforced in code, not only by its prompt. The sections of [docs/publisher.md](docs/publisher.md) on staging and the hook list every rule. When you change `acm publisher check`, the `acm publisher guard` hook, or the session rules, keep each of those rules, add a test for each new case, and update that doc in the same commit.
 
-Both checks are allow lists. A file, tool, or input shape they do not recognize is rejected, not passed, because a new shape may carry a local path. Keep it that way when Claude Code adds a new field or tool.
+Both checks are allow lists. A file, tool, or input shape they do not recognize is rejected, not passed, because a new shape may carry a local path. Keep it that way when Claude Code adds a new field or tool. The environment the publisher session starts with is an allow list too, `PUBLISHER_ENV` in `bin/acm`. Add a name there only when the session cannot work without it.
