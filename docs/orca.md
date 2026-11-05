@@ -95,7 +95,7 @@ Three ways were tried. The statusline tag is the one that needs nothing opened a
 | Picking an account per session | Works | Seen for the automatic pick and for `acm -a <account>` |
 | Shared history, memory, and skills | Works | Sessions on two accounts in an Orca worktree read the memory folder of the main repository |
 | Usage from the statusline | Works | Orca leaves `statusLine` in the settings as it is. The tag in front of the statusline lists every Claude account's usage, on the desktop and in the phone's terminal view |
-| Collecting artifacts in one account | Starts clean, publish not yet tried | The rule to hand off is attached to sessions on other accounts. The publisher session drops Orca's variables. See [Artifact collection](publisher.md) |
+| Collecting artifacts in one account | Works | A session on another account in an Orca tab handed off a publish, and the artifact landed in the primary account. The publisher session drops Orca's variables.[9] See [Artifact collection](publisher.md) |
 | Continuing a session that hit its limit | Not yet tried | The StopFailure hook still runs. Run `acm resume` in a terminal of the same worktree |
 | Menu bar app and widget | Works, with one gap | They count Orca's sessions too. "New Session…" opens iTerm, not Orca |
 | Codex accounts | Not yet tried | Set the Command of Codex to `<home>/.local/bin/acm codex` |
@@ -139,13 +139,12 @@ launchctl setenv NODE_EXTRA_CA_CERTS <bundle.pem>
 
 ## Still to check
 
-- A real publish handed off from a session Orca started on an account other than the primary one.
 - Whether Orca's terminal shows the notification acm sends when a session hits its limit.
 - Codex through `acm codex`. Orca's docs warn that a wrapper which sets `CODEX_HOME` reads a home Orca did not set up.[4] acm links each extra Codex account's `hooks.json` and `config.toml` to those in `~/.codex`, so the hooks should be found.
 - Agent hibernation, which is off by default. Orca reopens a paused session with the same launch command and `--resume`.[5] Through acm the pick runs again, so the session may continue on another account.
 - A phone on mobile data while the desktop is behind a VPN, and a Relay connection held for a long time.
 - The Quick Command for `acm status`. A tab that ran `acm status` showed on the phone, but the command was not saved as a Quick Command.
-- Whether an Orca started from the Dock receives the variable set with `launchctl setenv`.
+- An Orca started from the Dock with the variable set by `launchctl setenv`. A test app started with `open` received the value, but Orca itself was not restarted to check.[10]
 
 ## Footnotes
 
@@ -164,3 +163,7 @@ launchctl setenv NODE_EXTRA_CA_CERTS <bundle.pem>
 [7] Terminal and Mobile in the Orca docs. Quick Commands are created under Settings → Quick Commands, run from the tab bar, and "sync both ways" with the phone. https://github.com/stablyai/orca/blob/main/docs/site/content/docs/mobile.mdx
 
 [8] 2026-11-05, Orca 1.4.249. A development plugin with a worker, one status bar item, and one panel was loaded with `orca plugin dev load`. The status bar showed `cl1 62% · cl2 66%` and the panel drew a card per account. The Orca docs say of `statusBar.update` "Desktop app only", and Settings lists the plugin system as alpha. The plugin was unloaded after the test. https://github.com/stablyai/orca/blob/main/docs/reference/plugin-host-api.md
+
+[9] 2026-11-05, Orca 1.4.249, Claude Code 2.1.318, tmux 3.8. A session started with `acm -a` on the second Claude account in an Orca terminal tab wrote an HTML file, staged it with `acm publisher check`, and sent the staged path to the publisher session. `check` started the publisher session, which returned a URL, and the artifact was listed under the primary account. The requesting claude process carried 25 `ORCA_*` variables. The publisher session's process carried none, and no `CLAUDE_CODE_PLUGIN_DIRS`.
+
+[10] 2026-11-05, macOS 15.7.1. With the variable set by `launchctl setenv`, a test app that only records its environment was started with `open` from a shell where the variable had been unset. The app's parent was launchd, and it had the variable.
