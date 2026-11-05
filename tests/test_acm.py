@@ -192,6 +192,53 @@ class StatuslineWrapper(AcmCase):
         self.assertEqual(second["seven_day"]["used_percentage"], 13)
         self.assertEqual(second["model"], "claude-fable-5-1")
 
+    def tag(self, inner="printf 'x\\n'"):
+        env = dict(os.environ, ACM_ACCOUNT="cl1", ACM_LABEL="t")
+        return subprocess.run(["sh", STATUSLINE, inner], input="{}", text=True, env=env, capture_output=True,
+                              check=True).stdout
+
+    @unittest.skipUnless(shutil.which("jq"), "jq is not installed")
+    def test_tag_lists_every_claude_account(self):
+        now = int(time.time())
+        self.accounts(["cl1", "cl2", "cl3"])
+        self.assertEqual(self.tag(), "[t] x\n")
+        # One account with a record is not worth a list
+        self.statusline("cl1", seven_day={"used_percentage": 61.6, "resets_at": now + 9000})
+        self.assertEqual(self.tag(), "[t] x\n")
+        # cl2 has a 5h window. Its weekly window reset in the past, so it counts as 0
+        self.statusline("cl2", five_hour={"used_percentage": 5, "resets_at": now + 600, "at": now},
+                        seven_day={"used_percentage": 90, "resets_at": now - 60})
+        self.assertEqual(self.tag(), "[t · cl1 62% · cl2 5/0%] x\n")
+        # The /usage poll is newer than the statusline record for cl1, and cl3 is known only from a poll over an hour old
+        os.makedirs(self.acm.POLL_DIR, exist_ok=True)
+        self.acm.save_json(os.path.join(self.acm.POLL_DIR, "cl1.json"), {"usage": {
+            "updated_at": now + 5, "seven_day": {"used_percentage": 70, "resets_at": now + 9000}}})
+        self.acm.save_json(os.path.join(self.acm.POLL_DIR, "cl3.json"), {"usage": {
+            "updated_at": now - 7200, "seven_day": {"used_percentage": 12, "resets_at": now + 9000}}})
+        self.assertEqual(self.tag(), "[t · cl1 70% · cl2 5/0% · cl3 12%?] x\n")
+        # With no original command the tag still prints, and a broken record does not break the line
+        with open(os.path.join(self.acm.USAGE_DIR, "cl3.json"), "w") as f:
+            f.write("{broken")
+        self.assertEqual(self.tag(inner=""), "[t]\n")
+
+    @unittest.skipUnless(shutil.which("jq"), "jq is not installed")
+    def test_tag_leaves_out_codex_and_can_be_turned_off(self):
+        now = int(time.time())
+        data = self.accounts(["cl1", "cl2"])
+        data["accounts"]["cx1"] = {"tool": "codex", "dir": os.path.join(self.home, ".codex-cx1")}
+        self.acm.save_json(self.acm.ACCOUNTS_FILE, data)
+        for name in ("cl1", "cl2", "cx1"):
+            self.statusline(name, seven_day={"used_percentage": 40, "resets_at": now + 9000})
+        self.assertEqual(self.tag(), "[t · cl1 40% · cl2 40%] x\n")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.acm.cmd_statusline_usage(self.acm.load_accounts(), ["off"])
+        self.assertIs(self.acm.read_json(self.acm.ACCOUNTS_FILE)["statusline_usage"], False)
+        self.assertEqual(self.tag(), "[t] x\n")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.acm.cmd_statusline_usage(self.acm.load_accounts(), ["on"])
+        self.assertNotIn("statusline_usage", self.acm.read_json(self.acm.ACCOUNTS_FILE))
+        self.assertEqual(self.tag(), "[t · cl1 40% · cl2 40%] x\n")
+
     @unittest.skipUnless(shutil.which("jq"), "jq is not installed")
     def test_unknown_account_falls_back_to_config_dir(self):
         # A session started before the accounts were set up again still carries an old id that is not in the list

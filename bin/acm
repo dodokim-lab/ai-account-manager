@@ -2115,6 +2115,25 @@ def cmd_mode(data, args):
     print(f"Selection mode: {args[0]}")
 
 
+def cmd_statusline_usage(data, args):
+    """acm statusline-usage on|off  Whether the statusline tag lists every Claude account's usage. acm-statusline reads this setting."""
+    if args and args[0] not in ("on", "off"):
+        die("usage: acm statusline-usage on|off")
+    if not args:
+        print(f"Usage of every Claude account in the statusline tag: {'off' if data.get('statusline_usage') is False else 'on'}")
+        return
+    on = args[0] == "on"
+
+    def change(d):
+        # Only off is stored, so a file from an older acm reads as on
+        if on:
+            d.pop("statusline_usage", None)
+        else:
+            d["statusline_usage"] = False
+    update_accounts(change)
+    print(f"Usage of every Claude account in the statusline tag: {args[0]}. Sessions show it at their next statusline update")
+
+
 STATUSLINE_TAP = os.path.join(HOME, ".local", "bin", "acm-statusline")
 
 
@@ -4003,6 +4022,8 @@ Setup
                                    For Codex extra accounts, syncs the links to ~/.codex and hook trust
                                    (--fix moves projects, skills, and hooks in ~/.claude to ~/.acm/shared. Close all claude sessions first)
   acm shell-init                   Shell function that sends claude and codex typed in the terminal through acm (eval it in ~/.zshrc)
+  acm statusline-usage on|off      Whether the statusline tag lists every Claude account's usage, like [work · cl1 62% · cl2 5/66%]
+                                   (one number is Week, two are 5h/Week, ? marks a record over an hour old. Default on, shown with 2+ accounts)
   acm install-statusline           Install the statusline wrapper that collects usage (install.sh does this)
   acm uninstall-statusline         Revert the statusline to the original command
 
@@ -4029,6 +4050,7 @@ COMMANDS = {
     "status": cmd_status,
     "pick": cmd_pick,
     "mode": cmd_mode,
+    "statusline-usage": cmd_statusline_usage,
     "label": cmd_label,
     "rm": cmd_rm,
     "publisher": cmd_publisher,

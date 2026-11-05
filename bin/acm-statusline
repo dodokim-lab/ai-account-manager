@@ -57,6 +57,44 @@ if [ -z "$label" ] && [ -n "$acc" ]; then
   [ -z "$label" ] && label="$acc"
 fi
 
+# With two or more Claude accounts, the tag also lists every account's usage, so one session's statusline shows where
+# the others stand: [label · cl1 62% · cl2 5/66%]. One number is Week, two are 5h/Week. A trailing ? means the record is over
+# an hour old. The numbers come from the records acm already keeps (this wrapper's and the /usage poll's), with the same rules
+# as acm status: the more recent record wins per window, a window past its reset counts as 0, and a 5h window not seen for a day
+# is dropped. `acm statusline-usage off` turns it off
+usage_tag() {
+  set --
+  for f in "$dir"/usage/*.json "$dir"/poll/*.json; do
+    [ -s "$f" ] && set -- "$@" "$f"
+  done
+  [ $# -gt 0 ] || return 0
+  jq -rn --slurpfile cfg "$dir/accounts.json" --argjson now "$(date +%s)" '
+    def pct: if ((.resets_at // 0) | tonumber? // 0) as $r | ($r > 0 and $r <= $now) then 0 else (.used_percentage | tonumber? // 0) end;
+    ($cfg[0] // {}) as $c
+    | if $c.statusline_usage == false then empty else
+      (reduce inputs as $r ({};
+        (input_filename | split("/")) as $p
+        | (if $p[-2] == "poll" then ($r.usage // {}) else $r end) as $rec
+        | if ($rec | type) == "object" then .[$p[-1] | rtrimstr(".json")] += [$rec] else . end)) as $recs
+      | [ ($c.accounts // {} | keys_unsorted[]) as $id
+          | select(($c.accounts[$id] | type) == "object" and (($c.accounts[$id].tool // "claude") == "claude"))
+          | ($recs[$id] // []) as $rs
+          | def latest(k): [$rs[] | select((.[k] | type) == "object") | {at: (.[k].at // .updated_at // 0), w: .[k]}] | max_by(.at);
+            latest("five_hour") as $five | latest("seven_day") as $seven
+          | select($seven != null or $five != null)
+          | ([$rs[] | .updated_at // 0] | max) as $at
+          | $id + " "
+            + (if $five != null and ($now - $five.at) < 86400 then ($five.w | pct | round | tostring) + "/" else "" end)
+            + (if $seven != null then ($seven.w | pct | round | tostring) else "0" end) + "%"
+            + (if ($now - $at) > 3600 then "?" else "" end) ]
+      | if length >= 2 then join(" · ") else empty end
+    end' "$@" 2>/dev/null
+}
+if [ -n "$label" ] && [ -f "$dir/accounts.json" ]; then
+  summary=$(usage_tag)
+  [ -n "$summary" ] && label="$label · $summary"
+fi
+
 # The original statusline command sits in the settings.json statusLine command, as arguments to this wrapper.
 # It is not read from a separate acm file. Claude Code does not protect such a file, so a session could change it without asking
 inner="$*"
