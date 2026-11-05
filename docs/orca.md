@@ -146,6 +146,8 @@ The worker runs in the workspace that the starting session's tab belongs to, whi
 
 The sessions still run on the desktop, on the account acm picked there.
 
+The phone does not need to be on the desktop's network. With the desktop at home on a company VPN and the phone on mobile data, the session tabs opened and took input, and the connection stayed up through 17 minutes of use. The VPN re-signed HTTPS too, so Orca needed the CA there as well.[18]
+
 ## To use the phone
 
 - Open a workspace to see its session tabs. A tab opens in the terminal view or the chat view. Orca's docs say a long-press on a tab switches that tab between the two.[7]
@@ -222,7 +224,8 @@ launchctl setenv NODE_EXTRA_CA_CERTS <bundle.pem>
 - A Claude session that starts a worker on its own from the installed skills, and a Codex session that starts a Claude worker. The Codex rule does not cover `worker-start`, so that session would stop at a prompt.
 - Agent hibernation, which is off by default. Orca reopens a paused session with the same launch command and `--resume`.[5] Through acm the pick runs again, so the session may continue on another account.
 - Whether Orca's usage reads make the API answer `429` to acm's `/usage` poll on the default account. Both call the same API, and a menu bar plugin that called it every 2 minutes did that. See footnote 2 of [Account selection and usage](selection.md).
-- A phone on mobile data while the desktop is behind a VPN, and a Relay connection held for a long time.
+- A phone on the same Wi-Fi as a desktop that is on a VPN. Orca may try the desktop's local address before Relay there.
+- A Relay connection held for hours, or left idle. It was watched for 30 minutes.[18]
 - Quick Commands for `acm status` and `acm resume`. A tab that ran `acm status` showed on the phone, but neither command was saved as a Quick Command.
 - A session moved between an Orca worktree and the project's main folder. Claude Code keeps session records by folder, so the session may have to be resumed from the folder it started in.
 - Workspace Directory under Settings → General, and a worktree folder given as a relative path or with `~`. Only an absolute path set for one project was tried.[16]
@@ -262,3 +265,5 @@ launchctl setenv NODE_EXTRA_CA_CERTS <bundle.pem>
 [16] 2026-11-05, Orca 1.4.249, Claude Code 2.1.318. Twelve projects had been added from existing folders. `orca worktree list` gave each project's own folder as its main worktree, and the one workspace made in Orca was at `~/orca/workspaces/<repository name>/<workspace name>`. After `orca project setup-update --worktree-base-path` with an absolute path, `orca repo show` listed that path, and a workspace made with `orca worktree create --name path-check --no-parent --setup skip` was at `<path>/<repository name>/path-check`. The older workspace stayed listed at its old path. `orca worktree rm` removed the new folder and left the branch `path-check` and the empty `<path>/<repository name>` folder. The field names are the app's own strings, read from its settings code, which also says that a relative path resolves from the project's root. The runtime's settings update contract, in `client-settings-params.js`, has no field for the workspace folder. The shared history folder held a project folder named after the older worktree's path, with the records of three sessions started there.
 
 [17] Hot-swap Codex accounts in the Orca docs. "Pick an account; any new Codex session launched after that uses it." and "Managed accounts (added in Orca) do not rewrite that login; they run in isolated homes." The page says the Claude account switcher works the same way. https://github.com/stablyai/orca/blob/main/docs/site/content/docs/agents/codex-hot-swap.mdx
+
+[18] 2026-11-05, Orca 1.4.249 and its phone app, Claude Code 2.1.318, macOS 15.7.1, Cisco Secure Client. The desktop was on a home network with the company VPN connected, and its default route went through the VPN. Certificates for `onorca.dev`, `api.anthropic.com`, and `github.com` were issued by the company CA there too. Orca's main process had been running for 8 hours with `NODE_EXTRA_CA_CERTS` set and was not restarted for the test. With the phone on mobile data, a session tab opened, its terminal became 51 columns wide, and messages typed on the phone arrived. The desktop's connections were sampled every 5 seconds for 30 minutes. Nothing connected to its port 6768, so the phone did not reach the desktop directly. The main process held one outbound connection to `34.36.233.235:443` for all 30 minutes. A second one to the same address opened when the phone attached and closed 17 minutes later. Which host that address belongs to, and whether the second connection carried the phone, were not confirmed.
