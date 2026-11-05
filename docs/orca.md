@@ -131,7 +131,7 @@ Orca's main process is Node, and it did not trust a CA that the macOS keychain t
 open --env NODE_EXTRA_CA_CERTS=<bundle.pem> -a Orca
 ```
 
-For a start from the Dock, set the variable for the login session. It lasts until you log out and reaches every Node and Electron app started afterwards.
+For a start from the Dock, set the variable for the login session. It lasts until you log out and reaches every Node and Electron app started afterwards. An Orca started again without `--env` received it.[10]
 
 ```sh
 launchctl setenv NODE_EXTRA_CA_CERTS <bundle.pem>
@@ -144,7 +144,6 @@ launchctl setenv NODE_EXTRA_CA_CERTS <bundle.pem>
 - Agent hibernation, which is off by default. Orca reopens a paused session with the same launch command and `--resume`.[5] Through acm the pick runs again, so the session may continue on another account.
 - A phone on mobile data while the desktop is behind a VPN, and a Relay connection held for a long time.
 - The Quick Command for `acm status`. A tab that ran `acm status` showed on the phone, but the command was not saved as a Quick Command.
-- An Orca started from the Dock with the variable set by `launchctl setenv`. A test app started with `open` received the value, but Orca itself was not restarted to check.[10]
 
 ## Footnotes
 
@@ -166,4 +165,4 @@ launchctl setenv NODE_EXTRA_CA_CERTS <bundle.pem>
 
 [9] 2026-11-05, Orca 1.4.249, Claude Code 2.1.318, tmux 3.8. A session started with `acm -a` on the second Claude account in an Orca terminal tab wrote an HTML file, staged it with `acm publisher check`, and sent the staged path to the publisher session. `check` started the publisher session, which returned a URL, and the artifact was listed under the primary account. The requesting claude process carried 25 `ORCA_*` variables. The publisher session's process carried none, and no `CLAUDE_CODE_PLUGIN_DIRS`.
 
-[10] 2026-11-05, macOS 15.7.1. With the variable set by `launchctl setenv`, a test app that only records its environment was started with `open` from a shell where the variable had been unset. The app's parent was launchd, and it had the variable.
+[10] 2026-11-05, Orca 1.4.249, macOS 15.7.1. With the variable set by `launchctl setenv`, Orca was quit and started again with `open` from an empty environment, without `--env`. The new main process had launchd as its parent and carried the variable. The Dock icon itself was not clicked. A test app that only records its environment gave the same result. The sessions running in Orca's terminals kept running through the restart.
