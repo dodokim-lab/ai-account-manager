@@ -95,14 +95,66 @@ if [ -n "$label" ] && [ -f "$dir/accounts.json" ]; then
   [ -n "$summary" ] && label="$label · $summary"
 fi
 
+# Claude Code cuts a statusline line that is wider than the terminal, and the tag makes the first line wider. It passes the
+# terminal width in COLUMNS, and a line may be four columns narrower than that, less the statusLine padding on both sides.
+# A line that does not fit is folded at spaces instead, so a narrow terminal such as a phone shows all of it on more rows.
+# Colors and links that are open at a fold are closed there and opened again on the next row. A word wider than the row is
+# left whole. Without COLUMNS, or if folding fails, the lines go out as they are
+fit() {
+  case "${COLUMNS:-}" in ''|*[!0-9]*) cat; return ;; esac
+  # The x keeps the newlines at the end, which a command substitution drops
+  lines=$(cat; printf x)
+  lines=${lines%x}
+  conf="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
+  [ -f "$conf" ] || conf=/dev/null
+  if folded=$(printf '%s' "$lines" | jq -Rrsj --argjson cols "$COLUMNS" --slurpfile conf "$conf" '
+      def esc: "\u001b\\[[0-?]*[ -/]*[@-~]|\u001b\\][^\u0007\u001b]*(?:\u0007|\u001b\\\\)";
+      # Columns a string takes. Hangul, CJK, and emoji take two. A symbol counted too wide only folds a row early
+      def width: [explode[]
+        | if . < 32 or (. >= 768 and . <= 879) or (. >= 8203 and . <= 8205) or . == 65279 then 0
+          elif (. >= 4352 and . <= 4447) or (. >= 8960 and . <= 9215) or (. >= 9728 and . <= 10175) or (. >= 11008 and . <= 11263)
+            or (. >= 11904 and . <= 42191) or (. >= 44032 and . <= 55203) or (. >= 63744 and . <= 64255)
+            or (. >= 65072 and . <= 65135) or (. >= 65280 and . <= 65376) or (. >= 65504 and . <= 65510)
+            or (. >= 126976 and . <= 262141) then 2
+          else 1 end] | add // 0;
+      def fold($w):
+        if (gsub(esc; "") | width) <= $w then . else
+          reduce (match(" +|(?:" + esc + "|[^ ])+"; "g").string) as $t
+            ({out: [], cur: "", n: 0, gap: "", sgr: "", link: ""};
+             if ($t | startswith(" ")) then .gap = $t else
+               ($t | gsub(esc; "") | width) as $tw
+               | if .n > 0 and .n + (.gap | length) + $tw > $w
+                 then .out += [.cur + (if .link != "" then "\u001b]8;;\u001b\\" else "" end) + (if .sgr != "" then "\u001b[0m" else "" end)]
+                   | .cur = .sgr + .link + $t | .n = $tw
+                 else .cur += .gap + $t | .n += (.gap | length) + $tw end
+               | .gap = ""
+               | reduce ($t | match(esc; "g").string) as $e (.;
+                   if ($e | test("^\u001b\\[[0-9;:]*m$")) then
+                     $e[2:-1] as $p
+                     | if $p == "" or $p == "0" then .sgr = "" elif ($p | startswith("0;")) then .sgr = $e else .sgr += $e end
+                   elif ($e | startswith("\u001b]8;")) then
+                     .link = (if ($e | test("^\u001b\\]8;[^;]*;(?:\u0007|\u001b\\\\)$")) then "" else $e end)
+                   else . end)
+             end)
+          | .out + [.cur + .gap] | join("\n")
+        end;
+      ((try $conf[0].statusLine.padding catch null) | if type == "number" and . > 0 then floor else 0 end) as $pad
+      | ($cols - 4 - 2 * $pad) as $w
+      | if $w < 10 then . else split("\n") | map(fold($w)) | join("\n") end' 2>/dev/null && printf x); then
+    printf '%s' "${folded%x}"
+  else
+    printf '%s' "$lines"
+  fi
+}
+
 # The original statusline command sits in the settings.json statusLine command, as arguments to this wrapper.
 # It is not read from a separate acm file. Claude Code does not protect such a file, so a session could change it without asking
 inner="$*"
-[ -z "$inner" ] && { [ -n "$label" ] && printf '[%s]\n' "$label"; exit 0; }
+[ -z "$inner" ] && { [ -n "$label" ] && printf '[%s]\n' "$label" | fit; exit 0; }
 
 printf '%s' "$input" | sh -c "$inner" | {
   if IFS= read -r first || [ -n "$first" ]; then
     if [ -n "$label" ]; then printf '[%s] %s\n' "$label" "$first"; else printf '%s\n' "$first"; fi
     cat
   fi
-}
+} | fit

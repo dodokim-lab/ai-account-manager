@@ -239,6 +239,69 @@ class StatuslineWrapper(AcmCase):
         self.assertNotIn("statusline_usage", self.acm.read_json(self.acm.ACCOUNTS_FILE))
         self.assertEqual(self.tag(), "[t · cl1 40% · cl2 40%] x\n")
 
+    def at_width(self, columns, *lines, label="t"):
+        """What the wrapper prints for those statusline lines in a terminal that many columns wide."""
+        env = dict(os.environ, ACM_ACCOUNT="cl1", ACM_LABEL=label)
+        env.pop("CLAUDE_CONFIG_DIR", None)
+        env.pop("COLUMNS", None)
+        if columns is not None:
+            env["COLUMNS"] = str(columns)
+        inner = "printf '%s\\n' " + " ".join(shlex.quote(line) for line in lines) if lines else ""
+        return subprocess.run(["sh", STATUSLINE, inner], input="{}", text=True, env=env, capture_output=True,
+                              check=True).stdout
+
+    @unittest.skipUnless(shutil.which("jq"), "jq is not installed")
+    def test_line_wider_than_the_terminal_folds_at_spaces(self):
+        # Claude Code shows COLUMNS - 4 columns of a line and cuts the rest. 24 columns leave 20
+        line = "one two three four five six seven"
+        self.assertEqual(self.at_width(24, line, "short"), "[t] one two three\nfour five six seven\nshort\n")
+        # Hangul takes two columns a character, so 16 columns hold one of these words, not two
+        self.assertEqual(self.at_width(20, "가나다라 마바사아 자차카타"), "[t] 가나다라\n마바사아\n자차카타\n")
+        # A word wider than the row is left whole, and the tag alone folds too
+        self.assertEqual(self.at_width(24, "x" * 40 + " tail"), "[t]\n" + "x" * 40 + "\ntail\n")
+        self.assertEqual(self.at_width(24, label="long label with many words in it"),
+                         "[long label with\nmany words in it]\n")
+
+    @unittest.skipUnless(shutil.which("jq"), "jq is not installed")
+    def test_line_that_fits_or_has_no_width_is_left_as_it_is(self):
+        line = "one two three four five six seven"
+        self.assertEqual(self.at_width(41, line), f"[t] {line}\n")
+        self.assertEqual(self.at_width(40, line), "[t] one two three four five six\nseven\n")
+        for columns in (None, "", "wide", "-5", 12):
+            self.assertEqual(self.at_width(columns, line), f"[t] {line}\n")
+        # Spaces inside a line that fits are not touched, and neither is a missing newline at the end
+        env = dict(os.environ, ACM_ACCOUNT="cl1", ACM_LABEL="t", COLUMNS="80")
+        out = subprocess.run(["sh", STATUSLINE, "printf ' a   b \\nsecond'"], input="{}", text=True, env=env,
+                             capture_output=True, check=True).stdout
+        self.assertEqual(out, "[t]  a   b \nsecond")
+
+    @unittest.skipUnless(shutil.which("jq"), "jq is not installed")
+    def test_fold_keeps_colors_and_links_open_across_rows(self):
+        red, reset = "\033[31m", "\033[0m"
+        self.assertEqual(self.at_width(16, f"{red}one two three four{reset} five"),
+                         f"[t] {red}one two{reset}\n{red}three four{reset}\nfive\n")
+        # A reset inside a combined sequence drops what was open before it
+        bold, green = "\033[1m", "\033[0;32m"
+        self.assertEqual(self.at_width(16, f"{bold}one {green}two three four five"),
+                         f"[t] {bold}one {green}two{reset}\n{green}three four{reset}\n{green}five\n")
+        link, end = "\033]8;;https://example.com\033\\", "\033]8;;\033\\"
+        self.assertEqual(self.at_width(16, f"{link}one two three{end} four"),
+                         f"[t] {link}one two{end}\n{link}three{end} four\n")
+
+    @unittest.skipUnless(shutil.which("jq"), "jq is not installed")
+    def test_fold_takes_the_statusline_padding_off_the_width(self):
+        line = "one two three four five"
+        self.assertEqual(self.at_width(32, line), f"[t] {line}\n")
+        settings = os.path.join(self.home, ".claude", "settings.json")
+        os.makedirs(os.path.dirname(settings), exist_ok=True)
+        with open(settings, "w") as f:
+            json.dump({"statusLine": {"type": "command", "command": "x", "padding": 3}}, f)
+        self.assertEqual(self.at_width(32, line), "[t] one two three four\nfive\n")
+        # Settings that cannot be read leave the lines as they are
+        with open(settings, "w") as f:
+            f.write("{broken")
+        self.assertEqual(self.at_width(24, line), f"[t] {line}\n")
+
     @unittest.skipUnless(shutil.which("jq"), "jq is not installed")
     def test_unknown_account_falls_back_to_config_dir(self):
         # A session started before the accounts were set up again still carries an old id that is not in the list
