@@ -37,7 +37,7 @@ except ImportError:  # pragma: no cover - available since Python 3.9
 
 VERSION = "0.3.0"
 # The Claude Code version whose internals acm was last checked against. acm doctor and acm version show it next to the current version
-VERIFIED_CLAUDE = "2.1.318"
+VERIFIED_CLAUDE = "2.1.319"
 
 HOME = os.path.expanduser("~")
 # acm runs on macOS and Linux. Linux reads process details from /proc and keeps app settings under ~/.config
