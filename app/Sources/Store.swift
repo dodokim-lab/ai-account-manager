@@ -175,6 +175,14 @@ final class Store: ObservableObject {
         didSet { UserDefaults.standard.set(widgetTools.sorted(), forKey: "widgetTools") }
     }
 
+    // Whether the floating widget is shown. The widget's close button, its right-click menu, and the menu bar checkbox all change this one value, so they stay in step
+    @Published var widgetVisible = UserDefaults.standard.object(forKey: "widgetVisible") as? Bool ?? true {
+        didSet {
+            UserDefaults.standard.set(widgetVisible, forKey: "widgetVisible")
+            FloatingWidget.shared.apply(widgetVisible)
+        }
+    }
+
     // Turn a tool on or off in the widget. The last one stays on so the widget is never empty. To hide the whole widget, turn off "Floating widget"
     func setWidget(_ tool: String, _ on: Bool, in snap: Snapshot) {
         var tools = Set(snap.widgetList(widgetTools))

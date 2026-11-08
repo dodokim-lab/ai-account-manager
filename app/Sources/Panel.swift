@@ -5,7 +5,6 @@ import SwiftUI
 struct PanelView: View {
     @ObservedObject var store: Store
     @State private var loginItem = SMAppService.mainApp.status == .enabled
-    @State private var widget = FloatingWidget.shared.isVisible
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -126,10 +125,9 @@ struct PanelView: View {
                             loginItem = SMAppService.mainApp.status == .enabled
                         }
                     }
-                Toggle("Floating widget", isOn: $widget)
+                Toggle("Floating widget", isOn: $store.widgetVisible)
                     .toggleStyle(.checkbox)
                     .font(.caption)
-                    .onChange(of: widget) { _, on in FloatingWidget.shared.isVisible = on }
                 Spacer()
                 Text("Updated \(Date(timeIntervalSince1970: snap.generatedAt).formatted(date: .omitted, time: .shortened))")
                     .font(.caption2).foregroundStyle(.secondary)

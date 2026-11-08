@@ -5,25 +5,21 @@ import SwiftUI
 @MainActor
 final class FloatingWidget {
     static let shared = FloatingWidget()
-    private static let visibleKey = "widgetVisible"
 
     private var panel: NSPanel?
 
-    var isVisible: Bool {
-        get { UserDefaults.standard.object(forKey: Self.visibleKey) as? Bool ?? true }
-        set {
-            UserDefaults.standard.set(newValue, forKey: Self.visibleKey)
-            newValue ? show() : panel?.orderOut(nil)
-        }
-    }
-
     func showIfEnabled() {
-        if isVisible { show() }
+        apply(Store.shared.widgetVisible)
     }
 
-    private func show() {
-        if panel == nil { panel = makePanel() }
-        panel?.orderFrontRegardless()
+    // Store.widgetVisible calls this when it changes
+    func apply(_ visible: Bool) {
+        if visible {
+            if panel == nil { panel = makePanel() }
+            panel?.orderFrontRegardless()
+        } else {
+            panel?.orderOut(nil)
+        }
     }
 
     private func makePanel() -> NSPanel {
@@ -39,7 +35,7 @@ final class FloatingWidget {
         // SwiftUI draws the shadow along the rounded shape. The window shadow is rectangular, so turn it off
         panel.hasShadow = false
 
-        let host = AutoSizingHost(rootView: WidgetView(store: Store.shared))
+        let host = AutoSizingHost(rootView: WidgetView(store: Store.shared, hover: HoverState()))
         panel.contentView = host
 
         // Top right of the screen at first, then wherever it was last dragged. The size follows the content
@@ -53,8 +49,40 @@ final class FloatingWidget {
     }
 }
 
+// Whether the pointer is over the widget. The close button shows only then
+@MainActor
+final class HoverState: ObservableObject {
+    @Published var inside = false
+}
+
 // Fit the window when the content changes size. Keep the top left corner in place
 final class AutoSizingHost: NSHostingView<WidgetView> {
+    // The app is a menu bar app and is almost never active, so track the pointer in every state
+    // instead of relying on SwiftUI hover, which may wait for the window to be key
+    private var tracking: NSTrackingArea?
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let tracking { removeTrackingArea(tracking) }
+        let area = NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+                                  owner: self, userInfo: nil)
+        addTrackingArea(area)
+        tracking = area
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        super.mouseEntered(with: event)
+        rootView.hover.inside = true
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        super.mouseExited(with: event)
+        rootView.hover.inside = false
+    }
+
+    // The panel never becomes key, so the first click must reach the close button
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
     override func invalidateIntrinsicContentSize() {
         super.invalidateIntrinsicContentSize()
         DispatchQueue.main.async { [weak self] in self?.fitWindow() }
@@ -76,6 +104,7 @@ final class AutoSizingHost: NSHostingView<WidgetView> {
 
 struct WidgetView: View {
     @ObservedObject var store: Store
+    @ObservedObject var hover: HoverState
     static let radius: CGFloat = 14
 
     var body: some View {
@@ -127,6 +156,20 @@ struct WidgetView: View {
             }
         }
         .fixedSize()
+        // Close button on the top right corner, shown while the pointer is over the widget. Turn it back on from the menu bar
+        .overlay(alignment: .topTrailing) {
+            if hover.inside {
+                Button { store.widgetVisible = false } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 14))
+                        .symbolRenderingMode(.palette)
+                        .foregroundStyle(.white, .black.opacity(0.55))
+                }
+                .buttonStyle(.plain)
+                .help("Hide the widget. Turn it back on with Floating widget in the menu bar window")
+                .offset(x: 6, y: -6)
+            }
+        }
         // Inner window margin so the shadow is not clipped
         .padding(14)
         .contextMenu {
@@ -142,7 +185,7 @@ struct WidgetView: View {
                 }
                 Divider()
             }
-            Button("Hide widget") { FloatingWidget.shared.isVisible = false }
+            Button("Hide widget") { store.widgetVisible = false }
         }
     }
 }
