@@ -13,7 +13,9 @@ import shutil
 import stat
 import subprocess
 import sys
+import signal
 import tempfile
+import threading
 import time
 import unittest
 from datetime import datetime
@@ -1017,6 +1019,9 @@ class Resume(AcmCase):
         super().setUp()
         self.data = self.accounts(["cl1", "cl2"], publisher="cl1")
         self.acm.refresh_usage = lambda *a, **k: []
+        # The tests may themselves run under a claude session. Its process is not the session under test
+        self.claude_ancestor = self.acm.claude_ancestor
+        self.acm.claude_ancestor = lambda: None
         self.launched = []
         self.acm.launch = lambda data, argv, binary=None, reason=None: self.launched.append((argv, reason, os.getcwd()))
         self.project = os.path.join(self.home, "work", "proj")
@@ -1069,8 +1074,27 @@ class Resume(AcmCase):
         self.assertEqual(os.path.realpath(cwd), os.path.realpath(self.project))
         self.assertEqual(self.acm.limited_sessions(), [])
 
-    def test_resume_refuses_reserved_account_over_85(self):
+    def test_resume_goes_past_the_reserve_when_only_the_primary_account_is_left(self):
         self.usage(cl1=86, cl2=99)
+        self.hit()
+        self.acm.cmd_resume(self.data, [])
+        argv, reason, _ = self.launched[0]
+        self.assertEqual(argv[:2], ["-a", "cl1"])
+        self.assertIn("past its 85% reserve", reason)
+        # A new session still keeps off the primary account over its reserve while another account has some left
+        self.usage(cl1=86, cl2=90)
+        self.assertEqual(self.acm.pick(self.data, "usage")[0], "cl2")
+
+    def test_resume_prefers_another_account_to_the_primary_past_its_reserve(self):
+        self.data = self.accounts(["cl1", "cl2", "cl3"], publisher="cl1")
+        self.usage(cl1=86, cl2=99)
+        self.polled("cl3", seven_day={"used_percentage": 60, "resets_at": self.WEEK})
+        self.hit()
+        self.acm.cmd_resume(self.data, [])
+        self.assertEqual(self.launched[0][0][:2], ["-a", "cl3"])
+
+    def test_resume_refuses_when_the_primary_account_is_near_its_limit_too(self):
+        self.usage(cl1=98.5, cl2=99)
         self.hit()
         with self.assertRaises(SystemExit):
             self.acm.cmd_resume(self.data, [])
@@ -1199,6 +1223,259 @@ class Resume(AcmCase):
         self.assertEqual(len(self.acm.read_json(path)["hooks"]["StopFailure"]), 2)
         self.acm.undo_resume_hook()
         self.assertEqual(self.acm.read_json(path), theirs)
+
+
+class Handoff(Resume):
+    """Compact before continuing, and acm staying as the parent of claude to move a session that stops at its limit."""
+
+    def transcript(self, entries):
+        path = os.path.join(self.home, "t.jsonl")
+        with open(path, "w") as f:
+            for entry in entries:
+                f.write(json.dumps(entry) + "\n")
+        return path
+
+    @staticmethod
+    def used(model="claude-fable-5-1", **usage):
+        return {"type": "assistant", "message": {"model": model, "usage": usage}}
+
+    def test_context_size_is_the_last_answer_after_the_last_compact(self):
+        boundary = {"type": "system", "subtype": "compact_boundary", "compactMetadata": {"preTokens": 400000, "postTokens": 40832}}
+        size = lambda entries: self.acm.context_tokens(self.transcript(entries))
+        self.assertEqual(size([self.used(input_tokens=4, cache_read_input_tokens=149113, cache_creation_input_tokens=3093),
+                               {"type": "last-prompt"}]), 152210)
+        # A compact after the last answer leaves the size the compact reports
+        self.assertEqual(size([self.used(input_tokens=391552), boundary]), 40832)
+        # Messages copied from before a compact carry zero usage, and limit messages and subagent turns do not count
+        self.assertEqual(size([boundary, self.used(input_tokens=0), self.used(model="<synthetic>", input_tokens=9),
+                               dict(self.used(input_tokens=7), isSidechain=True)]), 40832)
+        self.assertEqual(size([boundary, self.used(input_tokens=60000)]), 60000)
+        self.assertIsNone(size([{"type": "user"}]))
+        self.assertIsNone(self.acm.context_tokens(os.path.join(self.home, "missing.jsonl")))
+        self.assertIsNone(self.acm.context_tokens(None))
+
+    def test_context_size_past_the_tail_reads_the_whole_file(self):
+        self.acm.CONTEXT_TAIL = 1024
+        path = self.transcript([self.used(input_tokens=200000)] + [{"type": "user", "pad": "x" * 100}] * 50)
+        self.assertEqual(self.acm.context_tokens(path), 200000)
+
+    def fake_compact(self, code=0):
+        bindir = os.path.join(self.tmp, "bin")
+        os.makedirs(bindir, exist_ok=True)
+        self.calls = os.path.join(self.tmp, "calls")
+        path = os.path.join(bindir, "claude")
+        with open(path, "w") as f:
+            f.write(f'#!/bin/sh\necho "$CLAUDE_CONFIG_DIR|$ACM_PARENT|$*" >> {self.calls}\nexit {code}\n')
+        os.chmod(path, 0o755)
+        self.acm.claude_bin = lambda: path
+
+    def compact_calls(self):
+        if not os.path.exists(self.calls):
+            return []
+        with open(self.calls) as f:
+            return f.read().splitlines()
+
+    def test_large_conversation_is_compacted_on_the_target_before_continuing(self):
+        self.fake_compact()
+        self.usage(cl1=10, cl2=99)
+        self.hit()
+        path = os.path.join(self.acm.LIMITED_DIR, f"{self.SID}.json")
+        rec = self.acm.read_json(path)
+        rec["transcript"] = self.transcript([self.used(input_tokens=2, cache_read_input_tokens=276907)])
+        self.acm.save_json(path, rec)
+        os.environ["ACM_PARENT"] = "4242"
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.acm.cmd_resume(self.data, ["--model", "claude-haiku-4-5"])
+        # On cl1, the account it moves to, with the session's model, and not as a session of the calling supervisor
+        self.assertEqual(self.compact_calls(), [f"||-p /compact --resume {self.SID} --model claude-haiku-4-5"])
+        self.assertIn("276k tokens", err.getvalue())
+        self.assertEqual(self.launched[0][0][:4], ["-a", "cl1", "--resume", self.SID])
+
+    def test_small_conversation_is_not_compacted_and_a_failed_compact_does_not_stop_the_handoff(self):
+        self.fake_compact(code=1)
+        self.usage(cl1=10, cl2=99)
+        rec = {"session_id": self.SID, "transcript": self.transcript([self.used(input_tokens=50776)])}
+        self.acm.compact_before_handoff(self.data, "cl1", rec, [])
+        self.assertEqual(self.compact_calls(), [])
+        rec["transcript"] = self.transcript([self.used(input_tokens=150000)])
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.acm.continue_session(self.data, rec, "cl2", "why", [])
+        self.assertEqual(len(self.compact_calls()), 1)
+        self.assertTrue(self.compact_calls()[0].startswith(self.data["accounts"]["cl2"]["dir"] + "|"))
+        self.assertIn("Compact failed", err.getvalue())
+        self.assertEqual(len(self.launched), 1)
+
+    def test_prompt_goes_before_options_that_take_several_values(self):
+        rec = {"session_id": self.SID, "label": "cl2@example.com"}
+        self.acm.continue_session(self.data, rec, "cl1", "why", ["--add-dir", "/a", "/b"], prompt="go on")
+        self.assertEqual(self.launched[0][0], ["-a", "cl1", "--resume", self.SID, "go on", "--add-dir", "/a", "/b"])
+        self.assertIn("from cl2@example.com", self.launched[0][1])
+
+    def test_only_known_options_carry_over(self):
+        argv = ["--model", "opus", "--permission-mode=plan", "--dangerously-skip-permissions", "--add-dir", "/a", "/b",
+                "--resume", "abc", "-c", "--session-id", "x", "fix the bug", "--append-system-prompt", "rules",
+                "--weird", "--", "--model", "no"]
+        self.assertEqual(self.acm.carried_args(argv),
+                         ["--model", "opus", "--permission-mode=plan", "--dangerously-skip-permissions", "--add-dir", "/a",
+                          "/b", "--append-system-prompt", "rules"])
+
+    def test_supervised_only_for_an_interactive_terminal_session_with_the_hook(self):
+        settings = os.path.join(self.home, ".claude", "settings.json")
+        self.acm.save_json(settings, {})
+        self.acm.setup_resume_hook(self.acm.SetupRun("yes"))
+        tty = {"v": True}
+        real_isatty = os.isatty
+        os.isatty = lambda fd: tty["v"]
+        try:
+            self.assertTrue(self.acm.supervises(self.data, ["--model", "opus"], None))
+            self.assertFalse(self.acm.supervises(self.data, [], "/ext/claude"))
+            self.assertFalse(self.acm.supervises(self.data, ["-p", "hi"], None))
+            self.assertTrue(self.acm.supervises(self.data, ["--", "-p"], None))
+            self.assertFalse(self.acm.supervises(self.data, ["mcp", "list"], None))
+            os.environ["ACM_HANDOFF"] = "0"
+            self.assertFalse(self.acm.supervises(self.data, [], None))
+            del os.environ["ACM_HANDOFF"]
+            self.assertFalse(self.acm.supervises(self.accounts(["cl1"]), [], None))
+            tty["v"] = False
+            self.assertFalse(self.acm.supervises(self.data, [], None))
+            tty["v"] = True
+            self.acm.undo_resume_hook()
+            self.assertFalse(self.acm.supervises(self.data, [], None))
+        finally:
+            os.isatty = real_isatty
+
+    def test_hook_marks_the_supervisor_only_when_claude_is_its_child(self):
+        env = dict(self.env_of("cl2"), ACM_PARENT="500")
+        self.acm.claude_ancestor = lambda: (600, 500)
+        text = self.hit_with(env)
+        self.assertIn("Moving the session", text)
+        rec = self.acm.limited_sessions()[0]
+        self.assertEqual((rec["pid"], rec["supervisor"]), (600, 500))
+        # A claude started inside that session inherits ACM_PARENT, but its parent is not that acm
+        self.acm.claude_ancestor = lambda: (700, 650)
+        self.assertIn("acm resume", self.hit_with(env))
+        self.assertEqual((self.acm.limited_sessions()[0]["pid"], self.acm.limited_sessions()[0]["supervisor"]), (700, None))
+
+    def hit_with(self, env):
+        return self.acm.hook_stop_failure({"session_id": self.SID, "cwd": self.project, "error": "rate_limit"}, env=env)
+
+    def test_claude_ancestor_walks_up_through_a_shell(self):
+        procs = {30: "20 /bin/sh", 20: "10 /opt/homebrew/bin/claude", 10: "1 -zsh"}
+        self.acm.quick_run = lambda cmd: procs.get(int(cmd[-1]), "")
+        self.assertEqual(self.claude_ancestor(start=30), (20, 10))
+        self.assertIsNone(self.claude_ancestor(start=10))
+
+    def child(self):
+        """A stand-in for claude that only waits."""
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        self.addCleanup(lambda: proc.poll() is None and (proc.kill(), proc.wait()))
+        return proc
+
+    def record_for(self, pid, account="cl2", supervisor=None):
+        os.makedirs(self.acm.LIMITED_DIR, exist_ok=True)
+        rec = {"session_id": self.SID, "account": account, "label": f"{account}@example.com", "cwd": self.project,
+               "at": int(time.time()), "pid": pid, "supervisor": supervisor or os.getpid()}
+        self.acm.save_json(os.path.join(self.acm.LIMITED_DIR, f"{self.SID}.json"), rec)
+        return rec
+
+    def fast(self):
+        self.acm.HANDOFF_POLL = 0.05
+        self.acm.HANDOFF_SETTLE = 0.05
+        self.acm.HANDOFF_CLOSE_WAIT = 2.0
+
+    def test_watcher_closes_the_session_when_another_account_has_room(self):
+        self.fast()
+        self.usage(cl1=10, cl2=99)
+        proc = self.child()
+        # Records of other processes, or of a claude another acm supervises, are not this session
+        self.record_for(proc.pid + 1)
+        self.record_for(proc.pid, supervisor=os.getpid() + 1)
+        state, done = {}, threading.Event()
+        watcher = threading.Thread(target=self.acm.watch_for_limit, args=(proc.pid, [], state, done))
+        watcher.start()
+        time.sleep(0.3)
+        self.assertEqual(state, {})
+        self.record_for(proc.pid)
+        self.assertEqual(proc.wait(timeout=5), -signal.SIGTERM)
+        done.set()
+        watcher.join(timeout=5)
+        rec, target, _ = state["handoff"]
+        self.assertEqual((rec["session_id"], target), (self.SID, "cl1"))
+
+    def test_watcher_leaves_the_session_when_there_is_nowhere_to_go(self):
+        self.fast()
+        self.usage(cl1=99, cl2=99)
+        notes = []
+        self.acm.notify = notes.append
+        proc = self.child()
+        self.record_for(proc.pid)
+        state, done = {}, threading.Event()
+        watcher = threading.Thread(target=self.acm.watch_for_limit, args=(proc.pid, [], state, done))
+        watcher.start()
+        time.sleep(0.4)
+        done.set()
+        watcher.join(timeout=5)
+        self.assertIsNone(proc.poll())
+        self.assertEqual(state, {})
+        self.assertEqual(len(notes), 1)
+        self.assertIn("no account to continue on", notes[0])
+
+    def test_watcher_does_not_send_the_session_back_to_an_account_it_just_left(self):
+        self.fast()
+        self.usage(cl1=10, cl2=10)
+        self.acm.HANDOFF_LEFT["cl2"] = time.time()
+        notes = []
+        self.acm.notify = notes.append
+        proc = self.child()
+        self.record_for(proc.pid, account="cl1")
+        state, done = {}, threading.Event()
+        watcher = threading.Thread(target=self.acm.watch_for_limit, args=(proc.pid, [], state, done))
+        watcher.start()
+        time.sleep(0.4)
+        done.set()
+        watcher.join(timeout=5)
+        self.assertIsNone(proc.poll())
+        self.assertEqual(len(notes), 1)
+        # Once the polls have caught up, it may go back
+        self.acm.HANDOFF_LEFT["cl2"] = time.time() - self.acm.HANDOFF_LEFT_KEEP - 1
+        self.assertEqual(self.acm.handoff_record(proc.pid, set())["account"], "cl1")
+
+    def test_supervisor_reopens_the_session_on_another_account_with_a_prompt(self):
+        self.fast()
+        self.usage(cl1=10, cl2=99)
+        saved = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGQUIT, signal.SIGTERM, signal.SIGHUP)}
+        self.addCleanup(lambda: [signal.signal(sig, h) for sig, h in saved.items()])
+        # The stand-in claude writes the record the StopFailure hook writes for a supervised session, then waits
+        script = (f"import json, os, time; os.makedirs({self.acm.LIMITED_DIR!r}, exist_ok=True); "
+                  f"json.dump({{'session_id': {self.SID!r}, 'account': 'cl2', 'label': 'cl2@example.com', 'cwd': {self.project!r}, "
+                  f"'at': int(time.time()), 'pid': os.getpid(), 'supervisor': int(os.environ['ACM_PARENT'])}}, "
+                  f"open(os.path.join({self.acm.LIMITED_DIR!r}, {self.SID!r} + '.json'), 'w')); time.sleep(30)")
+        run = os.path.join(self.acm.RUN_DIR, "cl2")
+        os.makedirs(run)
+        open(os.path.join(run, str(os.getpid())), "w").close()
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code = self.acm.supervise(self.data, "cl2", [sys.executable, "-c", script], dict(os.environ), ["--model", "opus"])
+        self.assertEqual(code, 128 + signal.SIGTERM)
+        argv, reason, cwd = self.launched[0]
+        self.assertEqual(argv, ["-a", "cl1", "--resume", self.SID, self.acm.HANDOFF_PROMPT, "--model", "opus"])
+        self.assertIn("continuing from cl2@example.com", reason)
+        self.assertEqual(os.path.realpath(cwd), os.path.realpath(self.project))
+        self.assertIn("hit its limit, so the session continues on cl1", err.getvalue())
+        self.assertIn("cl2", self.acm.HANDOFF_LEFT)
+        self.assertEqual(self.acm.limited_sessions(), [])
+        # The session was counted by the claude pid, not by acm's
+        self.assertNotIn(str(os.getpid()), os.listdir(run))
+
+    def test_supervisor_returns_the_exit_code_when_nothing_hits_a_limit(self):
+        saved = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGQUIT, signal.SIGTERM, signal.SIGHUP)}
+        self.addCleanup(lambda: [signal.signal(sig, h) for sig, h in saved.items()])
+        os.makedirs(os.path.join(self.acm.RUN_DIR, "cl2"))
+        code = self.acm.supervise(self.data, "cl2", [sys.executable, "-c", "raise SystemExit(3)"], dict(os.environ), [])
+        self.assertEqual(code, 3)
+        self.assertEqual(self.launched, [])
 
 
 class SameLogin(AcmCase):

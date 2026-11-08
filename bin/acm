@@ -22,6 +22,10 @@ import subprocess
 import sys
 import threading
 import time
+try:
+    import termios
+except ImportError:  # not on Windows
+    termios = None
 from queue import Empty, Queue
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
@@ -445,7 +449,7 @@ TOKEN_REFRESH_RECHECK = 90.0
 SESSION_ENV = ("CLAUDECODE", "CLAUDE_PID", "CLAUDE_EFFORT", "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_ENTRYPOINT",
                "CLAUDE_CODE_EXECPATH", "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_SESSION_ID",
                "CLAUDE_CODE_SESSION_ATTENDED", "CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDE_CODE_MESSAGING_TOKEN",
-               "ACM_ACCOUNT", "ACM_LABEL", "ACM_ROLE", "ACM_CODEX_ACCOUNT")
+               "ACM_ACCOUNT", "ACM_LABEL", "ACM_ROLE", "ACM_CODEX_ACCOUNT", "ACM_PARENT")
 SESSION_ENV_PREFIXES = ("CLAUDE_CODE_SESSION_", "CLAUDE_CODE_MESSAGING_")
 # Markers for background claude runs. Excluded from session lists and picks
 BACKGROUND_ROLES = ("publisher", "token-refresh", "poll")
@@ -1542,14 +1546,20 @@ def pick(data, mode, model=None, exclude=(), strict=False, tool="claude"):
     for n in ready:
         u = account_usage(n, now)
         score, exhausted = score_account(u, model, now, FIVE_HOUR_CAP, SEVEN_DAY_CAP)
-        if n == reserved:
-            exhausted = exhausted or reserve_held(n, now, model)
+        # Blocked only by the primary account's reserve threshold, not by its limit
+        held = n == reserved and not exhausted and reserve_held(n, now, model)
         # Count sessions started outside acm too, and acm runs just started that have not become claude yet
         active = len(live.get(n, set()) | registered_pids(n))
-        rows.append({"name": n, "u": u, "active": active, "exhausted": exhausted, "score": score})
-    if strict and all(r["exhausted"] for r in rows):
-        return None, "All other accounts are near their limit. " + " / ".join(blocked_reason(data, r, reserved, model) for r in rows)
+        rows.append({"name": n, "u": u, "active": active, "exhausted": exhausted or held, "held": held, "score": score})
     pool = [r for r in rows if not r["exhausted"]]
+    past_reserve = False
+    if strict and not pool:
+        # A session stopped at its limit is worth more than the headroom kept for publishing. When the primary account is
+        # the only one left, the session continues there up to the near-limit caps
+        pool = [r for r in rows if r["held"]]
+        past_reserve = bool(pool)
+        if not pool:
+            return None, "All other accounts are near their limit. " + " / ".join(blocked_reason(data, r, reserved, model) for r in rows)
     if not pool:
         # Past the caps every score is 0, so the pick would fall to rotation order. Compare what is really left up to 100% instead,
         # so an account the tool says cannot be used now, or one at 100%, is not picked while another still has some left.
@@ -1568,7 +1578,9 @@ def pick(data, mode, model=None, exclude=(), strict=False, tool="claude"):
     u = best["u"]
     scoped = "".join(f" · {s['short']} {s['pct']:.0f}%" for s in u["scoped"] if scope_matches(s["name"], model))
     why = f"{fmt_u(u)}{scoped} · score {best['score']:.0f} · running {best['active']}"
-    if best["exhausted"]:
+    if past_reserve:
+        why += f" · only the primary account is left, so it goes past its {RESERVE_SEVEN_DAY_CAP:.0f}% reserve"
+    elif best["exhausted"]:
         why += " · all accounts near their limit"
     return best["name"], why
 
@@ -3022,8 +3034,10 @@ def cmd_uninstall_statusline(data, args):
 
 
 # ---------- continuing sessions stopped at their limit ----------
-# When a session stops at its limit, the StopFailure hook records it and shows a terminal notification. Hook output does not enter the session, so
-# continuing happens when a person closes the session and types acm resume. Session history is in the shared folder, so context carries over to another account
+# When a session stops at its limit, the StopFailure hook records it. Hook output does not enter the session, so the hook cannot move it.
+# acm, staying as the parent of the session, closes it and reopens it on another account (see the next section). For a session acm does not
+# supervise, the hook shows a terminal notification, and a person closes the session and types acm resume.
+# Session history is in the shared folder, so context carries over to another account
 
 LIMITED_DIR = os.path.join(STATE_DIR, "limited")
 # Records older than this are assumed not to need continuing and are removed
@@ -3136,16 +3150,38 @@ def hook_stop_failure(event, env=None):
     state = os.path.realpath(STATE_DIR)
     if cwd == state or cwd.startswith(state + os.sep):
         return None
+    env = os.environ if env is None else env
     data = load_accounts()
     name = session_account(data, env)
     label = account_label(name, data["accounts"][name]) if name else None
+    # Supervised only if the claude this hook runs under is the child of the acm that set ACM_PARENT. A claude started inside
+    # that session inherits ACM_PARENT too, but its parent is a shell, so it is not supervised
+    proc = claude_ancestor()
+    supervisor = proc[1] if proc and str(env.get("ACM_PARENT") or "") == str(proc[1]) else None
     os.makedirs(LIMITED_DIR, mode=0o700, exist_ok=True)
     prune_limited()
     save_json(os.path.join(LIMITED_DIR, f"{sid}.json"), {
         "session_id": sid, "account": name, "label": label, "cwd": event.get("cwd"),
         "transcript": event.get("transcript_path"), "message": event.get("last_assistant_message"),
-        "at": int(time.time())})
+        "at": int(time.time()), "pid": proc[0] if proc else None, "supervisor": supervisor})
+    if supervisor:
+        return f"acm: {label or 'this account'} hit its limit. Moving the session to another account"
     return f"acm: {label or 'this account'} hit its limit. Close the session and continue on another account with acm resume"
+
+
+def claude_ancestor(start=None, depth=6):
+    """(pid, parent pid) of the nearest claude process above this one. Hooks run under claude, sometimes through a shell. None if not found."""
+    pid = start or os.getppid()
+    for _ in range(depth):
+        if pid <= 1:
+            return None
+        out = quick_run(["ps", "-o", "ppid=,comm=", "-p", str(pid)]).strip().split(None, 1)
+        if len(out) != 2 or not out[0].isdigit():
+            return None
+        if os.path.basename(out[1].strip()) in ("claude", "claude.exe"):
+            return pid, int(out[0])
+        pid = int(out[0])
+    return None
 
 
 def cmd_hook(data, args):
@@ -3176,6 +3212,118 @@ def open_session_pid(data, sid):
     return None
 
 
+# A conversation at least this large is compacted on the account it moves to before it continues there. Another organization's
+# account cannot read the cache, so every request rebuilds it. Below this, the compact itself costs more than it saves
+COMPACT_TOKENS = int(os.environ.get("ACM_COMPACT_TOKENS", "150000"))
+# Read this much of the end of a transcript first. Only if no size is found there is the whole file read
+CONTEXT_TAIL = 2 * 1024 * 1024
+
+
+def context_tokens(transcript):
+    """Tokens the conversation sends with each request, from the last model answer after the last compact.
+    If the conversation was compacted after that answer, the size the compact left. None if neither is found."""
+    try:
+        with open(transcript, "rb") as f:
+            size = f.seek(0, os.SEEK_END)
+            for start in ([max(0, size - CONTEXT_TAIL), 0] if size > CONTEXT_TAIL else [0]):
+                f.seek(start)
+                lines = f.read().split(b"\n")
+                if start:
+                    lines = lines[1:]  # the first line is cut off
+                for line in reversed(lines):
+                    if b"compact_boundary" not in line and b'"usage"' not in line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except ValueError:
+                        continue
+                    if not isinstance(entry, dict):
+                        continue
+                    if entry.get("subtype") == "compact_boundary":
+                        post = number((entry.get("compactMetadata") or {}).get("postTokens"))
+                        return int(post) if post else None
+                    message = entry.get("message")
+                    if entry.get("type") != "assistant" or entry.get("isSidechain") or not isinstance(message, dict) \
+                            or message.get("model") in (None, "<synthetic>"):
+                        continue
+                    usage = message.get("usage") if isinstance(message.get("usage"), dict) else {}
+                    total = sum(number(usage.get(k)) or 0 for k in
+                                ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"))
+                    # Messages copied into a session from before a compact carry zero usage
+                    if total:
+                        return int(total)
+    except (OSError, TypeError):
+        return None
+    return None
+
+
+def session_env(data, name, base=None):
+    """Environment for a session claude runs on that account, in the foreground."""
+    acc = data["accounts"][name]
+    env = dict(os.environ if base is None else base)
+    if config_dir(acc) is None:
+        env.pop("CLAUDE_CONFIG_DIR", None)
+    else:
+        env["CLAUDE_CONFIG_DIR"] = config_dir(acc)
+    env["ACM_ACCOUNT"] = name
+    env["ACM_LABEL"] = account_label(name, acc)
+    return env
+
+
+def compact_before_handoff(data, target, rec, rest):
+    """Compact a large conversation on the account it moves to. A failed compact is reported, and the session continues without it."""
+    tokens = context_tokens(rec.get("transcript"))
+    if tokens is None or tokens < COMPACT_TOKENS:
+        return
+    label = account_label(target, data["accounts"][target])
+    info(f"The conversation is {tokens // 1000}k tokens, so it is compacted on {label} first. This can take a few minutes")
+    command = [claude_bin(), "-p", "/compact", "--resume", rec["session_id"]]
+    model = session_model(rest)
+    if model:
+        command += ["--model", model]
+    env = session_env(data, target)
+    # A limit during the compact is not this supervisor's session
+    env.pop("ACM_PARENT", None)
+    try:
+        done = subprocess.run(command, env=env, stdin=subprocess.DEVNULL,
+                              stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    except (OSError, KeyboardInterrupt) as e:
+        info(f"Compact did not run ({type(e).__name__}), so the session continues as it is")
+        return
+    if done.returncode != 0:
+        info(f"Compact failed (exit {done.returncode}), so the session continues as it is")
+        return
+    after = context_tokens(rec.get("transcript"))
+    info(f"Compacted: {tokens // 1000}k → {after // 1000}k tokens" if after else "Compacted")
+
+
+def handoff_target(data, rec, rest, forced=None):
+    """(account, reason) to continue a limited session on. Ends acm with the reason if there is none."""
+    if forced:
+        target = resolve(data, forced, "claude")
+        if tool_of(data["accounts"][target]) != "claude":
+            die(f"{target} is a {TOOL_NAMES[tool_of(data['accounts'][target])]} account. Limit handoff works only for Claude sessions")
+        return target, "specified"
+    remember_emails(data)
+    refresh_usage(data)
+    target, why = pick(data, "usage", session_model(rest), exclude={rec.get("account")} - {None}, strict=True)
+    if target is None:
+        die(f"No account to continue on, so nothing was started. {why}")
+    return target, why
+
+
+def continue_session(data, rec, target, why, rest, prompt=None):
+    """Reopen a closed limited session on target. With prompt, the reopened session starts by sending it."""
+    sid = rec["session_id"]
+    try:
+        os.remove(os.path.join(LIMITED_DIR, f"{sid}.json"))
+    except OSError:
+        pass
+    compact_before_handoff(data, target, rec, rest)
+    came = f" from {rec['label']}" if rec.get("label") else ""
+    launch(data, ["-a", target, "--resume", sid] + ([prompt] if prompt else []) + rest, reason=f"continuing{came} · {why}")
+
+
 def cmd_resume(data, args):
     """Reopen a session stopped at its limit on another account. Without a session ID, uses the session that hit its limit most recently."""
     forced = None
@@ -3202,23 +3350,209 @@ def cmd_resume(data, args):
         if not os.path.isdir(cwd):
             die(f"The folder the session was opened in no longer exists: {cwd}")
         os.chdir(cwd)
-    if forced:
-        target, why = resolve(data, forced, "claude"), "specified"
-        if tool_of(data["accounts"][target]) != "claude":
-            die(f"{target} is a {TOOL_NAMES[tool_of(data['accounts'][target])]} account. Limit handoff works only for Claude sessions")
-    else:
-        remember_emails(data)
-        refresh_usage(data)
-        exclude = {rec.get("account")} - {None}
-        target, why = pick(data, "usage", session_model(rest), exclude=exclude, strict=True)
-        if target is None:
-            die(f"No account to continue on, so nothing was started. {why}")
+    target, why = handoff_target(data, rec, rest, forced)
+    continue_session(data, rec, target, why, rest)
+
+
+# ---------- moving a session when it stops at its limit ----------
+# acm stays as the parent of an interactive claude instead of becoming it. When the StopFailure hook records that this claude hit
+# its limit, acm picks an account to continue on. Only if there is one does it close the session and reopen it there in the same
+# terminal, with a prompt that continues the cut-off turn. Login tokens are not touched. ACM_HANDOFF=0 turns this off
+
+HANDOFF_PROMPT = ("The previous turn stopped at a usage limit, and acm reopened this session on another account. "
+                  "Continue the unfinished work from where it stopped.")
+# How often acm looks for a limit record, and how long it waits for the session to close before killing it
+HANDOFF_POLL = 1.0
+HANDOFF_SETTLE = 1.0
+HANDOFF_CLOSE_WAIT = 10.0
+# Accounts this terminal's session left at their limit, with the time it left. Usage records can lag behind a limit, so for this long
+# the session does not move back to them, or two limited accounts would pass it back and forth. By then polls have caught up
+HANDOFF_LEFT = {}
+HANDOFF_LEFT_KEEP = 30 * 60
+# Options carried over to the reopened session. Others, such as a prompt or another session to resume, are left out.
+# Options that take several values eat the arguments after them, so the prompt goes before the carried options
+CARRY_VALUE = ("--model", "--permission-mode", "--settings", "--setting-sources", "--agent", "--agents", "--fallback-model",
+               "--append-system-prompt", "--system-prompt", "--effort")
+CARRY_MANY = ("--add-dir", "--allowedTools", "--allowed-tools", "--disallowedTools", "--disallowed-tools", "--mcp-config",
+              "--plugin-dir")
+CARRY_FLAG = ("--dangerously-skip-permissions", "--allow-dangerously-skip-permissions", "--strict-mcp-config", "--verbose",
+              "--ide", "--chrome", "--no-chrome")
+
+
+def carried_args(argv):
+    out, i = [], 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--":
+            break
+        flag = a.split("=", 1)[0]
+        if "=" in a and flag in CARRY_VALUE + CARRY_MANY:
+            out.append(a)
+        elif a in CARRY_FLAG:
+            out.append(a)
+        elif a in CARRY_VALUE and i + 1 < len(argv):
+            out += argv[i:i + 2]
+            i += 1
+        elif a in CARRY_MANY:
+            j = i + 1
+            while j < len(argv) and not argv[j].startswith("-"):
+                j += 1
+            out += argv[i:j]
+            i = j - 1
+        i += 1
+    return out
+
+
+def supervises(data, argv, binary):
+    """Whether acm stays as the parent of this claude to move it when it stops at its limit."""
+    if binary or os.environ.get("ACM_HANDOFF", "1") == "0" or termios is None:
+        return False
+    if not (os.isatty(0) and os.isatty(1)):
+        return False
+    if argv[:1] and argv[0] in PASSTHROUGH:
+        return False
+    head = argv[:argv.index("--")] if "--" in argv else argv
+    if any(a in ("-p", "--print") for a in head):
+        return False
+    if not has_extra_accounts(data):
+        return False
+    return resume_hook_installed(read_json(os.path.join(SHARED, "settings.json")))
+
+
+def handoff_record(child_pid, tried):
+    """Limit record left by this acm's claude child that has not been handled yet."""
+    for path in glob.glob(os.path.join(LIMITED_DIR, "*.json")):
+        rec = read_json(path)
+        if not isinstance(rec, dict) or rec.get("supervisor") != os.getpid() or rec.get("pid") != child_pid:
+            continue
+        key = (rec.get("session_id"), rec.get("at"))
+        if key not in tried and SESSION_ID_RE.fullmatch(str(rec.get("session_id") or "")):
+            tried.add(key)
+            return rec
+    return None
+
+
+def notify(text):
+    """iTerm2 shows OSC 9 as a desktop notification. The sequence draws nothing, so it does not disturb the session on screen."""
+    clean = "".join(ch for ch in text if ch.isprintable())
     try:
-        os.remove(os.path.join(LIMITED_DIR, f"{sid}.json"))
+        os.write(1, f"\033]9;{clean}\007".encode())
     except OSError:
         pass
-    came = f" from {rec['label']}" if rec.get("label") else ""
-    launch(data, ["-a", target, "--resume", sid] + rest, reason=f"continuing{came} · {why}")
+
+
+def watch_for_limit(child_pid, carried, state, done):
+    """Runs beside the session. When the session hits its limit and another account has room, closes the session and leaves
+    what to continue in state. Without an account to go to, the session is left as it is and a notification says why."""
+    tried, seen = set(), None
+    while not done.wait(HANDOFF_POLL):
+        try:
+            changed = os.stat(LIMITED_DIR).st_mtime_ns
+        except OSError:
+            continue
+        if changed == seen:
+            continue
+        seen = changed
+        rec = handoff_record(child_pid, tried)
+        if not rec:
+            continue
+        data = load_accounts()
+        remember_emails(data)
+        refresh_usage(data)
+        now = time.time()
+        left = {n for n, at in HANDOFF_LEFT.items() if now - at < HANDOFF_LEFT_KEEP}
+        try:
+            target, why = pick(data, "usage", session_model(carried), exclude=({rec.get("account")} | left) - {None},
+                               strict=True)
+        except SystemExit:
+            target, why = None, "the account list could not be read"
+        if target is None:
+            notify(f"acm: no account to continue on. {why}")
+            continue
+        state["handoff"] = (rec, target, why)
+        # Let the hook finish and the session write the limit message to its history before it closes
+        if done.wait(HANDOFF_SETTLE):
+            return
+        try:
+            os.kill(child_pid, signal.SIGTERM)
+            if not done.wait(HANDOFF_CLOSE_WAIT):
+                os.kill(child_pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        return
+
+
+def wait_child(pid):
+    """Wait for the child to end and return its exit code. When the child stops itself, as claude does on Ctrl-Z,
+    acm stops too, so the shell gets the terminal back. fg continues the whole process group, the child included."""
+    while True:
+        _, status = os.waitpid(pid, os.WUNTRACED)
+        if os.WIFSTOPPED(status):
+            os.kill(os.getpid(), signal.SIGTSTP)
+            continue
+        if os.WIFSIGNALED(status):
+            return 128 + os.WTERMSIG(status)
+        return os.WEXITSTATUS(status)
+
+
+def supervise(data, name, command, env, carried):
+    """Run claude as a child and move the session to another account when it stops at its limit. Returns the exit code."""
+    env = dict(env, ACM_PARENT=str(os.getpid()))
+    try:
+        saved = termios.tcgetattr(0)
+    except termios.error:
+        saved = None
+    child = subprocess.Popen(command, env=env)
+    run = os.path.join(RUN_DIR, name)
+    # The session is counted by the claude pid, as when acm becomes claude
+    open(os.path.join(run, str(child.pid)), "w").close()
+    try:
+        os.remove(os.path.join(run, str(os.getpid())))
+    except OSError:
+        pass
+    # Ctrl-C and Ctrl-\ reach the whole process group. They are meant for claude, so acm ignores them.
+    # A handler, not SIG_IGN, because claude would inherit SIG_IGN. Termination signals sent to acm are passed to claude
+    for sig in (signal.SIGINT, signal.SIGQUIT):
+        signal.signal(sig, lambda *_: None)
+    def forward(sig, _):
+        try:
+            os.kill(child.pid, sig)
+        except ProcessLookupError:
+            pass
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, forward)
+    state, done = {}, threading.Event()
+    threading.Thread(target=watch_for_limit, args=(child.pid, carried, state, done), daemon=True).start()
+    try:
+        code = wait_child(child.pid)
+    finally:
+        done.set()
+    child.returncode = code
+    if saved is not None:
+        try:
+            termios.tcsetattr(0, termios.TCSADRAIN, saved)
+        except termios.error:
+            pass
+    if "handoff" not in state:
+        return code
+    rec, target, why = state["handoff"]
+    if rec.get("account"):
+        HANDOFF_LEFT[rec["account"]] = time.time()
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+    for sig in (signal.SIGQUIT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, signal.SIG_DFL)
+    data = load_accounts()
+    came = rec.get("label") or name
+    info(f"{came} hit its limit, so the session continues on {account_label(target, data['accounts'][target])}")
+    try:
+        cwd = rec.get("cwd")
+        if cwd and os.path.isdir(cwd):
+            os.chdir(cwd)
+        continue_session(data, rec, target, why, carried, prompt=HANDOFF_PROMPT)
+    except Exception as e:
+        info(f"Could not continue the session ({type(e).__name__}: {e}). Continue it with acm resume {rec['session_id'][:8]}")
+        return code
+    return code
 
 
 def resume_hook_installed(settings):
@@ -3246,9 +3580,9 @@ def setup_resume_hook(run):
         run.left(f"{path.replace(HOME, '~')} could not be read as JSON, so the StopFailure hook was not added")
         return
     if resume_hook_installed(settings):
-        run.ok("StopFailure hook that reports sessions stopped at their limit is in place")
+        run.ok("StopFailure hook that moves sessions stopped at their limit is in place")
         return
-    if not run.ask("Add a StopFailure hook that notifies you when a session hits its limit, so you can continue on another account with acm resume?"):
+    if not run.ask("Add a StopFailure hook so a session that hits its limit moves to another account in the same terminal?"):
         run.left("add the limit handoff hook (acm setup)")
         return
     hooks = settings.setdefault("hooks", {})
@@ -4148,6 +4482,8 @@ Environment variables
   ACM_FIVE_HOUR_CAP=95  ACM_SEVEN_DAY_CAP=98   Accounts at or above these are excluded from picks
   ACM_USAGE_BAND=5                              Within this many points of the top score, the account with fewer running sessions is picked
   ACM_RESERVE_FIVE_HOUR_CAP=70  ACM_RESERVE_SEVEN_DAY_CAP=85   Thresholds that exclude the primary account from automatic picks
+  ACM_HANDOFF=1                                 0 starts claude in place of acm, so a session that hits its limit is not moved for you
+  ACM_COMPACT_TOKENS=150000                     A conversation this large is compacted before it moves to another account
   ACM_POLL_INTERVAL=300                         Usage poll interval (seconds, per account). Same for Codex accounts
   ACM_PUBLISHER_IDLE=30  ACM_PUBLISHER_IDLE_MAX=300   Thresholds (seconds) for stopping the publisher session: after finishing work, and idle with no work
   ACM_PUBLISHER_CONFIRM=900                     How long (seconds) a delete confirmation may wait in the publisher session before it is stopped
@@ -4260,13 +4596,8 @@ def launch(data, argv, binary=None, reason=None, tool=None):
         # After exec, this pid becomes claude itself
         open(os.path.join(run, str(os.getpid())), "w").close()
 
-    env = dict(os.environ)
-    if config_dir(acc) is None:
-        env.pop("CLAUDE_CONFIG_DIR", None)
-    else:
-        env["CLAUDE_CONFIG_DIR"] = config_dir(acc)
-    env["ACM_ACCOUNT"] = name
-    env["ACM_LABEL"] = account_label(name, acc)
+    env = session_env(data, name)
+    carried = carried_args(argv)
     enabled, pub = publisher_conf(data)
     publish = enabled and name != pub and publisher_startable()
     # The Chrome extension is signed in to the primary account only, so screen control in other accounts' sessions goes through aside
@@ -4279,6 +4610,9 @@ def launch(data, argv, binary=None, reason=None, tool=None):
         info(f"{env['ACM_LABEL']} [{name}] ({acc.get('email') or 'not signed in'}) · {why}"
              + (" · artifacts go to the publisher session" if publish else "")
              + (" · screen control through aside" if browser else ""))
+    if supervises(data, argv, binary):
+        found = shutil.which("claude", path=env.get("PATH")) or claude_bin()
+        sys.exit(supervise(data, name, [found] + argv, env, carried))
     if binary:
         os.execve(binary, [binary] + argv, env)
     try:
