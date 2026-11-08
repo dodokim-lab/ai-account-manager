@@ -23,15 +23,16 @@ In Claude, one Artifact tool call finishes a publish. A Codex publisher session 
 The two items below seem unnecessary for now, so they are not planned. They come back if they are missed in use.
 
 - Storing usage as a time series to predict when it runs out and alert at thresholds. Menu bar apps such as claude-limits and Claudius feature this.[3]
-- A list of sessions stopped by a limit, with a continue button, in the menu bar window. For now, `acm resume` and the iTerm notification are enough.
+- A list of sessions stopped by a limit, with a continue button, in the menu bar window. For now, acm moves those sessions itself, and `acm resume` covers the rest.
 
 ## Some assumptions are still unverified
 
-The current code relies on assumptions for the four items below. As each is verified, the code or docs will be fixed. The last one is on the Codex side, so it will be verified when two Codex accounts can be used together.
+The current code relies on assumptions for the five items below. As each is verified, the code or docs will be fixed. The last one is on the Codex side, so it will be verified when two Codex accounts can be used together.
 
 - Whether VS Code-based extensions pass the bundled claude path as the first argument to `claudeProcessWrapper`. This has not been run with the real extension.
 - Whether `claude -p /usage` refreshes an expired token by itself. Leave an account with no session for a day with the menu bar app running. If `refresh_at` never appears in `~/.acm/poll/<account>.json`, it refreshes by itself. In that case, drop the token refresh that starts haiku.
 - Whether `/usage` shows the Current session line on an account with a 5h limit that has not been used for more than a day. If not, that account looks like it has no limit until its next use.
+- Whether a real limit moves a session the way the fake server test did. Only a limit from a fake server has been tried, where the hook's record reached acm and the closed session was reopened on another account. See [Account selection and usage](selection.md#a-session-that-hits-a-limit-moves-to-another-account).
 - Whether continuing with `acm codex resume` on another Codex account keeps the earlier reasoning history. There may be a limit similar to Claude not being able to use thinking from another organization.
 
 ## Footnotes

@@ -58,7 +58,7 @@ acm -c                   # without a tool name, arguments go to claude
 acm codex                # Codex account with the most headroom
 acm -a personal          # pick the account yourself; starts that account's tool
 acm pick [codex]         # show which account would be picked without starting
-acm resume               # continue a Claude session stopped by a limit on another account
+acm resume               # continue a Claude session stopped by a limit on another account, if acm did not move it
 acm codex resume <ID>    # open a Codex session from any Codex account
 ```
 

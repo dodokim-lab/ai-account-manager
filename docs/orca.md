@@ -92,7 +92,7 @@ Worktrees that already exist stay where they are. Claude Code keeps session reco
 
 ## To continue a session that hit its limit
 
-The steps are those of [Account selection and usage](selection.md#a-session-that-hits-a-limit-continues-on-another-account-with-acm-resume), typed in the session's own tab. They were tried with a limit record made by hand, not with a real limit.[11]
+A session started through acm in an Orca tab has acm as its parent, as in any terminal, so acm should move it to another account in the same tab. See [Account selection and usage](selection.md#a-session-that-hits-a-limit-moves-to-another-account). This has not been tried under Orca. If the session stays on its limit screen, the steps below are those of `acm resume`, typed in the session's own tab. They were tried with a limit record made by hand, not with a real limit.[11]
 
 1. Do not wait for acm's notification. It is a terminal sequence that iTerm2 shows as a desktop notification, and Orca's terminal has no handler for it. The session shows Claude Code's own limit message, and `acm status` reports the stopped session.
 2. Close the session with `/exit`. The tab drops to its shell.
@@ -173,7 +173,7 @@ Three ways were tried. The statusline tag is the one that needs nothing opened a
 | Shared history, memory, and skills | Works | Sessions on two accounts in an Orca worktree read the memory folder of the main repository |
 | Usage from the statusline | Works | Orca leaves `statusLine` in the settings as it is. The tag in front of the statusline lists every Claude account's usage, on the desktop and in the phone's terminal view. A line too wide for the terminal is folded onto more rows |
 | Collecting artifacts in one account | Works | A session on another account in an Orca tab handed off a publish, and the artifact landed in the primary account. The publisher session drops Orca's variables.[9] See [Artifact collection](publisher.md) |
-| Continuing a session that hit its limit | Works, without the notification | Tried with a limit record made by hand. See [To continue a session that hit its limit](#to-continue-a-session-that-hit-its-limit) |
+| Continuing a session that hit its limit | Works by hand, without the notification | Tried with a limit record made by hand. Moving the session for you is untried. See [To continue a session that hit its limit](#to-continue-a-session-that-hit-its-limit) |
 | Menu bar app and widget | Works, with one gap | They count Orca's sessions too. "New Session…" opens iTerm, not Orca |
 | Codex accounts | Works | Orca types `codex` into the tab's shell, and the shell function that `acm setup` added sends it through acm. The Command of Codex was left as it is.[12] |
 | Claude and Codex passing work to each other | Works from Claude to a Codex worker | The worker ran on the Codex account acm picked, and its report came back. With a Codex rule the report needs no prompt.[13][15] |
@@ -219,6 +219,7 @@ launchctl setenv NODE_EXTRA_CA_CERTS <bundle.pem>
 ## Still to check
 
 - A real limit in an Orca session. Orca's code treats that stop as the end of a failed turn, so Orca may send its own notification to the desktop and the phone. This was not seen.[11]
+- acm moving a limited session in an Orca tab. acm now stays as the parent of claude instead of becoming it, then closes claude and starts a new one in the same tab. Whether Orca still lists the tab as a Claude agent through that was not tried.
 - An agent that Orca starts as a chat instead of a terminal. Nothing is typed into a shell then, so the session may skip acm and run on the default account.
 - The Command of Codex set to `<home>/.local/bin/acm codex`, for a shell without acm's function. Orca's docs warn that a wrapper which sets `CODEX_HOME` reads a home Orca did not set up.[4] With the shell function, the hooks were found, because acm links each extra Codex account's `hooks.json` and `config.toml` to those in `~/.codex`.[12]
 - A Claude session that starts a worker on its own from the installed skills, and a Codex session that starts a Claude worker. The Codex rule does not cover `worker-start`, so that session would stop at a prompt.
